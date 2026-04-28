@@ -1,0 +1,75 @@
+# Production stack: postgres + backend + frontend (nginx).
+#
+# Usage:
+#   1. Copy .env.prod.example to .env.prod and fill in real values
+#      (especially POSTGRES_PASSWORD and JWT_SECRET).
+#   2. docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
+#   3. Visit http://localhost (frontend) — it proxies /api to the backend.
+#
+# Notes:
+#   - The backend runs `alembic upgrade head` and `python -m app.seed` on startup.
+#   - Uploaded product images are persisted in the `uploads_data` volume.
+#   - Don't expose Postgres publicly — keep `ports:` commented out unless needed.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: jewelry_erp_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-jewelry}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.prod}
+      POSTGRES_DB: ${POSTGRES_DB:-jewelry_erp}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-jewelry} -d $${POSTGRES_DB:-jewelry_erp}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  backend:
+    build:
+      context: ./backend
+    container_name: jewelry_erp_backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ENVIRONMENT: production
+      DEBUG: "false"
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-jewelry}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-jewelry_erp}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env.prod}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-480}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost,http://127.0.0.1}
+      SEED_ADMIN_EMAIL: ${SEED_ADMIN_EMAIL:-admin@jewelryerp.com}
+      SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:?set SEED_ADMIN_PASSWORD in .env.prod}
+      SEED_ADMIN_NAME: ${SEED_ADMIN_NAME:-System Admin}
+      WHATSAPP_PROVIDER: ${WHATSAPP_PROVIDER:-none}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      TWILIO_WHATSAPP_FROM: ${TWILIO_WHATSAPP_FROM:-}
+    volumes:
+      - uploads_data:/app/uploads
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE_URL: /api/v1
+    container_name: jewelry_erp_frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "${FRONTEND_PORT:-80}:80"
+
+volumes:
+  postgres_data:
+  uploads_data:

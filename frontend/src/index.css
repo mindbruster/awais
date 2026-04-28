@@ -1,0 +1,32 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Print styles — used by /invoices/:id printable view */
+@media print {
+  body { background: white !important; }
+  .no-print { display: none !important; }
+  .print-page { padding: 0 !important; box-shadow: none !important; border: none !important; max-width: none !important; }
+  aside { display: none !important; }
+  main { padding-left: 0 !important; }
+  /* Force colors for receipts */
+  * { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+}
+
+@layer components {
+  .btn {
+    @apply inline-flex items-center justify-center rounded-lg px-4 py-2 text-sm font-medium transition focus:outline-none focus:ring-2 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60;
+  }
+  .btn-primary {
+    @apply btn bg-brand-600 text-white hover:bg-brand-700 focus:ring-brand-500;
+  }
+  .btn-ghost {
+    @apply btn text-slate-700 hover:bg-slate-100 focus:ring-slate-300;
+  }
+  .input {
+    @apply block w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm placeholder:text-slate-400 focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500;
+  }
+  .card {
+    @apply rounded-xl border border-slate-200 bg-white p-5 shadow-sm;
+  }
+}

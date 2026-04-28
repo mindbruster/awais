@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+dist/
+build/
+.vite/
+*.log
+# tsc -b emits declaration files for the node tsconfig — not source
+frontend/vite.config.d.ts
+frontend/vite.config.js
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Env / secrets
+.env
+.env.local
+.env.*.local
+backend/.env
+frontend/.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Database / uploads
+*.sqlite3
+*.db
+backend/uploads/
+backend/media/
+
+# Docker volumes (if mounted locally)
+postgres_data/
+pgadmin_data/
+
+# Claude Code local settings
+.claude/settings.local.json

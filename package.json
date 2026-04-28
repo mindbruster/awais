@@ -1,0 +1,42 @@
+{
+  "name": "jewelry-erp",
+  "private": true,
+  "version": "0.4.0",
+  "description": "Jewelry ERP — orchestrator scripts. Backend lives in ./backend, frontend in ./frontend.",
+  "scripts": {
+    "//-- everyday --": "",
+    "dev": "concurrently -k -n db,api,ui -c blue,green,magenta \"npm:_dev:db\" \"npm:_dev:api\" \"npm:_dev:ui\"",
+    "stop": "docker compose down",
+    "_dev:db": "docker compose up postgres",
+    "_dev:api": "node scripts/python.js -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000",
+    "_dev:ui": "npm --prefix frontend run dev",
+
+    "//-- one-time setup --": "",
+    "init": "npm run setup && npm run db:up && npm run migrate && npm run seed",
+    "setup": "npm run setup:env && npm run setup:backend && npm run setup:frontend",
+    "setup:env": "node scripts/copy-env.js",
+    "setup:backend": "cd backend && python -m venv .venv && node ../scripts/python.js -m pip install --upgrade pip && node ../scripts/python.js -m pip install -r requirements.txt",
+    "setup:frontend": "npm --prefix frontend install",
+
+    "//-- database --": "",
+    "db:up": "docker compose up -d --wait postgres",
+    "db:down": "docker compose down",
+    "db:reset": "docker compose down -v && npm run db:up && npm run migrate && npm run seed",
+    "db:psql": "docker exec -it jewelry_erp_postgres psql -U jewelry -d jewelry_erp",
+
+    "//-- backend tasks --": "",
+    "migrate": "node scripts/python.js -m alembic upgrade head",
+    "seed": "node scripts/python.js -m app.seed",
+    "test": "node scripts/python.js -m tests.e2e",
+
+    "//-- build / production --": "",
+    "build": "npm --prefix frontend run build",
+    "typecheck": "npm --prefix frontend run build -- --mode production",
+    "prod:up": "docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build",
+    "prod:down": "docker compose -f docker-compose.prod.yml down",
+    "prod:logs": "docker compose -f docker-compose.prod.yml logs -f"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
