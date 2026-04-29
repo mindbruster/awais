@@ -3,7 +3,7 @@ import { api } from "@/api/client";
 import { Modal } from "@/components/Modal";
 import { SelectField, TextField, TextArea } from "@/components/Field";
 import { SearchBox, FilterSelect, Toolbar } from "@/components/Toolbar";
-import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { PasswordConfirm } from "@/components/PasswordConfirm";
 import { toast } from "@/components/Toast";
 import { apiError } from "@/lib/api-error";
 import { CURRENCY_OPTIONS, Currency, fmtMoney } from "@/lib/money";
@@ -36,7 +36,6 @@ export function StonesPage() {
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<Stone | null>(null);
   const [deleting, setDeleting] = useState<Stone | null>(null);
-  const [busyDelete, setBusyDelete] = useState(false);
   const [q, setQ] = useState("");
   const [kind, setKind] = useState("");
 
@@ -54,18 +53,17 @@ export function StonesPage() {
 
   useEffect(load, [q, kind]);
 
-  const confirmDelete = async () => {
+  const confirmDelete = async (password: string) => {
     if (!deleting) return;
-    setBusyDelete(true);
     try {
-      await api.delete(`/stones/${deleting.id}`);
+      await api.delete(`/stones/${deleting.id}`, {
+        headers: { "X-Confirm-Password": password },
+      });
       toast("success", `Deleted ${deleting.name}`);
       setDeleting(null);
       load();
     } catch (err) {
       toast("error", apiError(err, "Delete failed"));
-    } finally {
-      setBusyDelete(false);
     }
   };
 
@@ -164,14 +162,12 @@ export function StonesPage() {
           load();
         }}
       />
-      <ConfirmDialog
+      <PasswordConfirm
         open={!!deleting}
         onClose={() => setDeleting(null)}
         title={`Delete ${deleting?.name ?? "stone"}?`}
-        description="Stones referenced by any product breakdown cannot be deleted (FK RESTRICT)."
-        destructive
+        description="Stone deletes require password confirmation. Stones referenced by any product breakdown cannot be deleted (FK RESTRICT)."
         confirmLabel="Delete"
-        busy={busyDelete}
         onConfirm={confirmDelete}
       />
     </div>

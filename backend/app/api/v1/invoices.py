@@ -7,15 +7,29 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import CurrentUser, DbSession, require_password_confirm, require_perm
 from app.models.customer import Customer
+from app.models.gold_rate import GoldRate
 from app.models.inventory import InventoryItem
 from app.models.invoice import Invoice, InvoiceItem, InvoiceStatus, SaleType
 from app.models.product import Product, ProductStatus
 from app.models.stock_movement import MovementType
 from app.schemas.invoice import InvoiceCreate, InvoiceRead
+from app.services.audit import log_action
 from app.services.inventory import post_movement
 from app.services.pricing import invoice_totals, price_line
 from app.services.serial import next_invoice_no
 from app.services.whatsapp import render_invoice_message, send_text
+
+
+async def _current_gold_rate(db, currency, purity: int = 24) -> Decimal:
+    """Most recent rate for (currency, purity) — Decimal('0') if none set."""
+    stmt = (
+        select(GoldRate)
+        .where(GoldRate.currency == currency, GoldRate.purity == purity)
+        .order_by(GoldRate.rate_date.desc(), GoldRate.id.desc())
+        .limit(1)
+    )
+    rate = (await db.execute(stmt)).scalar_one_or_none()
+    return Decimal(str(rate.rate_per_g)) if rate else Decimal("0")
 
 router = APIRouter()
 read = Depends(require_perm("invoice:read"))
@@ -46,10 +60,14 @@ async def _load_invoice(db, invoice_id: int) -> Invoice:
 def _recompute(invoice: Invoice) -> None:
     line_totals: list[Decimal] = []
     for it in invoice.items:
-        # Use the line's own rate when explicitly set; otherwise fall back to the
-        # invoice rate. Treating Decimal('0') as "unset" via `or` is wrong because
-        # a user can legitimately price gold at 0 (e.g. labor-only invoice line).
-        rate = it.gold_rate_per_g if it.gold_rate_per_g is not None else invoice.gold_rate_per_g
+        # Line rate falls back to invoice rate when not set ( > 0 ). Persisted
+        # column default is 0 so callers omitting the field still get the
+        # invoice-level fallback they expect.
+        rate = (
+            it.gold_rate_per_g
+            if it.gold_rate_per_g is not None and Decimal(str(it.gold_rate_per_g)) > 0
+            else invoice.gold_rate_per_g
+        )
         gold_amount, stone_amount, line_total = price_line(
             gold_weight_g=Decimal(str(it.gold_weight_g)),
             gold_purity=it.gold_purity,
@@ -57,6 +75,7 @@ def _recompute(invoice: Invoice) -> None:
             stone_weight_ct=Decimal(str(it.stone_weight_ct)),
             stone_rate_per_ct=Decimal(str(it.stone_rate_per_ct)),
             labor_amount=Decimal(str(it.labor_amount)),
+            line_discount=Decimal(str(it.line_discount or 0)),
         )
         it.gold_amount = gold_amount
         it.stone_amount = stone_amount
@@ -113,13 +132,20 @@ async def create_invoice(payload: InvoiceCreate, db: DbSession) -> Invoice:
     if customer is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid customer_id")
 
+    # Auto-fill gold rate from /gold-rates/current when caller didn't supply one.
+    # Keeps invoice pricing aligned with the daily-rate master without forcing
+    # the UI to fetch /current itself.
+    invoice_rate = Decimal(str(payload.gold_rate_per_g))
+    if invoice_rate == 0:
+        invoice_rate = await _current_gold_rate(db, payload.currency)
+
     invoice = Invoice(
         invoice_no=await next_invoice_no(db),
         sale_type=payload.sale_type,
         status=InvoiceStatus.draft,
         customer_id=payload.customer_id,
         currency=payload.currency,
-        gold_rate_per_g=payload.gold_rate_per_g,
+        gold_rate_per_g=invoice_rate,
         discount_amount=payload.discount_amount,
         discount_weight_g=payload.discount_weight_g,
         tax_amount=payload.tax_amount,
@@ -145,7 +171,11 @@ async def get_invoice(invoice_id: int, db: DbSession) -> Invoice:
     return invoice
 
 
-@router.post("/{invoice_id}/issue", response_model=InvoiceRead, dependencies=[issue_perm])
+@router.post(
+    "/{invoice_id}/issue",
+    response_model=InvoiceRead,
+    dependencies=[issue_perm, Depends(require_password_confirm)],
+)
 async def issue_invoice(
     invoice_id: int, db: DbSession, current: CurrentUser
 ) -> Invoice:
@@ -198,12 +228,23 @@ async def issue_invoice(
 
     invoice.status = InvoiceStatus.issued
     invoice.issued_at = datetime.now(timezone.utc)
+    await log_action(
+        db, user=current,
+        action="invoice.issue",
+        resource_type="invoice", resource_id=invoice.id,
+        details={
+            "invoice_no": invoice.invoice_no,
+            "sale_type": invoice.sale_type.value,
+            "currency": invoice.currency.value,
+            "total": str(invoice.total),
+        },
+    )
     await db.commit()
     return await _load_invoice(db, invoice.id)
 
 
 @router.post("/{invoice_id}/mark-paid", response_model=InvoiceRead, dependencies=[mark_paid_perm])
-async def mark_paid(invoice_id: int, db: DbSession) -> Invoice:
+async def mark_paid(invoice_id: int, db: DbSession, current: CurrentUser) -> Invoice:
     stmt = (
         select(Invoice).options(selectinload(Invoice.items)).where(Invoice.id == invoice_id)
     )
@@ -214,6 +255,12 @@ async def mark_paid(invoice_id: int, db: DbSession) -> Invoice:
         raise HTTPException(status.HTTP_409_CONFLICT, "Only issued invoices can be marked paid")
     invoice.status = InvoiceStatus.paid
     invoice.paid_at = datetime.now(timezone.utc)
+    await log_action(
+        db, user=current,
+        action="invoice.mark_paid",
+        resource_type="invoice", resource_id=invoice.id,
+        details={"invoice_no": invoice.invoice_no, "total": str(invoice.total)},
+    )
     await db.commit()
     return await _load_invoice(db, invoice.id)
 
@@ -292,5 +339,15 @@ async def void_invoice(
             product.status = ProductStatus.in_stock
 
     invoice.status = InvoiceStatus.void
+    await log_action(
+        db, user=current,
+        action="invoice.void",
+        resource_type="invoice", resource_id=invoice.id,
+        details={
+            "invoice_no": invoice.invoice_no,
+            "sale_type": invoice.sale_type.value,
+            "previous_status": "issued" if invoice.issued_at else "draft",
+        },
+    )
     await db.commit()
     return await _load_invoice(db, invoice.id)

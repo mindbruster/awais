@@ -300,6 +300,36 @@ function ActionPanel(props: {
     }
   };
 
+  const [completing, setCompleting] = useState<{ name: string; category: string; location: string } | null>(null);
+
+  const confirmComplete = async (password: string) => {
+    if (!completing) return;
+    try {
+      await api.post(
+        `/manufacturing/${job.id}/complete`,
+        {
+          product_name: completing.name,
+          category: completing.category || null,
+          finished_inventory_location: completing.location || null,
+        },
+        { headers: { "X-Confirm-Password": password } },
+      );
+      toast("success", "Job completed");
+      setCompleting(null);
+      reload();
+    } catch (err) {
+      toast("error", apiError(err, "Complete failed"));
+    }
+  };
+
+  const completeOnSubmit = async (body: any) => {
+    setCompleting({
+      name: body.product_name,
+      category: body.category ?? "",
+      location: body.finished_inventory_location ?? "",
+    });
+  };
+
   const confirmCancel = async (password: string) => {
     try {
       await api.post(
@@ -364,11 +394,7 @@ function ActionPanel(props: {
             },
             {
               label: "Skip both — complete job",
-              form: (
-                <CompleteJobForm
-                  onSubmit={(body) => post("complete", body, "Job completed")}
-                />
-              ),
+              form: <CompleteJobForm onSubmit={completeOnSubmit} />,
             },
           ]}
         />
@@ -394,9 +420,7 @@ function ActionPanel(props: {
             },
             {
               label: "Skip polish — complete",
-              form: (
-                <CompleteJobForm onSubmit={(body) => post("complete", body, "Job completed")} />
-              ),
+              form: <CompleteJobForm onSubmit={completeOnSubmit} />,
             },
           ]}
         />
@@ -408,7 +432,7 @@ function ActionPanel(props: {
         />
       )}
       {job.stage === "polish_received" && (
-        <CompleteJobForm onSubmit={(body) => post("complete", body, "Job completed")} />
+        <CompleteJobForm onSubmit={completeOnSubmit} />
       )}
 
       <div className="mt-6 border-t border-slate-100 pt-3">
@@ -427,6 +451,15 @@ function ActionPanel(props: {
         description="This is irreversible. Stock movements already posted (e.g. gold to karigar) will remain in the ledger and the loss will need a manual return entry. Confirm with your password."
         confirmLabel="Cancel job"
         onConfirm={confirmCancel}
+      />
+      <PasswordConfirm
+        open={!!completing}
+        onClose={() => setCompleting(null)}
+        title={`Complete job ${job.job_no}?`}
+        description={`Creating "${completing?.name}" as a finished product and adding 1 unit to inventory. Confirm with your password.`}
+        confirmLabel="Complete job"
+        destructive={false}
+        onConfirm={confirmComplete}
       />
     </div>
   );

@@ -64,6 +64,7 @@ export function InvoicesPage() {
   const [error, setError] = useState<string | null>(null);
   const [openCreate, setOpenCreate] = useState(false);
   const [voiding, setVoiding] = useState<Invoice | null>(null);
+  const [issuing, setIssuing] = useState<Invoice | null>(null);
   const [q, setQ] = useState("");
   const [status, setStatus] = useState("");
   const [saleType, setSaleType] = useState("");
@@ -106,6 +107,22 @@ export function InvoicesPage() {
       load();
     } catch (err) {
       toast("error", apiError(err, "Void failed"));
+    }
+  };
+
+  const confirmIssue = async (password: string) => {
+    if (!issuing) return;
+    try {
+      await api.post(
+        `/invoices/${issuing.id}/issue`,
+        {},
+        { headers: { "X-Confirm-Password": password } },
+      );
+      toast("success", `Invoice ${issuing.invoice_no} issued`);
+      setIssuing(null);
+      load();
+    } catch (err) {
+      toast("error", apiError(err, "Issue failed"));
     }
   };
 
@@ -181,7 +198,7 @@ export function InvoicesPage() {
                       {inv.status === "draft" && (
                         <button
                           className="rounded bg-blue-600 px-2 py-1 text-xs text-white hover:bg-blue-700"
-                          onClick={() => action(inv.id, "issue", "Invoice issued")}
+                          onClick={() => setIssuing(inv)}
                         >
                           Issue
                         </button>
@@ -240,6 +257,19 @@ export function InvoicesPage() {
         confirmLabel="Void invoice"
         onConfirm={confirmVoid}
       />
+      <PasswordConfirm
+        open={!!issuing}
+        onClose={() => setIssuing(null)}
+        title={`Issue ${issuing?.invoice_no ?? "invoice"}?`}
+        description={
+          issuing?.sale_type === "on_approval"
+            ? "Issuing an on-approval invoice marks linked products as on_approval (stock untouched). Confirm with your password."
+            : "Issuing a normal sale will deduct stock from inventory. Confirm with your password."
+        }
+        confirmLabel="Issue invoice"
+        destructive={false}
+        onConfirm={confirmIssue}
+      />
     </div>
   );
 }
@@ -254,6 +284,7 @@ interface DraftItem {
   stone_weight_ct: string;
   stone_rate_per_ct: string;
   labor_amount: string;
+  line_discount: string;
 }
 
 const blankItem = (): DraftItem => ({
@@ -266,6 +297,7 @@ const blankItem = (): DraftItem => ({
   stone_weight_ct: "0",
   stone_rate_per_ct: "0",
   labor_amount: "0",
+  line_discount: "0",
 });
 
 function NewInvoiceModal({
@@ -366,6 +398,7 @@ function NewInvoiceModal({
           stone_weight_ct: it.stone_weight_ct || "0",
           stone_rate_per_ct: it.stone_rate_per_ct || "0",
           labor_amount: it.labor_amount || "0",
+          line_discount: it.line_discount || "0",
         })),
       });
       toast("success", "Invoice draft created");
@@ -478,7 +511,7 @@ function NewInvoiceModal({
                     </button>
                   </div>
                 </div>
-                <div className="mt-2 grid grid-cols-6 gap-2">
+                <div className="mt-2 grid grid-cols-7 gap-2">
                   <TextField
                     label="Gold (g)"
                     type="number"
@@ -527,6 +560,15 @@ function NewInvoiceModal({
                     min={0}
                     value={it.labor_amount}
                     onChange={(e) => updateItem(i, { labor_amount: e.target.value })}
+                  />
+                  <TextField
+                    label="Line disc"
+                    type="number"
+                    step="0.01"
+                    min={0}
+                    value={it.line_discount}
+                    onChange={(e) => updateItem(i, { line_discount: e.target.value })}
+                    hint="Subtracted from line"
                   />
                 </div>
               </div>

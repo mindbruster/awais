@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 
 from app.api.v1 import (
+    audit_log,
     auth,
     customers,
     gold_rates,
@@ -30,3 +31,4 @@ api_router.include_router(invoices.router, prefix="/invoices", tags=["invoices"]
 api_router.include_router(reports.router, prefix="/reports", tags=["reports"])
 api_router.include_router(gold_rates.router, prefix="/gold-rates", tags=["gold-rates"])
 api_router.include_router(stones.router, prefix="/stones", tags=["stones"])
+api_router.include_router(audit_log.router, prefix="/audit-log", tags=["audit-log"])

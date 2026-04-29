@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import or_, select
 
-from app.api.deps import DbSession, require_perm
+from app.api.deps import DbSession, require_password_confirm, require_perm
 from app.models.stone import Stone, StoneKind
 from app.schemas.stone import StoneCreate, StoneRead, StoneUpdate
 
@@ -64,7 +64,11 @@ async def update_stone(stone_id: int, payload: StoneUpdate, db: DbSession) -> St
     return stone
 
 
-@router.delete("/{stone_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[delete])
+@router.delete(
+    "/{stone_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[delete, Depends(require_password_confirm)],
+)
 async def delete_stone(stone_id: int, db: DbSession) -> None:
     stone = await db.get(Stone, stone_id)
     if stone is None:

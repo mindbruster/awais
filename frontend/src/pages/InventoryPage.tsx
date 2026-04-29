@@ -3,7 +3,7 @@ import { api } from "@/api/client";
 import { Modal } from "@/components/Modal";
 import { SelectField, TextField } from "@/components/Field";
 import { SearchBox, FilterSelect, Toolbar } from "@/components/Toolbar";
-import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { PasswordConfirm } from "@/components/PasswordConfirm";
 import { toast } from "@/components/Toast";
 import { apiError } from "@/lib/api-error";
 
@@ -33,7 +33,6 @@ export function InventoryPage() {
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<InventoryItem | null>(null);
   const [deleting, setDeleting] = useState<InventoryItem | null>(null);
-  const [busyDelete, setBusyDelete] = useState(false);
   const [q, setQ] = useState("");
   const [type, setType] = useState("");
 
@@ -51,18 +50,17 @@ export function InventoryPage() {
 
   useEffect(load, [q, type]);
 
-  const confirmDelete = async () => {
+  const confirmDelete = async (password: string) => {
     if (!deleting) return;
-    setBusyDelete(true);
     try {
-      await api.delete(`/inventory/${deleting.id}`);
+      await api.delete(`/inventory/${deleting.id}`, {
+        headers: { "X-Confirm-Password": password },
+      });
       toast("success", `Deleted ${deleting.label}`);
       setDeleting(null);
       load();
     } catch (err) {
       toast("error", apiError(err, "Delete failed"));
-    } finally {
-      setBusyDelete(false);
     }
   };
 
@@ -158,14 +156,12 @@ export function InventoryPage() {
           load();
         }}
       />
-      <ConfirmDialog
+      <PasswordConfirm
         open={!!deleting}
         onClose={() => setDeleting(null)}
         title={`Delete ${deleting?.label ?? "item"}?`}
-        description="Items referenced by stock movements cannot be deleted (RESTRICT). Adjust the stock to zero instead if you want to retire it."
-        destructive
+        description="Inventory deletes require password confirmation. Items referenced by stock movements cannot be deleted (RESTRICT) — adjust stock to zero instead."
         confirmLabel="Delete"
-        busy={busyDelete}
         onConfirm={confirmDelete}
       />
     </div>

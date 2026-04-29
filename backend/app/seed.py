@@ -9,6 +9,7 @@ from sqlalchemy import select
 
 from app.core.config import settings
 from app.core.database import SessionLocal
+from app.core.logging_setup import configure_logging, get_logger
 from app.core.security import hash_password
 from app.models.role import Role
 from app.models.user import User
@@ -18,6 +19,9 @@ DEFAULT_ROLES = [
     ("accountant", "Sales, invoices, reports"),
     ("staff", "Day-to-day operations"),
 ]
+
+configure_logging()
+log = get_logger("app.seed")
 
 
 async def seed() -> None:
@@ -31,9 +35,10 @@ async def seed() -> None:
                 created_roles.append(name)
         if created_roles:
             await db.commit()
-            print(f"Created roles: {', '.join(created_roles)}")
+            # 'created' is a reserved LogRecord attribute — use a different key.
+            log.info("seeded roles", extra={"role_names": created_roles})
         else:
-            print("Roles already exist — skipping.")
+            log.info("roles already exist; skipping")
 
         admin_role = (
             await db.execute(select(Role).where(Role.name == "admin"))
@@ -44,7 +49,7 @@ async def seed() -> None:
             await db.execute(select(User).where(User.email == admin_email))
         ).scalar_one_or_none()
         if existing_admin:
-            print(f"Admin user already exists: {admin_email}")
+            log.info("admin already exists", extra={"email": admin_email})
             return
 
         admin = User(
@@ -56,8 +61,10 @@ async def seed() -> None:
         )
         db.add(admin)
         await db.commit()
-        print(f"Created admin user: {admin_email} / {settings.seed_admin_password}")
-        print("WARNING: change this password after first login.")
+        log.warning(
+            "admin created — change password on first login",
+            extra={"email": admin_email},
+        )
 
 
 if __name__ == "__main__":

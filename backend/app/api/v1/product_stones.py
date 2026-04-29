@@ -8,6 +8,7 @@ from app.models.product import Product
 from app.models.product_stone import ProductStone
 from app.models.stone import Stone
 from app.schemas.product_stone import ProductStoneCreate, ProductStoneRead
+from app.services.product_cost import recompute_material_cost
 
 router = APIRouter()
 write = Depends(require_perm("product_stone:write"))
@@ -60,6 +61,11 @@ async def attach_stone(
         notes=payload.notes,
     )
     db.add(ps)
+    await db.flush()
+    # Recompute the parent product's material_cost to reflect the new stone.
+    product = await db.get(Product, product_id)
+    if product is not None:
+        await recompute_material_cost(db, product)
     await db.commit()
     await db.refresh(ps)
     return ps
@@ -75,4 +81,8 @@ async def detach_stone(product_id: int, ps_id: int, db: DbSession) -> None:
     if ps is None or ps.product_id != product_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Product stone not found")
     await db.delete(ps)
+    await db.flush()
+    product = await db.get(Product, product_id)
+    if product is not None:
+        await recompute_material_cost(db, product)
     await db.commit()

@@ -17,6 +17,7 @@ class ProductBase(BaseModel):
     stone_weight_ct: Decimal = Field(default=Decimal("0"), ge=0)
     image_url: str | None = Field(default=None, max_length=500)
     total_cost: Decimal = Field(default=Decimal("0"), ge=0)
+    material_cost: Decimal = Field(default=Decimal("0"), ge=0)
     status: ProductStatus = ProductStatus.in_production
 
 
@@ -34,6 +35,7 @@ class ProductUpdate(BaseModel):
     stone_weight_ct: Decimal | None = Field(default=None, ge=0)
     image_url: str | None = Field(default=None, max_length=500)
     total_cost: Decimal | None = Field(default=None, ge=0)
+    material_cost: Decimal | None = Field(default=None, ge=0)
     status: ProductStatus | None = None
 
 

@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Backend E2E + frontend build
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: jewelry
+          POSTGRES_PASSWORD: jewelry_dev_password
+          POSTGRES_DB: jewelry_erp
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U jewelry -d jewelry_erp"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      # --- Backend ---
+      DATABASE_URL: postgresql+asyncpg://jewelry:jewelry_dev_password@localhost:5432/jewelry_erp
+      JWT_SECRET: ci-secret-not-for-prod-use-only
+      ENVIRONMENT: ci
+      DEBUG: "false"
+      CORS_ORIGINS: http://localhost:5173
+      SEED_ADMIN_EMAIL: admin@jewelryerp.com
+      SEED_ADMIN_PASSWORD: admin123
+      SEED_ADMIN_NAME: System Admin
+      WHATSAPP_PROVIDER: none
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+
+      - name: Install backend deps
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install frontend deps
+        run: |
+          npm ci
+          npm --prefix frontend ci
+
+      - name: Apply migrations + seed
+        working-directory: backend
+        run: |
+          python -m alembic upgrade head
+          python -m app.seed
+
+      - name: Start API in background
+        working-directory: backend
+        run: |
+          nohup python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --log-level warning > uvicorn.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8000/health > /dev/null; then
+              echo "API up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "API never came up"
+          tail -50 uvicorn.log
+          exit 1
+
+      - name: Run E2E suite
+        working-directory: backend
+        run: python -m tests.e2e
+
+      - name: Dump uvicorn log on failure
+        if: failure()
+        working-directory: backend
+        run: tail -200 uvicorn.log || true
+
+      - name: Frontend type-check
+        working-directory: frontend
+        run: npx tsc -b
+
+      - name: Frontend production build
+        working-directory: frontend
+        run: npm run build

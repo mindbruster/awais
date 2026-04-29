@@ -1,3 +1,4 @@
+from app.models.audit_log import AuditLog
 from app.models.currency import Currency
 from app.models.customer import Customer
 from app.models.gold_rate import GoldRate
@@ -35,4 +36,5 @@ __all__ = [
     "Stone",
     "StoneKind",
     "ProductStone",
+    "AuditLog",
 ]

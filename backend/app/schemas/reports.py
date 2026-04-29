@@ -3,6 +3,7 @@ from decimal import Decimal
 
 from pydantic import BaseModel
 
+from app.models.currency import Currency
 from app.models.invoice import SaleType
 from app.models.inventory import InventoryType
 
@@ -21,6 +22,7 @@ class StockReport(BaseModel):
 
 
 class SalesBucket(BaseModel):
+    currency: Currency
     sale_type: SaleType
     invoice_count: int
     subtotal: Decimal
@@ -28,12 +30,18 @@ class SalesBucket(BaseModel):
     total: Decimal
 
 
+class CurrencyTotal(BaseModel):
+    currency: Currency
+    invoice_count: int
+    total: Decimal
+
+
 class SalesReport(BaseModel):
     range_from: datetime | None = None
     range_to: datetime | None = None
     by_sale_type: list[SalesBucket]
+    by_currency: list[CurrencyTotal]
     invoice_count: int
-    grand_total: Decimal
 
 
 class VendorLossRow(BaseModel):
@@ -53,7 +61,15 @@ class LossReport(BaseModel):
 class ProfitRow(BaseModel):
     invoice_id: int
     invoice_no: str
+    currency: Currency
     issued_at: datetime | None
+    revenue: Decimal
+    making_cost: Decimal
+    profit: Decimal
+
+
+class ProfitCurrencyTotal(BaseModel):
+    currency: Currency
     revenue: Decimal
     making_cost: Decimal
     profit: Decimal
@@ -63,6 +79,4 @@ class ProfitReport(BaseModel):
     range_from: datetime | None = None
     range_to: datetime | None = None
     rows: list[ProfitRow]
-    total_revenue: Decimal
-    total_making_cost: Decimal
-    total_profit: Decimal
+    by_currency: list[ProfitCurrencyTotal]

@@ -191,9 +191,19 @@ def main() -> int:
 
     # ----- STOCK MOVEMENT (direct adjustment) -----
     section("Stock movements (direct)")
+    # Direct stock adjustments now require password confirmation (Phase 8 alignment).
+    pwd_h = {**auth, "X-Confirm-Password": "admin123"}
+    # No password → 401
     r = client.post(
         "/stock-movements",
         headers=auth,
+        json={"inventory_item_id": raw_gold["id"], "type": "adjustment", "weight_g_delta": "-1"},
+    )
+    check("stock movement without password → 401", r.status_code == 401)
+
+    r = client.post(
+        "/stock-movements",
+        headers=pwd_h,
         json={
             "inventory_item_id": raw_gold["id"],
             "type": "adjustment",
@@ -201,7 +211,7 @@ def main() -> int:
             "notes": "weighing correction",
         },
     )
-    check("adjustment posted", r.status_code == 201, str(r.status_code))
+    check("adjustment posted (with password)", r.status_code == 201, str(r.status_code))
 
     # Verify snapshot updated to 498.5
     r = client.get(f"/inventory/{raw_gold['id']}", headers=auth)
@@ -214,7 +224,7 @@ def main() -> int:
     # Underflow guard
     r = client.post(
         "/stock-movements",
-        headers=auth,
+        headers=pwd_h,
         json={"inventory_item_id": raw_gold["id"], "type": "adjustment", "weight_g_delta": "-100000"},
     )
     check("underflow rejected → 400", r.status_code == 400)
@@ -323,10 +333,18 @@ def main() -> int:
     )
     check("receive polish; loss 0.1g", Decimal(str(r.json()["polish_loss_g"])) == Decimal("0.1"))
 
-    # Complete: creates Product + finished_product InventoryItem
+    # Complete: creates Product + finished_product InventoryItem.
+    # Now requires password (Phase 8 alignment).
     r = client.post(
         f"/manufacturing/{job['id']}/complete",
         headers=auth,
+        json={"product_name": "Should Need Password"},
+    )
+    check("complete without password → 401", r.status_code == 401)
+
+    r = client.post(
+        f"/manufacturing/{job['id']}/complete",
+        headers=pwd_h,
         json={
             "product_name": "Finished Test Ring",
             "category": "ring",
@@ -389,7 +407,7 @@ def main() -> int:
 
     r = client.post(
         f"/manufacturing/{cj['id']}/complete",
-        headers=auth,
+        headers=pwd_h,
         json={"product_name": "Cost-test ring"},
     )
     check("complete cost-test job", r.status_code == 200)
@@ -446,9 +464,10 @@ def main() -> int:
 
     invoice_id = inv["id"]
 
-    # Issue → must deduct stock
-    finished_qty_before = finished_inv["quantity"]
+    # Issue → must deduct stock. Now requires password (Phase 8 alignment).
     r = client.post(f"/invoices/{invoice_id}/issue", headers=auth)
+    check("issue without password → 401", r.status_code == 401)
+    r = client.post(f"/invoices/{invoice_id}/issue", headers=pwd_h)
     check("issue normal sale → 200", r.status_code == 200)
     check("status = issued", r.json()["status"] == "issued")
 
@@ -465,8 +484,8 @@ def main() -> int:
     r = client.post(f"/invoices/{invoice_id}/mark-paid", headers=auth)
     check("mark paid", r.status_code == 200 and r.json()["status"] == "paid")
 
-    # Already issued → can't re-issue
-    r = client.post(f"/invoices/{invoice_id}/issue", headers=auth)
+    # Already issued → can't re-issue (pass password so we hit the lifecycle check)
+    r = client.post(f"/invoices/{invoice_id}/issue", headers=pwd_h)
     check("re-issue blocked → 409", r.status_code == 409)
 
     # ----- SALES: ON-APPROVAL (must NOT deduct stock) -----
@@ -479,7 +498,7 @@ def main() -> int:
         "gold_source_inventory_id": raw_gold["id"],
     })
     client.post(f"/manufacturing/{j2['id']}/receive-karigar", headers=auth, json={"jewelry_received_g": "7.9"})
-    client.post(f"/manufacturing/{j2['id']}/complete", headers=auth, json={"product_name": "Ring 2", "category": "ring"})
+    client.post(f"/manufacturing/{j2['id']}/complete", headers=pwd_h, json={"product_name": "Ring 2", "category": "ring"})
     r = client.get(f"/manufacturing/{j2['id']}", headers=auth)
     p2_id = r.json()["product_id"]
     r = client.get("/inventory", headers=auth, params={"type": "finished_product"})
@@ -500,7 +519,7 @@ def main() -> int:
         }],
     }).json()
 
-    r = client.post(f"/invoices/{inv2['id']}/issue", headers=auth)
+    r = client.post(f"/invoices/{inv2['id']}/issue", headers=pwd_h)
     check("issue on-approval → 200", r.status_code == 200)
 
     # Stock must NOT be deducted
@@ -564,12 +583,20 @@ def main() -> int:
     r = client.get("/reports/sales", headers=auth)
     check("sales report 200", r.status_code == 200)
     sales = r.json()
-    # We've issued 1 paid normal sale (76700-100+50 = 76650) + 1 voided on-approval (excluded post-void? Issued/paid only included).
-    # The on-approval was voided so it's not in 'issued' or 'paid' anymore.
     check(
         "sales count >= 1",
         sales["invoice_count"] >= 1,
         f"got {sales['invoice_count']}",
+    )
+    # Currency rollup is present
+    check(
+        "sales report has by_currency rollup",
+        isinstance(sales.get("by_currency"), list) and len(sales["by_currency"]) >= 1,
+    )
+    # Each by_sale_type bucket carries a currency
+    check(
+        "sales by_sale_type rows tagged with currency",
+        all("currency" in b for b in sales["by_sale_type"]),
     )
 
     r = client.get("/reports/manufacturing-loss", headers=auth)
@@ -580,11 +607,19 @@ def main() -> int:
     r = client.get("/reports/profit", headers=auth)
     check("profit report 200", r.status_code == 200)
     pr = r.json()
+    # Identity per currency: revenue - cost = profit
     check(
-        "profit = revenue - cost",
-        Decimal(str(pr["total_profit"]))
-        == (Decimal(str(pr["total_revenue"])) - Decimal(str(pr["total_making_cost"]))).quantize(Decimal("0.01")),
-        f"rev={pr['total_revenue']}, cost={pr['total_making_cost']}, profit={pr['total_profit']}",
+        "profit by_currency identity holds",
+        all(
+            Decimal(str(b["profit"]))
+            == (Decimal(str(b["revenue"])) - Decimal(str(b["making_cost"]))).quantize(Decimal("0.01"))
+            for b in pr["by_currency"]
+        ),
+        f"by_currency={pr['by_currency']}",
+    )
+    check(
+        "profit rows tagged with currency",
+        all("currency" in r for r in pr["rows"]),
     )
 
     # ----- RBAC (Phase 8): staff + accountant roles -----
@@ -721,8 +756,11 @@ def main() -> int:
         headers=auth,
         json={"type": "other", "label": "ToDelete Inv", "weight_g": "0"},
     ).json()
+    # Inventory delete now requires password (Phase 8 alignment).
     r = client.delete(f"/inventory/{inv_item['id']}", headers=auth)
-    check("delete inventory item (no movements) → 204", r.status_code == 204)
+    check("inventory delete without password → 401", r.status_code == 401)
+    r = client.delete(f"/inventory/{inv_item['id']}", headers=pwd_h)
+    check("delete inventory item (with password) → 204", r.status_code == 204)
 
     # Product delete requires password (Phase 8). Without header → 401.
     prod = client.post("/products", headers=auth, json={"name": "ToDelete Prod"}).json()
@@ -810,14 +848,17 @@ def main() -> int:
     r = client.get(f"/products/{p1['id']}", headers=auth)
     check("product read includes stones[]", isinstance(r.json().get("stones"), list) and len(r.json()["stones"]) == 1)
 
-    # Cannot delete a stone that's in a product
+    # Stone delete now requires password (Phase 8 alignment)
     r = client.delete(f"/stones/{diamond_id}", headers=auth)
+    check("stone delete without password → 401", r.status_code == 401)
+    # Cannot delete a stone that's in a product (even with password)
+    r = client.delete(f"/stones/{diamond_id}", headers=pwd_h)
     check("stone delete blocked when used (FK RESTRICT)", r.status_code in (400, 409, 500))
 
-    # Detach the stone, then delete is allowed
+    # Detach the stone, then delete is allowed (with password)
     r = client.delete(f"/products/{p1['id']}/stones/{ps_id}", headers=auth)
     check("detach stone → 204", r.status_code == 204)
-    r = client.delete(f"/stones/{diamond_id}", headers=auth)
+    r = client.delete(f"/stones/{diamond_id}", headers=pwd_h)
     check("stone delete allowed once detached → 204", r.status_code == 204)
 
     # ----- MULTI-CURRENCY on invoices -----
@@ -834,6 +875,112 @@ def main() -> int:
         "items": [],
     }).json()
     check("PKR invoice defaults preserved", pkr_inv["currency"] == "PKR")
+
+    # ----- ALIGNMENT: gold-rate auto-fill + per-line discount -----
+    section("Alignment")
+    # Insert a rate dated far in the future so it sorts above any earlier rates.
+    client.post("/gold-rates", headers=auth, json={
+        "rate_date": "2099-12-31", "currency": "PKR", "rate_per_g": "7777", "purity": 24,
+    })
+    # Create invoice with NO gold_rate → backend should auto-fill from /current
+    r = client.post("/invoices", headers=auth, json={
+        "customer_id": customer_id, "sale_type": "normal", "currency": "PKR",
+        "items": [],
+    })
+    check(
+        "invoice without rate auto-fills from /gold-rates/current",
+        r.status_code == 201 and Decimal(str(r.json()["gold_rate_per_g"])) == Decimal("7777"),
+        f"got rate {r.json().get('gold_rate_per_g')}",
+    )
+
+    # Per-line discount
+    r = client.post("/invoices", headers=auth, json={
+        "customer_id": customer_id, "sale_type": "normal", "currency": "PKR",
+        "gold_rate_per_g": "6000",
+        "items": [{
+            "description": "Gold bar",
+            "gold_weight_g": "10", "gold_purity": 24,
+            "labor_amount": "500",
+            "line_discount": "200",
+        }],
+    })
+    # gold = 10 × 24/24 × 6000 = 60000 ; line = 60000 + 0 + 500 - 200 = 60300
+    check(
+        "line_discount subtracts from line total",
+        r.status_code == 201
+        and Decimal(str(r.json()["items"][0]["line_total"])) == Decimal("60300.00"),
+        f"got {r.json()['items'][0].get('line_total')}",
+    )
+
+    # Discount can't drive line negative
+    r = client.post("/invoices", headers=auth, json={
+        "customer_id": customer_id, "sale_type": "normal", "currency": "PKR",
+        "gold_rate_per_g": "6000",
+        "items": [{
+            "description": "Free gift", "gold_weight_g": "0",
+            "labor_amount": "100", "line_discount": "999999",
+        }],
+    })
+    check(
+        "huge line_discount clamps to 0",
+        r.status_code == 201
+        and Decimal(str(r.json()["items"][0]["line_total"])) == Decimal("0.00"),
+        f"got {r.json()['items'][0].get('line_total')}",
+    )
+
+    # ----- AUDIT LOG (admin viewer) -----
+    section("Audit log")
+    r = client.get("/audit-log", headers=auth)
+    check("audit log readable by admin", r.status_code == 200)
+    rows = r.json()
+    actions = {row["action"] for row in rows}
+    check(
+        "issue invoice action recorded",
+        "invoice.issue" in actions,
+        f"actions={sorted(actions)}",
+    )
+    check("manufacturing.complete recorded", "manufacturing.complete" in actions)
+    # Filter by action
+    r = client.get("/audit-log", headers=auth, params={"action": "invoice.issue"})
+    check(
+        "filter audit by action",
+        r.status_code == 200 and all(row["action"] == "invoice.issue" for row in r.json()),
+    )
+    # Staff cannot see audit log
+    r = client.get("/audit-log", headers=staff_auth)
+    check("audit log forbidden for staff → 403", r.status_code == 403)
+
+    # ----- MATERIAL COST → real profit -----
+    section("Material cost in profit")
+    r = client.get(f"/products/{cost_product_id}", headers=auth)
+    body = r.json()
+    check(
+        "cost-test product has material_cost ≥ 0",
+        Decimal(str(body["material_cost"])) >= 0,
+        f"material_cost={body['material_cost']}",
+    )
+    # Profit identity should still hold per currency.
+    r = client.get("/reports/profit", headers=auth)
+    pr = r.json()
+    check(
+        "profit identity per currency still holds",
+        all(
+            Decimal(str(b["profit"]))
+            == (Decimal(str(b["revenue"])) - Decimal(str(b["making_cost"]))).quantize(Decimal("0.01"))
+            for b in pr["by_currency"]
+        ),
+    )
+
+    # ----- LOGIN RATE LIMIT (slowapi: 10/minute) -----
+    section("Login rate limit")
+    for _ in range(10):
+        client.post("/auth/login", json={"email": "admin@jewelryerp.com", "password": "wrong"})
+    r = client.post("/auth/login", json={"email": "admin@jewelryerp.com", "password": "wrong"})
+    check(
+        "11th login attempt within a minute → 429",
+        r.status_code == 429,
+        f"got {r.status_code}",
+    )
 
     # ----- LIST/FILTER ENDPOINTS -----
     section("List filters")

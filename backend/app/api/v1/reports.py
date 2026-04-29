@@ -11,7 +11,9 @@ from app.models.manufacturing import ManufacturingJob
 from app.models.product import Product
 from app.models.vendor import Vendor, VendorType
 from app.schemas.reports import (
+    CurrencyTotal,
     LossReport,
+    ProfitCurrencyTotal,
     ProfitReport,
     ProfitRow,
     SalesBucket,
@@ -57,39 +59,55 @@ async def sales_report(
     range_from: datetime | None = Query(default=None),
     range_to: datetime | None = Query(default=None),
 ) -> SalesReport:
-    """Aggregate issued (and paid) invoices by sale_type within an optional date range."""
-    base = select(
-        Invoice.sale_type,
-        func.count(Invoice.id),
-        func.coalesce(func.sum(Invoice.subtotal), 0),
-        func.coalesce(func.sum(Invoice.discount_amount), 0),
-        func.coalesce(func.sum(Invoice.total), 0),
-    ).where(Invoice.status.in_((InvoiceStatus.issued, InvoiceStatus.paid)))
+    """Aggregate issued/paid invoices by (currency, sale_type) within an optional date range."""
+    base = (
+        select(
+            Invoice.currency,
+            Invoice.sale_type,
+            func.count(Invoice.id),
+            func.coalesce(func.sum(Invoice.subtotal), 0),
+            func.coalesce(func.sum(Invoice.discount_amount), 0),
+            func.coalesce(func.sum(Invoice.total), 0),
+        )
+        .where(Invoice.status.in_((InvoiceStatus.issued, InvoiceStatus.paid)))
+    )
     if range_from is not None:
         base = base.where(Invoice.issued_at >= range_from)
     if range_to is not None:
         base = base.where(Invoice.issued_at <= range_to)
-    base = base.group_by(Invoice.sale_type)
+    base = base.group_by(Invoice.currency, Invoice.sale_type).order_by(
+        Invoice.currency, Invoice.sale_type
+    )
 
     rows = (await db.execute(base)).all()
     buckets = [
         SalesBucket(
+            currency=cur,
             sale_type=st,
             invoice_count=n,
             subtotal=Decimal(str(s)),
             discount=Decimal(str(d)),
             total=Decimal(str(t)),
         )
-        for (st, n, s, d, t) in rows
+        for (cur, st, n, s, d, t) in rows
     ]
-    invoice_count = sum(b.invoice_count for b in buckets)
-    grand_total = sum((b.total for b in buckets), Decimal("0"))
+
+    # Per-currency rollup
+    by_cur: dict[str, dict] = {}
+    for b in buckets:
+        agg = by_cur.setdefault(b.currency.value, {"n": 0, "total": Decimal("0")})
+        agg["n"] += b.invoice_count
+        agg["total"] += b.total
+
     return SalesReport(
         range_from=range_from,
         range_to=range_to,
         by_sale_type=buckets,
-        invoice_count=invoice_count,
-        grand_total=grand_total,
+        by_currency=[
+            CurrencyTotal(currency=k, invoice_count=v["n"], total=v["total"])
+            for k, v in sorted(by_cur.items())
+        ],
+        invoice_count=sum(b.invoice_count for b in buckets),
     )
 
 
@@ -167,6 +185,8 @@ async def profit_report(
     Excludes draft and void invoices. Material value is *not* counted as cost
     (it's tracked via inventory and stock movements).
     """
+    # Cost of goods sold per invoice = labor (product.total_cost) + material
+    # (product.material_cost) summed across line items, weighted by quantity.
     making_cost_subq = (
         select(
             InvoiceItem.invoice_id.label("invoice_id"),
@@ -174,7 +194,7 @@ async def profit_report(
                 func.sum(
                     case(
                         (Product.id.is_(None), Decimal("0")),
-                        else_=Product.total_cost * InvoiceItem.quantity,
+                        else_=(Product.total_cost + Product.material_cost) * InvoiceItem.quantity,
                     )
                 ),
                 0,
@@ -189,6 +209,7 @@ async def profit_report(
         select(
             Invoice.id,
             Invoice.invoice_no,
+            Invoice.currency,
             Invoice.issued_at,
             Invoice.total,
             func.coalesce(making_cost_subq.c.making_cost, 0),
@@ -203,29 +224,41 @@ async def profit_report(
         stmt = stmt.where(Invoice.issued_at <= range_to)
 
     rows: list[ProfitRow] = []
-    total_rev = Decimal("0")
-    total_cost = Decimal("0")
-    for inv_id, inv_no, issued_at, total, mc in (await db.execute(stmt)).all():
+    by_cur: dict[str, dict] = {}
+    for inv_id, inv_no, currency, issued_at, total, mc in (await db.execute(stmt)).all():
         revenue = Decimal(str(total))
         cost = Decimal(str(mc))
+        profit = (revenue - cost).quantize(Decimal("0.01"))
         rows.append(
             ProfitRow(
                 invoice_id=inv_id,
                 invoice_no=inv_no,
+                currency=currency,
                 issued_at=issued_at,
                 revenue=revenue,
                 making_cost=cost,
-                profit=(revenue - cost).quantize(Decimal("0.01")),
+                profit=profit,
             )
         )
-        total_rev += revenue
-        total_cost += cost
+        agg = by_cur.setdefault(
+            currency.value,
+            {"revenue": Decimal("0"), "cost": Decimal("0"), "profit": Decimal("0")},
+        )
+        agg["revenue"] += revenue
+        agg["cost"] += cost
+        agg["profit"] += profit
 
     return ProfitReport(
         range_from=range_from,
         range_to=range_to,
         rows=rows,
-        total_revenue=total_rev.quantize(Decimal("0.01")),
-        total_making_cost=total_cost.quantize(Decimal("0.01")),
-        total_profit=(total_rev - total_cost).quantize(Decimal("0.01")),
+        by_currency=[
+            ProfitCurrencyTotal(
+                currency=k,
+                revenue=v["revenue"].quantize(Decimal("0.01")),
+                making_cost=v["cost"].quantize(Decimal("0.01")),
+                profit=v["profit"].quantize(Decimal("0.01")),
+            )
+            for k, v in sorted(by_cur.items())
+        ],
     )

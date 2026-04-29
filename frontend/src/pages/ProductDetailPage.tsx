@@ -7,6 +7,7 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { toast } from "@/components/Toast";
 import { apiError } from "@/lib/api-error";
 import { Currency, fmtMoney } from "@/lib/money";
+import { staticUrl } from "@/lib/url";
 
 interface Stone {
   id: number;
@@ -108,7 +109,7 @@ export function ProductDetailPage() {
         <section className="card lg:col-span-1">
           {product.image_url ? (
             <img
-              src={`http://localhost:8000${product.image_url}`}
+              src={staticUrl(product.image_url)}
               alt={product.name}
               className="aspect-square w-full rounded-lg object-cover"
             />

@@ -13,15 +13,18 @@ def price_line(
     stone_weight_ct: Decimal,
     stone_rate_per_ct: Decimal,
     labor_amount: Decimal,
+    line_discount: Decimal = Decimal("0"),
 ) -> tuple[Decimal, Decimal, Decimal]:
     """
     Returns (gold_amount, stone_amount, line_total).
     Gold is purity-adjusted: effective_weight = weight * purity/24 (only when purity given).
+    line_total = gold + stone + labor - line_discount, clamped to >= 0.
     """
     purity_factor = d(gold_purity) / Decimal("24") if gold_purity else Decimal("1")
     gold_amount = (d(gold_weight_g) * purity_factor * d(gold_rate_per_g)).quantize(Decimal("0.01"))
     stone_amount = (d(stone_weight_ct) * d(stone_rate_per_ct)).quantize(Decimal("0.01"))
-    line_total = (gold_amount + stone_amount + d(labor_amount)).quantize(Decimal("0.01"))
+    raw_total = gold_amount + stone_amount + d(labor_amount) - d(line_discount)
+    line_total = max(raw_total, Decimal("0")).quantize(Decimal("0.01"))
     return gold_amount, stone_amount, line_total
 
 

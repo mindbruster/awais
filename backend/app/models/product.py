@@ -31,9 +31,13 @@ class Product(Base, TimestampMixin):
     image_url: Mapped[str | None] = mapped_column(String(500))
 
     # Phase 7 — total making cost rolled up from manufacturing job (labor + polish
-    # + stone fixing + other). Excludes raw material value, which is computed
-    # separately at sale time using the gold rate.
+    # + stone fixing + other). Material value is tracked separately on
+    # `material_cost` so that profit = revenue − (material + labor).
     total_cost: Mapped[float] = mapped_column(Numeric(14, 2), default=0, nullable=False)
+    # Capitalised material value: gold value at completion + sum of stones.
+    # Recomputed when stones are attached/detached. Zero for products that
+    # weren't created via the manufacturing pipeline.
+    material_cost: Mapped[float] = mapped_column(Numeric(14, 2), default=0, nullable=False)
 
     # Per-product stone breakdown — owned by the product, cascade on delete.
     stones: Mapped[list["ProductStone"]] = relationship(  # noqa: F821

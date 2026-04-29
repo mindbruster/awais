@@ -3,6 +3,7 @@ import { AxiosError } from "axios";
 import { api } from "@/api/client";
 import { TextField } from "@/components/Field";
 import { apiError } from "@/lib/api-error";
+import { Currency, fmtMoney } from "@/lib/money";
 
 interface StockReport {
   by_type: {
@@ -17,14 +18,19 @@ interface StockReport {
 
 interface SalesReport {
   by_sale_type: {
+    currency: Currency;
     sale_type: string;
     invoice_count: number;
     subtotal: string;
     discount: string;
     total: string;
   }[];
+  by_currency: {
+    currency: Currency;
+    invoice_count: number;
+    total: string;
+  }[];
   invoice_count: number;
-  grand_total: string;
 }
 
 interface LossReport {
@@ -43,14 +49,18 @@ interface ProfitReport {
   rows: {
     invoice_id: number;
     invoice_no: string;
+    currency: Currency;
     issued_at: string | null;
     revenue: string;
     making_cost: string;
     profit: string;
   }[];
-  total_revenue: string;
-  total_making_cost: string;
-  total_profit: string;
+  by_currency: {
+    currency: Currency;
+    revenue: string;
+    making_cost: string;
+    profit: string;
+  }[];
 }
 
 type ReportState<T> = { data: T | null; forbidden: boolean; error: string | null };
@@ -113,26 +123,37 @@ export function ReportsPage() {
         </div>
       </div>
 
-      <div className="grid gap-4 md:grid-cols-3">
-        <KPI
-          label="Total revenue"
-          value={profit.data?.total_revenue ?? (profit.forbidden ? "—" : "…")}
-          accent="emerald"
-          locked={profit.forbidden}
-        />
-        <KPI
-          label="Making cost"
-          value={profit.data?.total_making_cost ?? (profit.forbidden ? "—" : "…")}
-          accent="amber"
-          locked={profit.forbidden}
-        />
-        <KPI
-          label="Profit"
-          value={profit.data?.total_profit ?? (profit.forbidden ? "—" : "…")}
-          accent="brand"
-          locked={profit.forbidden}
-        />
-      </div>
+      {profit.forbidden ? (
+        <div className="card text-sm text-slate-500">
+          Profit summary requires admin or accountant access.
+        </div>
+      ) : profit.data && profit.data.by_currency.length > 0 ? (
+        <div className="space-y-2">
+          {profit.data.by_currency.map((b) => (
+            <div key={b.currency} className="grid gap-3 md:grid-cols-3">
+              <KPI
+                label={`Revenue (${b.currency})`}
+                value={fmtMoney(b.revenue, b.currency)}
+                accent="emerald"
+              />
+              <KPI
+                label={`Making cost (${b.currency})`}
+                value={fmtMoney(b.making_cost, b.currency)}
+                accent="amber"
+              />
+              <KPI
+                label={`Profit (${b.currency})`}
+                value={fmtMoney(b.profit, b.currency)}
+                accent="brand"
+              />
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="card text-sm text-slate-500">
+          No issued sales in the selected range yet.
+        </div>
+      )}
 
       <div className="grid gap-4 lg:grid-cols-2">
         <section className="card">
@@ -166,12 +187,13 @@ export function ReportsPage() {
         </section>
 
         <section className="card">
-          <h3 className="mb-3 text-sm font-semibold text-slate-700">Sales by type</h3>
+          <h3 className="mb-3 text-sm font-semibold text-slate-700">Sales by currency / type</h3>
           <ReportContents state={sales}>
             {(d) => (
               <table className="w-full text-sm">
                 <thead className="text-left text-xs uppercase text-slate-500">
                   <tr>
+                    <th className="py-1">Currency</th>
                     <th className="py-1">Sale type</th>
                     <th className="py-1 text-right">Count</th>
                     <th className="py-1 text-right">Subtotal</th>
@@ -181,15 +203,20 @@ export function ReportsPage() {
                 </thead>
                 <tbody className="divide-y divide-slate-100">
                   {d.by_sale_type.length === 0 && (
-                    <tr><td className="py-2 text-slate-500" colSpan={5}>No issued sales in range.</td></tr>
+                    <tr><td className="py-2 text-slate-500" colSpan={6}>No issued sales in range.</td></tr>
                   )}
-                  {d.by_sale_type.map((b) => (
-                    <tr key={b.sale_type}>
+                  {d.by_sale_type.map((b, i) => (
+                    <tr key={`${b.currency}-${b.sale_type}-${i}`}>
+                      <td className="py-1.5 font-mono text-xs">{b.currency}</td>
                       <td className="py-1.5">{b.sale_type}</td>
                       <td className="py-1.5 text-right">{b.invoice_count}</td>
-                      <td className="py-1.5 text-right">{b.subtotal}</td>
-                      <td className="py-1.5 text-right text-red-600">{b.discount}</td>
-                      <td className="py-1.5 text-right font-semibold">{b.total}</td>
+                      <td className="py-1.5 text-right">{fmtMoney(b.subtotal, b.currency)}</td>
+                      <td className="py-1.5 text-right text-red-600">
+                        {fmtMoney(b.discount, b.currency)}
+                      </td>
+                      <td className="py-1.5 text-right font-semibold">
+                        {fmtMoney(b.total, b.currency)}
+                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -249,6 +276,7 @@ export function ReportsPage() {
                 <thead className="text-left text-xs uppercase text-slate-500">
                   <tr>
                     <th className="py-1">Invoice</th>
+                    <th className="py-1">Cur</th>
                     <th className="py-1">Issued</th>
                     <th className="py-1 text-right">Revenue</th>
                     <th className="py-1 text-right">Cost</th>
@@ -257,17 +285,22 @@ export function ReportsPage() {
                 </thead>
                 <tbody className="divide-y divide-slate-100">
                   {d.rows.length === 0 && (
-                    <tr><td className="py-2 text-slate-500" colSpan={5}>No issued sales in range.</td></tr>
+                    <tr><td className="py-2 text-slate-500" colSpan={6}>No issued sales in range.</td></tr>
                   )}
                   {d.rows.map((r) => (
                     <tr key={r.invoice_id}>
                       <td className="py-1.5 font-mono text-xs">{r.invoice_no}</td>
+                      <td className="py-1.5 text-xs">{r.currency}</td>
                       <td className="py-1.5 text-xs text-slate-500">
                         {r.issued_at ? new Date(r.issued_at).toLocaleDateString() : "—"}
                       </td>
-                      <td className="py-1.5 text-right">{r.revenue}</td>
-                      <td className="py-1.5 text-right text-amber-700">{r.making_cost}</td>
-                      <td className="py-1.5 text-right font-semibold text-emerald-700">{r.profit}</td>
+                      <td className="py-1.5 text-right">{fmtMoney(r.revenue, r.currency)}</td>
+                      <td className="py-1.5 text-right text-amber-700">
+                        {fmtMoney(r.making_cost, r.currency)}
+                      </td>
+                      <td className="py-1.5 text-right font-semibold text-emerald-700">
+                        {fmtMoney(r.profit, r.currency)}
+                      </td>
                     </tr>
                   ))}
                 </tbody>

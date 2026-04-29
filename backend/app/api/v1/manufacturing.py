@@ -9,6 +9,7 @@ from app.models.inventory import InventoryItem, InventoryType
 from app.models.manufacturing import JobStage, ManufacturingJob
 from app.models.product import Product, ProductStatus
 from app.models.stock_movement import MovementType
+from app.models.user import User
 from app.models.vendor import Vendor, VendorType
 from app.schemas.manufacturing import (
     AssignKarigar,
@@ -22,7 +23,9 @@ from app.schemas.manufacturing import (
     ReceiveFromStoneFixer,
     SetJobCosts,
 )
+from app.services.audit import log_action
 from app.services.inventory import post_movement
+from app.services.product_cost import recompute_material_cost
 from app.services.serial import next_job_no, next_product_serial
 
 router = APIRouter()
@@ -321,7 +324,13 @@ async def set_costs(
     return job
 
 
-@router.post("/{job_id}/complete", response_model=ManufacturingJobRead, dependencies=[write])
+@router.post(
+    "/{job_id}/complete",
+    response_model=ManufacturingJobRead,
+    # Completing a job mints a new product and posts manufacturing_in stock
+    # movements — irreversible without manual reversals, so password-confirm.
+    dependencies=[write, Depends(require_password_confirm)],
+)
 async def complete_job(
     job_id: int, payload: CompleteJob, db: DbSession, current: CurrentUser
 ) -> ManufacturingJob:
@@ -356,6 +365,9 @@ async def complete_job(
     )
     db.add(product)
     await db.flush()
+    # Snapshot the gold value into material_cost using the current PKR rate.
+    # Stones added later via /products/{id}/stones trigger a recompute.
+    await recompute_material_cost(db, product)
 
     inv = InventoryItem(
         type=InventoryType.finished_product,
@@ -385,6 +397,19 @@ async def complete_job(
     job.product_id = product.id
     job.stage = JobStage.completed
 
+    await log_action(
+        db, user=current,
+        action="manufacturing.complete",
+        resource_type="manufacturing_job", resource_id=job.id,
+        details={
+            "product_id": product.id,
+            "product_serial": product.serial_no,
+            "gold_g": str(final_gold_g),
+            "stones_ct": str(final_stones_ct),
+            "labor_cost": str(total_cost),
+            "material_cost": str(product.material_cost),
+        },
+    )
     await db.commit()
     await db.refresh(job)
     return job
@@ -397,14 +422,21 @@ async def cancel_job(
     # Once a job has assigned material, cancelling it is destructive (costs/loss
     # left in the books, materials already moved). Require password confirmation
     # except for jobs still in draft.
-    confirmer=Depends(require_password_confirm),
+    current: User = Depends(require_password_confirm),
 ) -> ManufacturingJob:
     job = await db.get(ManufacturingJob, job_id)
     if job is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Job not found")
     if job.stage in (JobStage.completed, JobStage.cancelled):
         raise HTTPException(status.HTTP_409_CONFLICT, "Job already finalised")
+    prev_stage = job.stage
     job.stage = JobStage.cancelled
+    await log_action(
+        db, user=current,
+        action="manufacturing.cancel",
+        resource_type="manufacturing_job", resource_id=job.id,
+        details={"previous_stage": prev_stage.value},
+    )
     await db.commit()
     await db.refresh(job)
     return job

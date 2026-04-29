@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api } from "@/api/client";
 import { apiError } from "@/lib/api-error";
+import { Currency, fmtMoney } from "@/lib/money";
 
 interface Customer {
   id: number;
@@ -18,6 +19,7 @@ interface InvoiceRow {
   invoice_no: string;
   sale_type: string;
   status: string;
+  currency: Currency;
   total: string;
   issued_at: string | null;
   created_at: string;
@@ -59,13 +61,20 @@ export function CustomerDetailPage() {
   if (!customer || invoices === null)
     return <div className="text-sm text-slate-500">Loading…</div>;
 
-  const lifetime = invoices
-    .filter((i) => i.status === "paid" || i.status === "issued")
-    .reduce((sum, i) => sum + Number(i.total), 0);
-  const paidCount = invoices.filter((i) => i.status === "paid").length;
-  const outstanding = invoices
+  // Money totals are kept per-currency — there's no FX conversion in the system,
+  // so combining PKR + USD into one number would be misleading.
+  const liveInvoices = invoices.filter((i) => i.status === "paid" || i.status === "issued");
+  const lifetimeByCurrency = liveInvoices.reduce<Record<string, number>>((acc, i) => {
+    acc[i.currency] = (acc[i.currency] ?? 0) + Number(i.total);
+    return acc;
+  }, {});
+  const outstandingByCurrency = invoices
     .filter((i) => i.status === "issued")
-    .reduce((sum, i) => sum + Number(i.total), 0);
+    .reduce<Record<string, number>>((acc, i) => {
+      acc[i.currency] = (acc[i.currency] ?? 0) + Number(i.total);
+      return acc;
+    }, {});
+  const paidCount = invoices.filter((i) => i.status === "paid").length;
 
   return (
     <div className="space-y-6">
@@ -97,12 +106,28 @@ export function CustomerDetailPage() {
         </section>
 
         <section className="lg:col-span-2 grid gap-4 sm:grid-cols-3">
-          <KPI label="Lifetime spend" value={`₹${lifetime.toFixed(2)}`} accent="brand" />
+          <KPI
+            label="Lifetime spend"
+            value={
+              Object.keys(lifetimeByCurrency).length === 0
+                ? fmtMoney(0, "PKR")
+                : Object.entries(lifetimeByCurrency)
+                    .map(([cur, total]) => fmtMoney(total, cur))
+                    .join("  +  ")
+            }
+            accent="brand"
+          />
           <KPI label="Paid invoices" value={String(paidCount)} accent="emerald" />
           <KPI
             label="Outstanding"
-            value={`₹${outstanding.toFixed(2)}`}
-            accent={outstanding > 0 ? "amber" : "slate"}
+            value={
+              Object.keys(outstandingByCurrency).length === 0
+                ? fmtMoney(0, "PKR")
+                : Object.entries(outstandingByCurrency)
+                    .map(([cur, total]) => fmtMoney(total, cur))
+                    .join("  +  ")
+            }
+            accent={Object.values(outstandingByCurrency).some((v) => v > 0) ? "amber" : "slate"}
           />
         </section>
       </div>
@@ -148,7 +173,9 @@ export function CustomerDetailPage() {
                       ? new Date(i.issued_at).toLocaleDateString()
                       : new Date(i.created_at).toLocaleDateString() + " (draft)"}
                   </td>
-                  <td className="px-4 py-3 text-right font-semibold">{i.total}</td>
+                  <td className="px-4 py-3 text-right font-semibold">
+                    {fmtMoney(i.total, i.currency)}
+                  </td>
                   <td className="px-4 py-3 text-right">
                     <Link
                       to={`/invoices/${i.id}`}

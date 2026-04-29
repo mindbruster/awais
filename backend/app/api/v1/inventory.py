@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import or_, select
 
-from app.api.deps import DbSession, require_perm
+from app.api.deps import DbSession, require_password_confirm, require_perm
 from app.models.inventory import InventoryItem, InventoryType
 from app.schemas.inventory import (
     InventoryItemCreate,
@@ -64,7 +64,11 @@ async def update_item(
     return item
 
 
-@router.delete("/{item_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[delete])
+@router.delete(
+    "/{item_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[delete, Depends(require_password_confirm)],
+)
 async def delete_item(item_id: int, db: DbSession) -> None:
     item = await db.get(InventoryItem, item_id)
     if item is None:

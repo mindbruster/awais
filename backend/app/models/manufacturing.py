@@ -36,7 +36,7 @@ class ManufacturingJob(Base, TimestampMixin):
 
     # Karigar (gold work)
     karigar_id: Mapped[int | None] = mapped_column(ForeignKey("vendors.id", ondelete="SET NULL"))
-    karigar: Mapped[Vendor | None] = relationship(foreign_keys=[karigar_id], lazy="joined")
+    karigar: Mapped[Vendor | None] = relationship(foreign_keys=[karigar_id], lazy="selectin")
     gold_assigned_g: Mapped[float] = mapped_column(Numeric(14, 4), default=0, nullable=False)
     gold_assigned_purity: Mapped[int | None] = mapped_column(Integer)
     gold_assigned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -45,14 +45,14 @@ class ManufacturingJob(Base, TimestampMixin):
 
     # Stone fixer
     stone_fixer_id: Mapped[int | None] = mapped_column(ForeignKey("vendors.id", ondelete="SET NULL"))
-    stone_fixer: Mapped[Vendor | None] = relationship(foreign_keys=[stone_fixer_id], lazy="joined")
+    stone_fixer: Mapped[Vendor | None] = relationship(foreign_keys=[stone_fixer_id], lazy="selectin")
     stones_assigned_ct: Mapped[float] = mapped_column(Numeric(14, 4), default=0, nullable=False)
     stones_used_ct: Mapped[float] = mapped_column(Numeric(14, 4), default=0, nullable=False)
     stones_returned_ct: Mapped[float] = mapped_column(Numeric(14, 4), default=0, nullable=False)
 
     # Polish
     polish_vendor_id: Mapped[int | None] = mapped_column(ForeignKey("vendors.id", ondelete="SET NULL"))
-    polish_vendor: Mapped[Vendor | None] = relationship(foreign_keys=[polish_vendor_id], lazy="joined")
+    polish_vendor: Mapped[Vendor | None] = relationship(foreign_keys=[polish_vendor_id], lazy="selectin")
     weight_before_polish_g: Mapped[float] = mapped_column(Numeric(14, 4), default=0, nullable=False)
     weight_after_polish_g: Mapped[float] = mapped_column(Numeric(14, 4), default=0, nullable=False)
     polish_loss_g: Mapped[float] = mapped_column(Numeric(14, 4), default=0, nullable=False)
@@ -66,6 +66,6 @@ class ManufacturingJob(Base, TimestampMixin):
 
     # Resulting product (created when stage becomes completed)
     product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id", ondelete="SET NULL"))
-    product: Mapped[Product | None] = relationship(lazy="joined")
+    product: Mapped[Product | None] = relationship(lazy="selectin")
 
     notes: Mapped[str | None] = mapped_column(Text)

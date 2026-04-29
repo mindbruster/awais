@@ -18,6 +18,7 @@ class InvoiceItemCreate(BaseModel):
     stone_weight_ct: Decimal = Field(default=Decimal("0"), ge=0)
     stone_rate_per_ct: Decimal = Field(default=Decimal("0"), ge=0)
     labor_amount: Decimal = Field(default=Decimal("0"), ge=0)
+    line_discount: Decimal = Field(default=Decimal("0"), ge=0)
 
 
 class InvoiceItemRead(TimestampedRead, InvoiceItemCreate):

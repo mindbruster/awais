@@ -6,9 +6,10 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, 
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 
-from app.api.deps import DbSession, require_password_confirm, require_perm
+from app.api.deps import CurrentUser, DbSession, require_password_confirm, require_perm
 from app.models.product import Product
 from app.schemas.product import ProductCreate, ProductRead, ProductUpdate
+from app.services.audit import log_action
 from app.services.serial import next_product_serial
 
 router = APIRouter()
@@ -86,12 +87,31 @@ async def update_product(
     status_code=status.HTTP_204_NO_CONTENT,
     dependencies=[delete, Depends(require_password_confirm)],
 )
-async def delete_product(product_id: int, db: DbSession) -> None:
+async def delete_product(product_id: int, db: DbSession, current: CurrentUser) -> None:
     product = await db.get(Product, product_id)
     if product is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Product not found")
+
+    # Capture image path before delete so we can sweep it once the row is gone.
+    image_path: Path | None = None
+    if product.image_url and product.image_url.startswith("/static/"):
+        image_path = UPLOAD_DIR / product.image_url.removeprefix("/static/")
+
+    await log_action(
+        db, user=current,
+        action="product.delete",
+        resource_type="product", resource_id=product.id,
+        details={"serial_no": product.serial_no, "name": product.name},
+    )
     await db.delete(product)
     await db.commit()
+
+    # Best-effort: ignore if it was already missing on disk.
+    if image_path is not None:
+        try:
+            image_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 @router.post("/{product_id}/image", response_model=ProductRead, dependencies=[write])

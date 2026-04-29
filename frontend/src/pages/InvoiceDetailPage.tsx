@@ -4,6 +4,7 @@ import { api } from "@/api/client";
 import { PasswordConfirm } from "@/components/PasswordConfirm";
 import { toast } from "@/components/Toast";
 import { apiError } from "@/lib/api-error";
+import { Currency, fmtMoney } from "@/lib/money";
 
 interface InvoiceItem {
   id: number;
@@ -17,6 +18,7 @@ interface InvoiceItem {
   stone_rate_per_ct: string;
   stone_amount: string;
   labor_amount: string;
+  line_discount: string;
   line_total: string;
 }
 
@@ -26,6 +28,7 @@ interface Invoice {
   sale_type: string;
   status: string;
   customer_id: number;
+  currency: Currency;
   gold_rate_per_g: string;
   subtotal: string;
   discount_amount: string;
@@ -61,6 +64,7 @@ export function InvoiceDetailPage() {
   const [customer, setCustomer] = useState<Customer | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [voiding, setVoiding] = useState(false);
+  const [issuing, setIssuing] = useState(false);
   const [sendingWa, setSendingWa] = useState(false);
 
   const load = useCallback(async () => {
@@ -106,6 +110,21 @@ export function InvoiceDetailPage() {
     }
   };
 
+  const confirmIssue = async (password: string) => {
+    try {
+      await api.post(
+        `/invoices/${invoice.id}/issue`,
+        {},
+        { headers: { "X-Confirm-Password": password } },
+      );
+      toast("success", "Invoice issued");
+      setIssuing(false);
+      load();
+    } catch (err) {
+      toast("error", apiError(err, "Issue failed"));
+    }
+  };
+
   const sendWhatsapp = async () => {
     setSendingWa(true);
     try {
@@ -135,7 +154,7 @@ export function InvoiceDetailPage() {
             {sendingWa ? "Sending…" : "Send WhatsApp"}
           </button>
           {invoice.status === "draft" && (
-            <button className="btn-primary" onClick={() => action("issue", "Invoice issued")}>
+            <button className="btn-primary" onClick={() => setIssuing(true)}>
               Issue
             </button>
           )}
@@ -196,7 +215,8 @@ export function InvoiceDetailPage() {
             {invoice.paid_at && (
               <Row label="Paid">{new Date(invoice.paid_at).toLocaleString()}</Row>
             )}
-            <Row label="Gold rate">₹{invoice.gold_rate_per_g} / g</Row>
+            <Row label="Currency">{invoice.currency}</Row>
+            <Row label="Gold rate">{fmtMoney(invoice.gold_rate_per_g, invoice.currency)} / g</Row>
           </div>
         </section>
 
@@ -208,6 +228,7 @@ export function InvoiceDetailPage() {
               <th className="py-2 text-right">Gold (g)</th>
               <th className="py-2 text-right">Stone (ct)</th>
               <th className="py-2 text-right">Labor</th>
+              <th className="py-2 text-right">Discount</th>
               <th className="py-2 text-right">Line total</th>
             </tr>
           </thead>
@@ -218,35 +239,43 @@ export function InvoiceDetailPage() {
                   {it.description}
                   {it.gold_purity ? (
                     <div className="text-xs text-slate-500">
-                      {it.gold_purity}k @ ₹{it.gold_rate_per_g}/g · gold ₹{it.gold_amount} · stone ₹{it.stone_amount}
+                      {it.gold_purity}k @ {fmtMoney(it.gold_rate_per_g, invoice.currency)}/g · gold {fmtMoney(it.gold_amount, invoice.currency)} · stone {fmtMoney(it.stone_amount, invoice.currency)}
                     </div>
                   ) : null}
                 </td>
                 <td className="py-2 text-right">{it.quantity}</td>
                 <td className="py-2 text-right">{it.gold_weight_g}</td>
                 <td className="py-2 text-right">{it.stone_weight_ct}</td>
-                <td className="py-2 text-right">{it.labor_amount}</td>
-                <td className="py-2 text-right font-medium">{it.line_total}</td>
+                <td className="py-2 text-right">{fmtMoney(it.labor_amount, invoice.currency)}</td>
+                <td className="py-2 text-right text-red-600">
+                  {Number(it.line_discount) > 0 ? `-${fmtMoney(it.line_discount, invoice.currency)}` : "—"}
+                </td>
+                <td className="py-2 text-right font-medium">{fmtMoney(it.line_total, invoice.currency)}</td>
               </tr>
             ))}
           </tbody>
         </table>
 
         <section className="mt-4 ml-auto w-full max-w-xs space-y-1 border-t border-slate-200 pt-3 text-sm">
-          <Row label="Subtotal">₹{invoice.subtotal}</Row>
+          <Row label="Subtotal">{fmtMoney(invoice.subtotal, invoice.currency)}</Row>
           {Number(invoice.discount_amount) > 0 && (
             <Row label="Discount" negative>
-              -₹{invoice.discount_amount}
+              -{fmtMoney(invoice.discount_amount, invoice.currency)}
             </Row>
           )}
           {Number(invoice.discount_weight_g) > 0 && (
             <Row label={`Weight discount (${invoice.discount_weight_g}g)`} negative>
-              -₹{(Number(invoice.discount_weight_g) * Number(invoice.gold_rate_per_g)).toFixed(2)}
+              -{fmtMoney(
+                Number(invoice.discount_weight_g) * Number(invoice.gold_rate_per_g),
+                invoice.currency,
+              )}
             </Row>
           )}
-          {Number(invoice.tax_amount) > 0 && <Row label="Tax">₹{invoice.tax_amount}</Row>}
+          {Number(invoice.tax_amount) > 0 && (
+            <Row label="Tax">{fmtMoney(invoice.tax_amount, invoice.currency)}</Row>
+          )}
           <Row label="Total" bold>
-            ₹{invoice.total}
+            {fmtMoney(invoice.total, invoice.currency)}
           </Row>
         </section>
 
@@ -269,6 +298,19 @@ export function InvoiceDetailPage() {
         description="Voiding will reverse stock movements (for normal sales) and reset product status. Confirm with your password."
         confirmLabel="Void invoice"
         onConfirm={confirmVoid}
+      />
+      <PasswordConfirm
+        open={issuing}
+        onClose={() => setIssuing(false)}
+        title={`Issue ${invoice.invoice_no}?`}
+        description={
+          invoice.sale_type === "on_approval"
+            ? "Issuing an on-approval invoice marks linked products as on_approval (stock untouched)."
+            : "Issuing a normal sale will deduct stock from inventory."
+        }
+        confirmLabel="Issue invoice"
+        destructive={false}
+        onConfirm={confirmIssue}
       />
     </div>
   );

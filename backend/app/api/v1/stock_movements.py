@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 
-from app.api.deps import CurrentUser, DbSession, require_perm
+from app.api.deps import CurrentUser, DbSession, require_password_confirm, require_perm
 from app.models.inventory import InventoryItem
 from app.models.stock_movement import MovementType, StockMovement
 from app.schemas.stock_movement import StockMovementCreate, StockMovementRead
@@ -30,7 +30,12 @@ async def list_movements(
 
 
 @router.post(
-    "", response_model=StockMovementRead, status_code=status.HTTP_201_CREATED, dependencies=[write]
+    "",
+    response_model=StockMovementRead,
+    status_code=status.HTTP_201_CREATED,
+    # Direct stock adjustments bypass the manufacturing/sales audit trail, so we
+    # gate them with password confirmation regardless of role.
+    dependencies=[write, Depends(require_password_confirm)],
 )
 async def create_movement(
     payload: StockMovementCreate, db: DbSession, current: CurrentUser

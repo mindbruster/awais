@@ -97,4 +97,7 @@ class InvoiceItem(Base, TimestampMixin):
     stone_amount: Mapped[float] = mapped_column(Numeric(14, 2), default=0, nullable=False)
 
     labor_amount: Mapped[float] = mapped_column(Numeric(14, 2), default=0, nullable=False)
+    # Per-line discount expressed in the invoice's currency. Subtracted from
+    # (gold + stone + labor) before line_total. Capped to never go negative.
+    line_discount: Mapped[float] = mapped_column(Numeric(14, 2), default=0, nullable=False)
     line_total: Mapped[float] = mapped_column(Numeric(14, 2), default=0, nullable=False)
