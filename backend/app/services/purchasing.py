@@ -19,7 +19,7 @@ from sqlalchemy import Integer, cast, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.account import SystemAccount
-from app.models.design import JobLeg, LegStone
+from app.models.design import JobLeg, LegStatus, LegStone
 from app.models.inventory import InventoryItem, InventoryType
 from app.models.journal import Commodity, JournalEntry, PartyType
 from app.models.purchase import OldGoldPurchase, StonePurchase, StonePurchaseItem
@@ -503,6 +503,13 @@ async def stone_stock(
         )
         .join(Stone, Stone.id == LegStone.stone_id)
         .join(JobLeg, JobLeg.id == LegStone.leg_id)
+        # A cancelled leg consumed nothing. Its stones either came back to the
+        # shelf on cancellation — where they were already credited as a stock
+        # movement, so counting them here would deduct the same carats twice —
+        # or are still outstanding against the worker, which is a debt to chase
+        # and not a stone that went into a piece. Either way, treating a
+        # cancelled leg as consumption understates what is available to set.
+        .where(JobLeg.status != LegStatus.cancelled)
         .group_by(LegStone.stone_id, Stone.quality, Stone.cut, Stone.color, Stone.clarity)
     )
 

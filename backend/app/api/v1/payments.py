@@ -236,6 +236,28 @@ async def create_payment(
             payload.gold_weight_g, payload.gold_purity, payload.gold_rate_per_g
         )
 
+    # A settlement cannot exceed what is owed. Left unchecked, `balance_due`
+    # goes negative and the invoice reads as though the shop owes the customer,
+    # which is a different transaction with a different answer: money handed
+    # back is `direction=paid`, and money taken with no bill behind it is an
+    # advance. Both are recordable — this just refuses to disguise one as the
+    # other. Gold exchange is the common way in: metal worth more than the piece
+    # is exactly the case the reference product pays out in cash.
+    if (
+        invoice is not None
+        and payload.direction is PaymentDirection.received
+        and amount > 0
+    ):
+        _, outstanding = await sales.settlement(db, invoice)
+        if amount > outstanding:
+            over = (amount - outstanding).quantize(Decimal("0.01"))
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"That is {over} more than the {outstanding} still owed on "
+                f"{invoice.invoice_no}. Take the balance against the bill and the rest as an "
+                "advance, or pay the difference back with direction=paid.",
+            )
+
     payment = Payment(
         payment_no=await sales.next_payment_no(db),
         invoice_id=payload.invoice_id,

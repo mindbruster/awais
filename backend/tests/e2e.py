@@ -2398,6 +2398,81 @@ def main() -> int:
     )
     check("books balance after buying stones", client.get("/ledger/trial-balance", headers=auth).json()["balanced"] is True)
 
+    # --- a settlement cannot exceed what is owed ---
+    inv_now = client.get(f"/invoices/{sale['id']}", headers=auth).json()
+    still_owed = Decimal(str(inv_now["balance_due"]))
+    r = client.post(
+        "/payments",
+        headers=auth,
+        json={
+            "customer_id": cust["id"], "invoice_id": sale["id"],
+            "method": "cash", "amount": str(still_owed + Decimal("1000")),
+        },
+    )
+    check(
+        "overpaying a bill is refused rather than driving the balance negative",
+        r.status_code == 409,
+        f"got {r.status_code}: {r.text[:200]}",
+    )
+    r = client.post(
+        "/payments",
+        headers=auth,
+        json={
+            "customer_id": cust["id"], "invoice_id": sale["id"],
+            "method": "cash", "amount": str(still_owed),
+        },
+    )
+    check("settling exactly the balance is fine → 201", r.status_code == 201, f"got {r.status_code}")
+    check(
+        "the bill reads paid once nothing is outstanding",
+        client.get(f"/invoices/{sale['id']}", headers=auth).json()["status"] == "paid",
+    )
+
+    # --- stones on a cancelled leg were never consumed ---
+    avail_before = Decimal(
+        str(
+            next(
+                x for x in client.get("/purchasing/stone-stock", headers=auth).json()["rows"]
+                if x["stone_id"] == diamond_id
+            )["available_weight_ct"]
+        )
+    )
+    cd = client.post("/designs", headers=auth, json={"item_id": taka_id}).json()
+    r = client.post(
+        f"/designs/{cd['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": setting_dept_id, "worker_id": setter["id"],
+            "gold_issued_g": "5", "gold_issued_purity": 22,
+            "gold_source_inventory_id": raw_gold["id"],
+            "piece_count": 10, "wastage_basis": "per_100_pieces",
+            "wastage_per_100_pcs_g": "0.400",
+            "stone_source_inventory_id": raw_stones["id"],
+            "stones": [{"stone_id": diamond_id, "quantity_issued": 10, "weight_issued_ct": "2", "rate_per_ct": "4000"}],
+        },
+    )
+    check("issue a setting leg carrying stones → 201", r.status_code == 201, f"got {r.status_code}: {r.text[:220]}")
+    stone_leg = r.json()
+    r = client.post(
+        f"/designs/legs/{stone_leg['id']}/cancel",
+        headers=pwd_h,
+        json={"gold_recovered_g": "5", "stones_recovered_ct": "2", "reason": "job pulled"},
+    )
+    check("cancel the leg → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:220]}")
+    avail_after = Decimal(
+        str(
+            next(
+                x for x in client.get("/purchasing/stone-stock", headers=auth).json()["rows"]
+                if x["stone_id"] == diamond_id
+            )["available_weight_ct"]
+        )
+    )
+    check(
+        "a cancelled leg consumed no stones — they are back on the shelf",
+        avail_after == avail_before,
+        f"available went {avail_before} -> {avail_after}; a cancelled leg must not read as consumption",
+    )
+
     # ----- LOGIN RATE LIMIT (slowapi: 10/minute) -----
     section("Login rate limit")
     for _ in range(10):

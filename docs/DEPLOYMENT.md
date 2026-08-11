@@ -17,9 +17,13 @@ Three services in one Railway project, all from this repository:
 | **backend** | `/backend` | Dockerfile | `/health` | `api.<your-domain>` |
 | **frontend** | `/frontend` | Dockerfile | `/healthz` | `app.<your-domain>` |
 
-Each service reads its own config file — `backend/railway.toml` and
-`frontend/railway.toml` — which is why the Root Directory setting matters. The
-`railway.json` at the repo root only carries defaults shared by both.
+Each service reads **only** the config file inside its own Root Directory —
+`backend/railway.toml` and `frontend/railway.toml`. That is why the Root
+Directory setting matters, and it is the whole story: Railway has no notion of
+a repo-root file carrying defaults that per-service files inherit or override.
+If a setting is not in the service's own file, it is not applied. (An earlier
+`railway.json` at the repo root implied otherwise and was removed rather than
+left sitting there looking authoritative while doing nothing.)
 
 `docker-compose.prod.yml` is **not** used on Railway. It remains valid for a
 single-host deploy, but see §12: the frontend image changed and compose needs two
@@ -147,9 +151,11 @@ Optional, both safe to omit:
 
 | Variable | Value | Notes |
 |---|---|---|
-| `AI_PROVIDER` | `anthropic` | Omit or `none` and every figure still renders — only the narration is skipped, and `/ask` returns 503 with setup instructions. |
-| `ANTHROPIC_API_KEY` | your key | |
-| `AI_MODEL` | `claude-opus-5` | |
+| `AI_PROVIDER` | `openrouter` or `anthropic` | Omit or `none` and every figure still renders — only the narration is skipped, and `/ask` returns 503 with setup instructions. |
+| `OPENROUTER_API_KEY` | your key | For `openrouter`. Needs no extra Python package. |
+| `ANTHROPIC_API_KEY` | your key | For `anthropic`. That route also needs `pip install anthropic`. |
+| `AI_MODEL` | `z-ai/glm-4.7-flash` | Defaults follow the provider. See `docs/AI_SETUP.md` — note that no GLM model is on OpenRouter's free tier, though this one costs about $0.06/M input. |
+| `FORWARDED_ALLOW_IPS` | leave unset | Only set this if Railway's edge stops being the immediate hop. Setting it to `*` lets any caller choose its own client IP, which disables the login rate limit. |
 | `WHATSAPP_PROVIDER` | `twilio` | Omit and the send endpoint returns 503. |
 | `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` / `TWILIO_WHATSAPP_FROM` | from Twilio | The `FROM` value must keep its `whatsapp:` prefix. |
 
@@ -299,6 +305,28 @@ or Railway itself having a bad day. That is what layer 2 is for.
 
 ### Layer 2 — offsite `pg_dump` to R2
 
+Two things to settle before the job below will run, both of which contradict
+something said earlier in this document if you skip them:
+
+**Reaching the database from outside Railway.** §2 tells you to keep Postgres
+private, and that is right — but a backup running on your own machine or in
+GitHub Actions is *outside*, and the private hostname does not resolve there.
+Enable **TCP Proxy** on the Postgres service (Railway → Postgres → Settings →
+Networking → TCP Proxy) and use the proxy host and port it gives you in
+`PGURL`. That is a public endpoint protected only by the password, so treat the
+credential accordingly: never commit it, and rotate it if it leaks. If you would
+rather not expose it at all, run the job as a Railway cron *inside* the project,
+where the private hostname works and no proxy is needed.
+
+**Matching the client to the server.** `pg_dump` refuses to dump from a server
+newer than itself, and Railway upgrades its Postgres image without asking. The
+job below pins `postgres:16-alpine`; check the real version and change the tag
+to match if it differs, or the backup starts failing silently one morning:
+
+```bash
+docker run --rm postgres:16-alpine psql "$PGURL" -tAc "SHOW server_version;"
+```
+
 **This is not automated by this repository.** Nothing in this repo creates the
 schedule; you have to set it up once. Here is the exact thing to set up.
 
@@ -369,13 +397,28 @@ aws s3 ls s3://jewelry-erp-backups/ --endpoint-url https://<account-id>.r2.cloud
 aws s3 cp s3://jewelry-erp-backups/<STAMP>.dump ./restore-test.dump \
   --endpoint-url https://<account-id>.r2.cloudflarestorage.com
 
-# 2. Restore into a throwaway local Postgres 16.
-docker run -d --name pg-restore-test -e POSTGRES_PASSWORD=test -p 55432:5432 postgres:16-alpine
-sleep 5
+# 2. Check what major version the server actually is, and match it below.
+#    pg_restore refuses a dump made by a NEWER pg_dump than itself, and Railway
+#    upgrades its Postgres image without asking you.
+docker run --rm postgres:16-alpine psql "$PGURL" -tAc "SHOW server_version;"
+
+# 3. Restore into a throwaway local Postgres of that same major version.
+#    Everything runs INSIDE the container: no port mapping, no --network host.
+#    `--network host` does not reach the host on macOS or Windows — Docker
+#    Desktop runs the engine in a VM, so a drill written that way silently
+#    fails on the machines most people actually try it from, which is the one
+#    thing a restore drill must never do.
+docker run -d --name pg-restore-test -e POSTGRES_PASSWORD=test postgres:16-alpine
+until docker exec pg-restore-test pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
 docker exec pg-restore-test psql -U postgres -c "CREATE DATABASE restore_test;"
-docker run --rm -i --network host -v "$PWD/restore-test.dump:/d.dump" postgres:16-alpine \
-  pg_restore --no-owner --no-privileges -d "postgresql://postgres:test@127.0.0.1:55432/restore_test" /d.dump
+docker cp ./restore-test.dump pg-restore-test:/tmp/d.dump
+docker exec pg-restore-test \
+  pg_restore --no-owner --no-privileges -U postgres -d restore_test /tmp/d.dump
 ```
+
+Note the `until pg_isready` rather than `sleep 5`: on a slow machine five
+seconds is not always enough, and a drill that fails intermittently gets
+skipped, which defeats the point of having one.
 
 ### 3. Prove it is actually the books, not an empty schema
 

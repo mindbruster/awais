@@ -126,9 +126,24 @@ async def upload_image(
             f"Unsupported file type: {ext or 'unknown'}",
         )
 
-    contents = await file.read()
-    if len(contents) > MAX_IMAGE_BYTES:
-        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "Image exceeds 5MB limit")
+    # Read in chunks and stop at the limit rather than pulling the whole body in
+    # and measuring it. `await file.read()` on a 2 GB upload buys a 2 GB
+    # allocation before the check can fire, which on a container with a memory
+    # cap kills the process — one oversized POST takes the shop's till offline
+    # instead of getting a 413.
+    chunks: list[bytes] = []
+    total = 0
+    while chunk := await file.read(64 * 1024):
+        total += len(chunk)
+        if total > MAX_IMAGE_BYTES:
+            raise HTTPException(
+                status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                f"Image exceeds the {MAX_IMAGE_BYTES // (1024 * 1024)}MB limit.",
+            )
+        chunks.append(chunk)
+    contents = b"".join(chunks)
+    if not contents:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "The uploaded file is empty.")
 
     storage = get_storage()
     previous_url = product.image_url

@@ -51,6 +51,11 @@ _PCT = Decimal("0.01")
 # change in his rate is treated as a trend. Two bad legs in a fortnight is a
 # bad fortnight; that is not what this report is for.
 MIN_LEGS_PER_HALF = 3
+# Below this, a wastage difference is not worth a shop owner's attention: it is
+# inside the noise of a bench scale and of how carefully each piece was weighed.
+# Expressed in grams because that is what the owner would have to go and argue
+# about with the worker.
+MIN_MATERIAL_GRAMS = Decimal("0.5")
 # "Up by more than half again" — the rate has to move by 50% to count, so
 # ordinary drift between one month and the next stays quiet.
 DETERIORATION_RATIO = Decimal("1.5")
@@ -187,10 +192,14 @@ async def wastage_anomalies(
     # The worst excess-to-allowance ratio in the shop. Ratio rather than raw
     # grams so a worker who handles a lot of metal isn't automatically the
     # answer — this is "who overran his own terms by the most".
+    # Floored on both sides. Without a floor on the allowance, a worker allowed
+    # 0.01g who overran by 0.02g outranks one who lost half a kilo; without a
+    # floor on the excess, someone is flagged as "worst" whenever any excess
+    # exists anywhere, even when the whole shop is doing fine.
     ratios = {
         wid: (a["excess"] / a["allowed"]).quantize(_PCT)
         for wid, a in workers.items()
-        if a["allowed"] > 0 and a["excess"] > 0
+        if a["allowed"] >= MIN_MATERIAL_GRAMS and a["excess"] >= MIN_MATERIAL_GRAMS
     }
     worst_id = max(ratios, key=lambda k: ratios[k]) if ratios else None
 
@@ -205,11 +214,18 @@ async def wastage_anomalies(
         # Both halves need enough legs, and the earlier rate has to be a real
         # positive baseline — a worker whose earlier half netted zero or came
         # back heavier has no rate to have got worse than.
+        # A ratio alone flags noise. A worker whose wastage went from 0.02g to
+        # 0.04g across six small legs trips the same threshold as one losing
+        # hundreds of grams, and a report that cries wolf gets ignored — which
+        # costs more than not having it. The extra grams have to be worth
+        # chasing in their own right as well as proportionally.
+        extra_g = (recent["actual"] - recent["issued"] * earlier_rate / Decimal("100")).quantize(_G)
         if (
             earlier["legs"] >= MIN_LEGS_PER_HALF
             and recent["legs"] >= MIN_LEGS_PER_HALF
             and earlier_rate > 0
             and recent_rate > earlier_rate * DETERIORATION_RATIO
+            and extra_g >= MIN_MATERIAL_GRAMS
         ):
             flags.append("deteriorating")
         if wid is not None and wid == worst_id:

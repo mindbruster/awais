@@ -38,17 +38,29 @@ mark_paid_perm = Depends(require_perm("invoice:mark_paid"))
 void_perm = Depends(require_perm("invoice:void"))
 
 
-async def _load_invoice(db, invoice_id: int) -> Invoice:
+async def _load_invoice(db, invoice_id: int, *, lock: bool = False) -> Invoice:
     """
     Always re-fetch the full row after a mutating commit. Refreshing only
     `attribute_names=["items"]` leaves columns with `onupdate=now()` (e.g.
     `updated_at`) expired, which then triggers a sync lazy-load during
     Pydantic serialization (MissingGreenlet error).
+
+    `lock=True` on the three paths that change an invoice's status. Each of
+    them reads the status, decides, and then writes — issuing deducts stock and
+    posts a receivable, marking paid mints a payment, voiding reverses both. Two
+    requests arriving together both pass the status check and both act, which
+    means stock deducted twice or the same bill posted to the books twice, and
+    unpicking that needs hand-written reversals. The lock is on the bare id
+    because the row eager-joins its customer and Postgres refuses FOR UPDATE
+    across an outer join.
     """
+    if lock:
+        await db.execute(select(Invoice.id).where(Invoice.id == invoice_id).with_for_update())
     stmt = (
         select(Invoice)
         .options(selectinload(Invoice.items))
         .where(Invoice.id == invoice_id)
+        .execution_options(populate_existing=True)
     )
     result = (await db.execute(stmt)).scalar_one_or_none()
     if result is None:
@@ -233,14 +245,7 @@ async def issue_invoice(
     the two that this system exists to prevent, so both happen in the one
     transaction.
     """
-    stmt = (
-        select(Invoice)
-        .options(selectinload(Invoice.items))
-        .where(Invoice.id == invoice_id)
-    )
-    invoice = (await db.execute(stmt)).scalar_one_or_none()
-    if invoice is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Invoice not found")
+    invoice = await _load_invoice(db, invoice_id, lock=True)
     if invoice.status != InvoiceStatus.draft:
         raise HTTPException(status.HTTP_409_CONFLICT, "Only draft invoices can be issued")
 
@@ -321,7 +326,7 @@ async def mark_paid(invoice_id: int, db: DbSession, current: CurrentUser) -> Inv
     part payment, a bank transfer, old gold — goes through POST /payments,
     which is the same code path with the details filled in.
     """
-    invoice = await _load_invoice(db, invoice_id)
+    invoice = await _load_invoice(db, invoice_id, lock=True)
     if invoice.status is not InvoiceStatus.issued:
         raise HTTPException(status.HTTP_409_CONFLICT, "Only issued invoices can be marked paid")
 
@@ -411,7 +416,7 @@ async def void_invoice(
     the journal with a reversal pointing at it, so the books can still explain
     how the receivable appeared and why it went away.
     """
-    invoice = await _load_invoice(db, invoice_id)
+    invoice = await _load_invoice(db, invoice_id, lock=True)
     if invoice.status not in (InvoiceStatus.draft, InvoiceStatus.issued):
         raise HTTPException(status.HTTP_409_CONFLICT, "Cannot void in current status")
 
