@@ -24,6 +24,9 @@ PERMISSIONS: dict[str, set[str]] = {
         "report:stock", "report:sales", "report:loss", "report:profit",
         "gold_rate:read", "gold_rate:write",
         "stone:read",
+        # Reference data: accountants maintain the financial masters (banks,
+        # accounts) and need to read the rest to reconcile.
+        "master:read", "master:write",
     },
     "staff": {
         "customer:read", "customer:write", "customer:delete",
@@ -37,6 +40,10 @@ PERMISSIONS: dict[str, set[str]] = {
         "report:stock", "report:loss",
         "gold_rate:read",
         "stone:read", "stone:write", "stone:delete",
+        # Staff select from reference data all day but must not redefine the
+        # shop's departments, items or bank accounts. Read only; deleting a
+        # master is admin-only because it silently reshapes historic reports.
+        "master:read",
     },
 }
 

@@ -17,6 +17,18 @@ class StoneKind(str, enum.Enum):
     other = "other"
 
 
+class StoneCategory(str, enum.Enum):
+    """
+    The top-level split the shop actually buys and reports by. Diamonds are
+    purchased, graded, priced and stocked differently from coloured stones —
+    they carry cut/colour/clarity and a quality grade, and they're sized by
+    PTR — so the entry forms and the stock report branch on this.
+    """
+
+    stone = "stone"
+    diamond = "diamond"
+
+
 class Stone(Base, TimestampMixin):
     """
     Master catalogue of stone *types* (not physical inventory). A stone here
@@ -31,6 +43,19 @@ class Stone(Base, TimestampMixin):
     kind: Mapped[StoneKind] = mapped_column(
         Enum(StoneKind, name="stone_kind"), nullable=False, index=True
     )
+    category: Mapped[StoneCategory] = mapped_column(
+        Enum(StoneCategory, name="stone_category"),
+        nullable=False,
+        default=StoneCategory.stone,
+        index=True,
+    )
+    # Optional short code, mirroring the item abbreviation. Used on job cards
+    # and stone labels where the full name won't fit.
+    abbreviation: Mapped[str | None] = mapped_column(String(8), index=True)
+    # Trade grade — "deluxe" or "commercial" for diamonds. Free-form against
+    # the `quality` attribute options rather than an enum, because shops invent
+    # their own grades.
+    quality: Mapped[str | None] = mapped_column(String(60), index=True)
     # Free-form so you can store "round", "princess", "marquise", etc.
     cut: Mapped[str | None] = mapped_column(String(40))
     # GIA color grade or local label: D-Z for diamonds; for coloured stones use

@@ -1207,6 +1207,186 @@ def main() -> int:
         str(d7_row),
     )
 
+    # ----- MASTER DATA (phase 2) -----
+    section("Master data")
+
+    # Departments ship seeded so a fresh install is usable immediately.
+    r = client.get("/departments", headers=auth)
+    depts = r.json()
+    check("9 departments seeded", r.status_code == 200 and len(depts) == 9, f"got {len(depts)}")
+    check(
+        "departments ordered by sequence",
+        [d["code"] for d in depts][:3] == ["RP", "CAST", "CLEAN"],
+        str([d["code"] for d in depts][:3]),
+    )
+    setting = next((d for d in depts if d["code"] == "SET"), None)
+    check("setting is the stone-consuming stage", setting and setting["consumes_stones"] is True)
+
+    r = client.post("/departments", headers=auth, json={"name": "Enamel", "code": "enml", "sequence": 95})
+    check("create department → 201", r.status_code == 201, f"got {r.status_code}")
+    check("department code upper-cased", r.json()["code"] == "ENML", r.json()["code"])
+    enamel_id = r.json()["id"]
+    r = client.post("/departments", headers=auth, json={"name": "Enamel 2", "code": "ENML"})
+    check("duplicate department code → 409", r.status_code == 409, f"got {r.status_code}")
+
+    # Items — the abbreviation seeds design numbers, so it is normalised and unique.
+    r = client.post("/items", headers=auth, json={"name": "Taka", "abbreviation": "tk"})
+    check("create item → 201", r.status_code == 201, f"got {r.status_code}")
+    check("item abbreviation upper-cased", r.json()["abbreviation"] == "TK", r.json()["abbreviation"])
+    r = client.post("/items", headers=auth, json={"name": "Another Taka", "abbreviation": "TK"})
+    check("duplicate item abbreviation → 409", r.status_code == 409, f"got {r.status_code}")
+    r = client.post("/items", headers=auth, json={"name": "Bad", "abbreviation": "T-K!"})
+    check("non-alphanumeric abbreviation → 422", r.status_code == 422, f"got {r.status_code}")
+    r = client.get("/items", headers=auth, params={"q": "tak"})
+    check("item search matches", r.status_code == 200 and len(r.json()) >= 1)
+
+    # Attribute options replace the free-text cut/colour/clarity columns.
+    r = client.get("/attribute-options/by-kind/clarity", headers=auth)
+    clarities = r.json()
+    check("clarity options seeded", r.status_code == 200 and len(clarities) == 11, f"got {len(clarities)}")
+    check("clarity options sorted", clarities[0]["value"] == "FL", clarities[0]["value"])
+    r = client.get("/attribute-options/by-kind/quality", headers=auth)
+    check(
+        "diamond quality grades seeded",
+        {o["value"] for o in r.json()} == {"Deluxe", "Commercial"},
+        str([o["value"] for o in r.json()]),
+    )
+    r = client.post("/attribute-options", headers=auth, json={"kind": "clarity", "value": "FL"})
+    check("duplicate option within a kind → 409", r.status_code == 409, f"got {r.status_code}")
+    r = client.post("/attribute-options", headers=auth, json={"kind": "cut", "value": "FL"})
+    check("same value under a different kind is fine → 201", r.status_code == 201, f"got {r.status_code}")
+
+    # Countries and cities — city names repeat across countries.
+    pk = client.post("/countries", headers=auth, json={"name": "Pakistan", "iso_code": "pk"}).json()
+    check("country iso upper-cased", pk["iso_code"] == "PK", str(pk.get("iso_code")))
+    india = client.post("/countries", headers=auth, json={"name": "India"}).json()
+    r = client.post("/cities", headers=auth, json={"name": "Karachi", "country_id": pk["id"]})
+    check("create city → 201", r.status_code == 201, f"got {r.status_code}")
+    karachi_id = r.json()["id"]
+    check("city read carries country name", r.json()["country_name"] == "Pakistan", str(r.json()))
+    r = client.post("/cities", headers=auth, json={"name": "Karachi", "country_id": pk["id"]})
+    check("duplicate city in same country → 409", r.status_code == 409, f"got {r.status_code}")
+    r = client.post("/cities", headers=auth, json={"name": "Hyderabad", "country_id": pk["id"]})
+    r2 = client.post("/cities", headers=auth, json={"name": "Hyderabad", "country_id": india["id"]})
+    check(
+        "same city name in a different country is allowed",
+        r.status_code == 201 and r2.status_code == 201,
+        f"{r.status_code}/{r2.status_code}",
+    )
+    r = client.delete(f"/countries/{pk['id']}", headers=pwd_h)
+    check("delete country with cities → 409", r.status_code == 409, f"got {r.status_code}")
+
+    # Banks carry the deduction rate; accounts carry the opening cash.
+    bank = client.post(
+        "/banks", headers=auth, json={"name": "Meezan", "deduction_rate": "0.5"}
+    ).json()
+    r = client.post(
+        "/bank-accounts",
+        headers=auth,
+        json={
+            "bank_id": bank["id"],
+            "account_no": "0123456789",
+            "title": "Main current",
+            "opening_balance": "2000000",
+        },
+    )
+    check("create bank account → 201", r.status_code == 201, f"got {r.status_code}")
+    check("bank account read carries bank name", r.json()["bank_name"] == "Meezan", str(r.json()))
+    check("opening balance stored", Decimal(str(r.json()["opening_balance"])) == Decimal("2000000"))
+    r = client.post(
+        "/bank-accounts", headers=auth, json={"bank_id": bank["id"], "account_no": "0123456789"}
+    )
+    check("duplicate account no on same bank → 409", r.status_code == 409, f"got {r.status_code}")
+    r = client.delete(f"/banks/{bank['id']}", headers=pwd_h)
+    check("delete bank with accounts → 409", r.status_code == 409, f"got {r.status_code}")
+
+    # Customers gained the counter fields.
+    r = client.post(
+        "/customers",
+        headers=auth,
+        json={
+            "name": "Sagar Jalal",
+            "cnic": "42101-1234567-1",
+            "phone2": "03001234567",
+            "reference": "Hanif Jeweller",
+            "date_of_birth": "1985-04-12",
+            "city_id": karachi_id,
+            "country_id": pk["id"],
+            "opening_balance": "50000",
+        },
+    )
+    check("create customer with extended fields → 201", r.status_code == 201, f"got {r.status_code}")
+    cust = r.json()
+    check("customer city/country names resolved", cust["city_name"] == "Karachi" and cust["country_name"] == "Pakistan", str(cust))
+    check("customer opening balance stored", Decimal(str(cust["opening_balance"])) == Decimal("50000"))
+    r = client.post("/customers", headers=auth, json={"name": "Bare Minimum"})
+    check("name alone is still enough to create a customer", r.status_code == 201, f"got {r.status_code}")
+
+    # Workers gained a department, agreed wastage and opening balances.
+    casting_id = next(d["id"] for d in depts if d["code"] == "CAST")
+    r = client.post(
+        "/vendors",
+        headers=auth,
+        json={
+            "name": "Zahid Bhai",
+            "type": "karigar",
+            "department_id": casting_id,
+            "default_wastage_pct": "3.5",
+            "opening_gold_g": "12.5",
+            "cnic": "42101-7654321-9",
+        },
+    )
+    check("create worker with department → 201", r.status_code == 201, f"got {r.status_code}")
+    w = r.json()
+    check("worker department name resolved", w["department_name"] == "Casting", str(w))
+    check("worker opening gold stored", Decimal(str(w["opening_gold_g"])) == Decimal("12.5"))
+    check(
+        "worker's own wastage wins",
+        Decimal(str(w["effective_wastage_pct"])) == Decimal("3.5"),
+        str(w["effective_wastage_pct"]),
+    )
+    client.patch(f"/departments/{enamel_id}", headers=auth, json={"default_wastage_pct": "2.0"})
+    r = client.post(
+        "/vendors",
+        headers=auth,
+        json={"name": "Inherits Dept Rate", "type": "other", "department_id": enamel_id},
+    )
+    check(
+        "worker with no rate inherits the department's",
+        Decimal(str(r.json()["effective_wastage_pct"])) == Decimal("2.0"),
+        str(r.json().get("effective_wastage_pct")),
+    )
+    r = client.delete(f"/departments/{casting_id}", headers=pwd_h)
+    check("delete department with workers → 409", r.status_code == 409, f"got {r.status_code}")
+
+    # Stones gained category / abbreviation / quality.
+    r = client.post(
+        "/stones",
+        headers=auth,
+        json={
+            "name": "12 PTR",
+            "kind": "diamond",
+            "category": "diamond",
+            "abbreviation": "D12",
+            "quality": "Commercial",
+            "cut": "Round",
+            "clarity": "VS1",
+        },
+    )
+    check("create diamond with category/quality → 201", r.status_code == 201, f"got {r.status_code}")
+    check("stone category stored", r.json()["category"] == "diamond", str(r.json().get("category")))
+    check("stone quality stored", r.json()["quality"] == "Commercial")
+
+    # RBAC — staff select from masters but must not redefine them.
+    r = client.get("/departments", headers=staff_auth)
+    check("staff can read masters", r.status_code == 200, f"got {r.status_code}")
+    r = client.post("/departments", headers=staff_auth, json={"name": "Sneaky", "code": "SNK"})
+    check("staff cannot create masters → 403", r.status_code == 403, f"got {r.status_code}")
+    r = client.post("/items", headers=acct_auth, json={"name": "Bangle", "abbreviation": "BNG"})
+    check("accountant can create masters → 201", r.status_code == 201, f"got {r.status_code}")
+    r = client.delete(f"/items/{r.json()['id']}", headers={**acct_auth, "X-Confirm-Password": "acct1234"})
+    check("accountant cannot delete masters → 403", r.status_code == 403, f"got {r.status_code}")
+
     # ----- LOGIN RATE LIMIT (slowapi: 10/minute) -----
     section("Login rate limit")
     for _ in range(10):

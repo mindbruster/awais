@@ -2,7 +2,7 @@ import { FormEvent, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "@/api/client";
 import { Modal } from "@/components/Modal";
-import { TextField, TextArea } from "@/components/Field";
+import { SelectField, TextField, TextArea } from "@/components/Field";
 import { SearchBox, Toolbar } from "@/components/Toolbar";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { toast } from "@/components/Toast";
@@ -12,9 +12,24 @@ interface Customer {
   id: number;
   name: string;
   phone: string | null;
+  phone2: string | null;
   email: string | null;
+  cnic: string | null;
   address: string | null;
+  reference: string | null;
+  date_of_birth: string | null;
+  anniversary: string | null;
+  city_id: number | null;
+  country_id: number | null;
+  city_name: string | null;
+  country_name: string | null;
+  opening_balance: string;
   notes: string | null;
+}
+
+interface NamedRow {
+  id: number;
+  name: string;
 }
 
 export function CustomersPage() {
@@ -162,18 +177,44 @@ function CustomerForm({
 }) {
   const [name, setName] = useState("");
   const [phone, setPhone] = useState("");
+  const [phone2, setPhone2] = useState("");
   const [email, setEmail] = useState("");
+  const [cnic, setCnic] = useState("");
   const [address, setAddress] = useState("");
+  const [reference, setReference] = useState("");
+  const [dob, setDob] = useState("");
+  const [anniversary, setAnniversary] = useState("");
+  const [countryId, setCountryId] = useState("");
+  const [cityId, setCityId] = useState("");
+  const [openingBalance, setOpeningBalance] = useState("");
   const [notes, setNotes] = useState("");
+  const [countries, setCountries] = useState<NamedRow[]>([]);
+  const [cities, setCities] = useState<NamedRow[]>([]);
   const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
     if (open) {
       setName(existing?.name ?? "");
       setPhone(existing?.phone ?? "");
+      setPhone2(existing?.phone2 ?? "");
       setEmail(existing?.email ?? "");
+      setCnic(existing?.cnic ?? "");
       setAddress(existing?.address ?? "");
+      setReference(existing?.reference ?? "");
+      setDob(existing?.date_of_birth ?? "");
+      setAnniversary(existing?.anniversary ?? "");
+      setCountryId(existing?.country_id ? String(existing.country_id) : "");
+      setCityId(existing?.city_id ? String(existing.city_id) : "");
+      setOpeningBalance(existing?.opening_balance ?? "");
       setNotes(existing?.notes ?? "");
+      api
+        .get<NamedRow[]>("/countries", { params: { limit: "500", is_active: "true" } })
+        .then((r) => setCountries(r.data))
+        .catch(() => setCountries([]));
+      api
+        .get<NamedRow[]>("/cities", { params: { limit: "500", is_active: "true" } })
+        .then((r) => setCities(r.data))
+        .catch(() => setCities([]));
     }
   }, [open, existing]);
 
@@ -184,8 +225,16 @@ function CustomerForm({
       const body = {
         name,
         phone: phone || null,
+        phone2: phone2 || null,
         email: email || null,
+        cnic: cnic || null,
         address: address || null,
+        reference: reference || null,
+        date_of_birth: dob || null,
+        anniversary: anniversary || null,
+        country_id: countryId ? Number(countryId) : null,
+        city_id: cityId ? Number(cityId) : null,
+        opening_balance: openingBalance || "0",
         notes: notes || null,
       };
       if (existing) {
@@ -206,14 +255,75 @@ function CustomerForm({
   return (
     <Modal open={open} onClose={onClose} title={existing ? "Edit customer" : "New customer"}>
       <form onSubmit={submit} className="space-y-4">
-        <TextField label="Name" required value={name} onChange={(e) => setName(e.target.value)} />
+        <TextField
+          label="Name"
+          required
+          hint="The only required field — capture the rest when the customer offers it"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+        />
         <div className="grid grid-cols-2 gap-3">
           <TextField label="Phone" value={phone} onChange={(e) => setPhone(e.target.value)} />
+          <TextField
+            label="Second phone"
+            value={phone2}
+            onChange={(e) => setPhone2(e.target.value)}
+          />
           <TextField
             label="Email"
             type="email"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
+          />
+          <TextField
+            label="CNIC"
+            value={cnic}
+            onChange={(e) => setCnic(e.target.value)}
+            placeholder="42101-1234567-1"
+          />
+          <SelectField
+            label="Country"
+            options={[
+              { value: "", label: "—" },
+              ...countries.map((c) => ({ value: c.id, label: c.name })),
+            ]}
+            value={countryId}
+            onChange={(e) => setCountryId(e.target.value)}
+          />
+          <SelectField
+            label="City"
+            options={[
+              { value: "", label: "—" },
+              ...cities.map((c) => ({ value: c.id, label: c.name })),
+            ]}
+            value={cityId}
+            onChange={(e) => setCityId(e.target.value)}
+          />
+          <TextField
+            label="Date of birth"
+            type="date"
+            value={dob}
+            onChange={(e) => setDob(e.target.value)}
+          />
+          <TextField
+            label="Anniversary"
+            type="date"
+            value={anniversary}
+            onChange={(e) => setAnniversary(e.target.value)}
+          />
+          <TextField
+            label="Reference"
+            hint="Who introduced them"
+            value={reference}
+            onChange={(e) => setReference(e.target.value)}
+          />
+          <TextField
+            label="Opening balance"
+            type="number"
+            step="0.01"
+            hint="Positive = customer owes the shop"
+            value={openingBalance}
+            onChange={(e) => setOpeningBalance(e.target.value)}
           />
         </div>
         <TextArea label="Address" value={address} onChange={(e) => setAddress(e.target.value)} />

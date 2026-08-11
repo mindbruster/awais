@@ -11,9 +11,22 @@ interface Vendor {
   id: number;
   name: string;
   type: string;
+  department_id: number | null;
+  department_name: string | null;
   phone: string | null;
+  cnic: string | null;
   address: string | null;
+  default_wastage_pct: string | null;
+  effective_wastage_pct: string | null;
+  opening_cash_balance: string;
+  opening_gold_g: string;
+  is_active: boolean;
   notes: string | null;
+}
+
+interface Department {
+  id: number;
+  name: string;
 }
 
 const VENDOR_TYPES = [
@@ -66,16 +79,17 @@ export function VendorsPage() {
   return (
     <div>
       <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-semibold text-slate-900">Vendors</h1>
+        <h1 className="text-2xl font-semibold text-slate-900">Workers</h1>
         <button className="btn-primary" onClick={() => setOpen(true)}>
-          New vendor
+          New worker
         </button>
       </div>
       <p className="mt-1 text-sm text-slate-500">
-        Karigars, stone-fixers and polish vendors used by manufacturing jobs.
+        The karigars, stone-fixers and polishers the shop issues material to. Each belongs to a
+        department and carries the wastage rate agreed with him.
       </p>
       <Toolbar>
-        <SearchBox value={q} onChange={setQ} placeholder="Search by name or phone…" className="w-72" />
+        <SearchBox value={q} onChange={setQ} placeholder="Search by name, phone or CNIC…" className="w-72" />
         <FilterSelect value={type} onChange={setType} options={VENDOR_TYPES} allLabel="All types" />
         <span className="ml-auto text-xs text-slate-500">{items.length} shown</span>
       </Toolbar>
@@ -84,7 +98,7 @@ export function VendorsPage() {
         {error && <div className="p-6 text-sm text-red-600">{error}</div>}
         {!loading && !error && items.length === 0 && (
           <div className="p-6 text-sm text-slate-500">
-            {q || type ? "No vendors matching the filters." : "No vendors yet."}
+            {q || type ? "No workers matching the filters." : "No workers yet."}
           </div>
         )}
         {items.length > 0 && (
@@ -92,21 +106,45 @@ export function VendorsPage() {
             <thead className="bg-slate-50 text-left text-xs uppercase text-slate-500">
               <tr>
                 <th className="px-4 py-3">Name</th>
+                <th className="px-4 py-3">Department</th>
                 <th className="px-4 py-3">Type</th>
+                <th className="px-4 py-3">Wastage</th>
+                <th className="px-4 py-3">Opening gold</th>
                 <th className="px-4 py-3">Phone</th>
-                <th className="px-4 py-3">Address</th>
                 <th className="px-4 py-3"></th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
               {items.map((v) => (
                 <tr key={v.id} className="hover:bg-slate-50">
-                  <td className="px-4 py-3 font-medium">{v.name}</td>
+                  <td className="px-4 py-3 font-medium">
+                    {v.name}
+                    {!v.is_active && (
+                      <span className="ml-2 rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-500">
+                        inactive
+                      </span>
+                    )}
+                  </td>
+                  <td className="px-4 py-3">{v.department_name ?? "—"}</td>
                   <td className="px-4 py-3">
                     <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs">{v.type}</span>
                   </td>
+                  <td className="px-4 py-3">
+                    {v.effective_wastage_pct === null ? (
+                      "—"
+                    ) : (
+                      <span title={v.default_wastage_pct ? "Agreed with this worker" : "Inherited from department"}>
+                        {Number(v.effective_wastage_pct)}%
+                        {!v.default_wastage_pct && (
+                          <span className="ml-1 text-xs text-slate-400">dept</span>
+                        )}
+                      </span>
+                    )}
+                  </td>
+                  <td className="px-4 py-3">
+                    {Number(v.opening_gold_g) === 0 ? "—" : `${Number(v.opening_gold_g)} g`}
+                  </td>
                   <td className="px-4 py-3">{v.phone ?? "—"}</td>
-                  <td className="px-4 py-3 text-slate-500">{v.address ?? "—"}</td>
                   <td className="px-4 py-3 text-right">
                     <div className="flex justify-end gap-3">
                       <button
@@ -150,8 +188,8 @@ export function VendorsPage() {
       <ConfirmDialog
         open={!!deleting}
         onClose={() => setDeleting(null)}
-        title={`Delete ${deleting?.name ?? "vendor"}?`}
-        description="Manufacturing jobs that reference this vendor will keep their record (the FK becomes NULL)."
+        title={`Delete ${deleting?.name ?? "worker"}?`}
+        description="Jobs already assigned to this worker keep their record. If he has simply stopped working with the shop, switch him to inactive instead — that preserves his history."
         destructive
         confirmLabel="Delete"
         busy={busyDelete}
@@ -174,18 +212,35 @@ function VendorForm({
 }) {
   const [name, setName] = useState("");
   const [type, setType] = useState("karigar");
+  const [departmentId, setDepartmentId] = useState("");
   const [phone, setPhone] = useState("");
+  const [cnic, setCnic] = useState("");
   const [address, setAddress] = useState("");
+  const [wastage, setWastage] = useState("");
+  const [openingCash, setOpeningCash] = useState("");
+  const [openingGold, setOpeningGold] = useState("");
+  const [isActive, setIsActive] = useState(true);
   const [notes, setNotes] = useState("");
+  const [departments, setDepartments] = useState<Department[]>([]);
   const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
     if (open) {
       setName(existing?.name ?? "");
       setType(existing?.type ?? "karigar");
+      setDepartmentId(existing?.department_id ? String(existing.department_id) : "");
       setPhone(existing?.phone ?? "");
+      setCnic(existing?.cnic ?? "");
       setAddress(existing?.address ?? "");
+      setWastage(existing?.default_wastage_pct ?? "");
+      setOpeningCash(existing?.opening_cash_balance ?? "");
+      setOpeningGold(existing?.opening_gold_g ?? "");
+      setIsActive(existing ? existing.is_active : true);
       setNotes(existing?.notes ?? "");
+      api
+        .get<Department[]>("/departments", { params: { limit: "200", is_active: "true" } })
+        .then((r) => setDepartments(r.data))
+        .catch(() => setDepartments([]));
     }
   }, [open, existing]);
 
@@ -196,8 +251,14 @@ function VendorForm({
       const body = {
         name,
         type,
+        department_id: departmentId ? Number(departmentId) : null,
         phone: phone || null,
+        cnic: cnic || null,
         address: address || null,
+        default_wastage_pct: wastage === "" ? null : wastage,
+        opening_cash_balance: openingCash || "0",
+        opening_gold_g: openingGold || "0",
+        is_active: isActive,
         notes: notes || null,
       };
       if (existing) {
@@ -205,28 +266,79 @@ function VendorForm({
         toast("success", `"${name}" updated`);
       } else {
         await api.post("/vendors", body);
-        toast("success", `Vendor "${name}" created`);
+        toast("success", `Worker "${name}" created`);
       }
       onSaved();
     } catch (err) {
-      toast("error", apiError(err, "Could not save vendor"));
+      toast("error", apiError(err, "Could not save worker"));
     } finally {
       setSubmitting(false);
     }
   };
 
   return (
-    <Modal open={open} onClose={onClose} title={existing ? "Edit vendor" : "New vendor"}>
+    <Modal open={open} onClose={onClose} title={existing ? "Edit worker" : "New worker"}>
       <form onSubmit={submit} className="space-y-4">
         <TextField label="Name" required value={name} onChange={(e) => setName(e.target.value)} />
-        <SelectField
-          label="Type"
-          required
-          options={VENDOR_TYPES}
-          value={type}
-          onChange={(e) => setType(e.target.value)}
-        />
-        <TextField label="Phone" value={phone} onChange={(e) => setPhone(e.target.value)} />
+        <div className="grid grid-cols-2 gap-3">
+          <SelectField
+            label="Type"
+            required
+            options={VENDOR_TYPES}
+            value={type}
+            onChange={(e) => setType(e.target.value)}
+          />
+          <SelectField
+            label="Department"
+            hint="Which stage this worker handles"
+            options={[
+              { value: "", label: "—" },
+              ...departments.map((d) => ({ value: d.id, label: d.name })),
+            ]}
+            value={departmentId}
+            onChange={(e) => setDepartmentId(e.target.value)}
+          />
+          <TextField label="Phone" value={phone} onChange={(e) => setPhone(e.target.value)} />
+          <TextField
+            label="CNIC"
+            value={cnic}
+            onChange={(e) => setCnic(e.target.value)}
+            placeholder="42101-1234567-1"
+          />
+          <TextField
+            label="Agreed wastage %"
+            type="number"
+            step="0.001"
+            hint="Leave blank to use the department's rate"
+            value={wastage}
+            onChange={(e) => setWastage(e.target.value)}
+          />
+          <TextField
+            label="Opening gold (g)"
+            type="number"
+            step="0.0001"
+            hint="Metal he already holds"
+            value={openingGold}
+            onChange={(e) => setOpeningGold(e.target.value)}
+          />
+          <TextField
+            label="Opening cash balance"
+            type="number"
+            step="0.01"
+            hint="Positive = owed to the worker"
+            value={openingCash}
+            onChange={(e) => setOpeningCash(e.target.value)}
+          />
+          <label className="flex items-center gap-2 pt-7 text-sm">
+            <input
+              type="checkbox"
+              checked={isActive}
+              onChange={(e) => setIsActive(e.target.checked)}
+              className="h-4 w-4 rounded border-slate-300"
+            />
+            <span className="font-medium text-slate-700">Active</span>
+          </label>
+        </div>
         <TextArea label="Address" value={address} onChange={(e) => setAddress(e.target.value)} />
         <TextArea label="Notes" value={notes} onChange={(e) => setNotes(e.target.value)} />
         <div className="flex justify-end gap-2 pt-2">

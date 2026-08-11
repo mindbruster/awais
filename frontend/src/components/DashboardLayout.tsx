@@ -21,9 +21,20 @@ const NAV: NavItem[] = [
   { to: "/stones", label: "Stones" },
   { to: "/stock-movements", label: "Stock ledger" },
   { to: "/customers", label: "Customers" },
-  { to: "/vendors", label: "Vendors" },
+  { to: "/vendors", label: "Workers" },
   { to: "/gold-rates", label: "Gold rates" },
   { to: "/reports", label: "Reports" },
+];
+
+// Reference data, configured once and then selected from everywhere. Staff can
+// read these but only admins and accountants may change them, so the section is
+// hidden from staff rather than showing them screens they can't act on.
+const SETTINGS_NAV: NavItem[] = [
+  { to: "/settings/items", label: "Items" },
+  { to: "/settings/departments", label: "Departments" },
+  { to: "/settings/stone-attributes", label: "Stone attributes" },
+  { to: "/settings/locations", label: "Countries & cities" },
+  { to: "/settings/banks", label: "Banks" },
 ];
 
 export function DashboardLayout() {
@@ -45,6 +56,12 @@ export function DashboardLayout() {
   };
 
   const visibleNav = NAV.filter((n) => !n.roles || n.roles.includes(role));
+  const canManageMasters = role === "admin" || role === "accountant";
+
+  const linkClass = ({ isActive }: { isActive: boolean }) =>
+    `block rounded-lg px-3 py-2 text-sm font-medium transition ${
+      isActive ? "bg-brand-50 text-brand-700" : "text-slate-600 hover:bg-slate-100"
+    }`;
 
   const navContent = (
     <>
@@ -54,21 +71,22 @@ export function DashboardLayout() {
       </div>
       <nav className="flex-1 space-y-1 overflow-y-auto px-3 pb-4">
         {visibleNav.map((item) => (
-          <NavLink
-            key={item.to}
-            to={item.to}
-            end={item.end}
-            className={({ isActive }) =>
-              `block rounded-lg px-3 py-2 text-sm font-medium transition ${
-                isActive
-                  ? "bg-brand-50 text-brand-700"
-                  : "text-slate-600 hover:bg-slate-100"
-              }`
-            }
-          >
+          <NavLink key={item.to} to={item.to} end={item.end} className={linkClass}>
             {item.label}
           </NavLink>
         ))}
+        {canManageMasters && (
+          <>
+            <div className="px-3 pb-1 pt-5 text-xs font-semibold uppercase tracking-wide text-slate-400">
+              Setup
+            </div>
+            {SETTINGS_NAV.map((item) => (
+              <NavLink key={item.to} to={item.to} className={linkClass}>
+                {item.label}
+              </NavLink>
+            ))}
+          </>
+        )}
       </nav>
       <div className="border-t border-slate-200 px-4 py-4">
         <div className="text-sm font-medium text-slate-800">{user?.full_name}</div>

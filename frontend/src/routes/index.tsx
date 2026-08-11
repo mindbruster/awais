@@ -17,6 +17,11 @@ import { InvoiceDetailPage } from "@/pages/InvoiceDetailPage";
 import { CustomerDetailPage } from "@/pages/CustomerDetailPage";
 import { StockMovementsPage } from "@/pages/StockMovementsPage";
 import { ReportsPage } from "@/pages/ReportsPage";
+import { DepartmentsPage } from "@/pages/settings/DepartmentsPage";
+import { ItemsPage } from "@/pages/settings/ItemsPage";
+import { AttributeOptionsPage } from "@/pages/settings/AttributeOptionsPage";
+import { LocationsPage } from "@/pages/settings/LocationsPage";
+import { BanksPage } from "@/pages/settings/BanksPage";
 
 function ProtectedRoute() {
   const token = useAuthStore((s) => s.token);
@@ -56,6 +61,11 @@ export const router = createBrowserRouter([
           { path: "/reports", element: <ReportsPage /> },
           { path: "/gold-rates", element: <GoldRatesPage /> },
           { path: "/stones", element: <StonesPage /> },
+          { path: "/settings/departments", element: <DepartmentsPage /> },
+          { path: "/settings/items", element: <ItemsPage /> },
+          { path: "/settings/stone-attributes", element: <AttributeOptionsPage /> },
+          { path: "/settings/locations", element: <LocationsPage /> },
+          { path: "/settings/banks", element: <BanksPage /> },
         ],
       },
     ],
