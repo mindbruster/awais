@@ -7,6 +7,7 @@ from app.api.deps import DbSession, require_perm
 from app.models.currency import Currency
 from app.models.gold_rate import GoldRate
 from app.schemas.gold_rate import GoldRateCreate, GoldRateRead
+from app.services.gold_rate import rate_in_force
 
 router = APIRouter()
 read = Depends(require_perm("gold_rate:read"))
@@ -40,14 +41,12 @@ async def current_rate(
     currency: Currency = Query(default=Currency.PKR),
     purity: int = Query(default=24, ge=1, le=24),
 ) -> GoldRate:
-    """Most recent rate for the given (currency, purity). 404 if none set yet."""
-    stmt = (
-        select(GoldRate)
-        .where(GoldRate.currency == currency, GoldRate.purity == purity)
-        .order_by(desc(GoldRate.rate_date), desc(GoldRate.id))
-        .limit(1)
-    )
-    rate = (await db.execute(stmt)).scalar_one_or_none()
+    """The rate in force today for (currency, purity). 404 if none set yet.
+
+    A rate keyed in advance for a future date is deliberately not "current" —
+    see `app.services.gold_rate.rate_in_force`.
+    """
+    rate = await rate_in_force(db, currency=currency, purity=purity)
     if rate is None:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,

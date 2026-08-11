@@ -22,6 +22,12 @@ import { ItemsPage } from "@/pages/settings/ItemsPage";
 import { AttributeOptionsPage } from "@/pages/settings/AttributeOptionsPage";
 import { LocationsPage } from "@/pages/settings/LocationsPage";
 import { BanksPage } from "@/pages/settings/BanksPage";
+import { DesignsPage } from "@/pages/designs/DesignsPage";
+import { DesignDetailPage } from "@/pages/designs/DesignDetailPage";
+import { ChartOfAccountsPage } from "@/pages/ledger/ChartOfAccountsPage";
+import { StatementPage } from "@/pages/ledger/StatementPage";
+import { JournalPage } from "@/pages/ledger/JournalPage";
+import { PositionPage } from "@/pages/ledger/PositionPage";
 
 function ProtectedRoute() {
   const token = useAuthStore((s) => s.token);
@@ -66,6 +72,12 @@ export const router = createBrowserRouter([
           { path: "/settings/stone-attributes", element: <AttributeOptionsPage /> },
           { path: "/settings/locations", element: <LocationsPage /> },
           { path: "/settings/banks", element: <BanksPage /> },
+          { path: "/designs", element: <DesignsPage /> },
+          { path: "/designs/:id", element: <DesignDetailPage /> },
+          { path: "/ledger/position", element: <PositionPage /> },
+          { path: "/ledger/statement", element: <StatementPage /> },
+          { path: "/ledger/journal", element: <JournalPage /> },
+          { path: "/ledger/accounts", element: <ChartOfAccountsPage /> },
         ],
       },
     ],

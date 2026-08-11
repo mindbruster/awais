@@ -27,6 +27,10 @@ PERMISSIONS: dict[str, set[str]] = {
         # Reference data: accountants maintain the financial masters (banks,
         # accounts) and need to read the rest to reconcile.
         "master:read", "master:write",
+        # The books are the accountant's job — they may define accounts and
+        # post entries. Deleting accounts stays with admins.
+        "ledger:read", "ledger:write", "ledger:post",
+        "design:read",
     },
     "staff": {
         "customer:read", "customer:write", "customer:delete",
@@ -44,6 +48,10 @@ PERMISSIONS: dict[str, set[str]] = {
         # shop's departments, items or bank accounts. Read only; deleting a
         # master is admin-only because it silently reshapes historic reports.
         "master:read",
+        # Staff run the workshop floor: they mint designs and record issue and
+        # receive all day. They cannot see the books those postings land in —
+        # worker gold liabilities and cash balances are owner information.
+        "design:read", "design:write",
     },
 }
 

@@ -16,19 +16,14 @@ from app.schemas.invoice import InvoiceCreate, InvoiceRead
 from app.services.audit import log_action
 from app.services.inventory import post_movement
 from app.services.pricing import invoice_totals, price_line
+from app.services.gold_rate import rate_in_force
 from app.services.serial import next_invoice_no
 from app.services.whatsapp import render_invoice_message, send_text
 
 
 async def _current_gold_rate(db, currency, purity: int = 24) -> Decimal:
     """Most recent rate for (currency, purity) — Decimal('0') if none set."""
-    stmt = (
-        select(GoldRate)
-        .where(GoldRate.currency == currency, GoldRate.purity == purity)
-        .order_by(GoldRate.rate_date.desc(), GoldRate.id.desc())
-        .limit(1)
-    )
-    rate = (await db.execute(stmt)).scalar_one_or_none()
+    rate = await rate_in_force(db, currency=currency, purity=purity)
     return Decimal(str(rate.rate_per_g)) if rate else Decimal("0")
 
 router = APIRouter()

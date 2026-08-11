@@ -4,9 +4,11 @@ from app.api.v1 import (
     audit_log,
     auth,
     customers,
+    designs,
     gold_rates,
     inventory,
     invoices,
+    ledger,
     manufacturing,
     masters,
     product_stones,
@@ -44,3 +46,7 @@ api_router.include_router(masters.countries_router, prefix="/countries", tags=["
 api_router.include_router(masters.cities_router, prefix="/cities", tags=["masters"])
 api_router.include_router(masters.banks_router, prefix="/banks", tags=["masters"])
 api_router.include_router(masters.bank_accounts_router, prefix="/bank-accounts", tags=["masters"])
+
+# The books, and the workshop floor that posts into them.
+api_router.include_router(ledger.router, prefix="/ledger", tags=["ledger"])
+api_router.include_router(designs.router, prefix="/designs", tags=["designs"])

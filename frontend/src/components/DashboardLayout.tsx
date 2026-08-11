@@ -14,6 +14,7 @@ interface NavItem {
 // Mirrors backend permissions in app/core/permissions.py.
 const NAV: NavItem[] = [
   { to: "/", label: "Dashboard", end: true },
+  { to: "/designs", label: "Designs" },
   { to: "/manufacturing", label: "Manufacturing" },
   { to: "/invoices", label: "Invoices" },
   { to: "/products", label: "Products" },
@@ -24,6 +25,16 @@ const NAV: NavItem[] = [
   { to: "/vendors", label: "Workers" },
   { to: "/gold-rates", label: "Gold rates" },
   { to: "/reports", label: "Reports" },
+];
+
+// The books. Worker gold liabilities and cash positions are owner information,
+// so this whole section is hidden from staff — they post into the ledger by
+// doing their job, but they don't get to read it.
+const LEDGER_NAV: NavItem[] = [
+  { to: "/ledger/position", label: "Position" },
+  { to: "/ledger/statement", label: "Statements" },
+  { to: "/ledger/journal", label: "Journal" },
+  { to: "/ledger/accounts", label: "Chart of accounts" },
 ];
 
 // Reference data, configured once and then selected from everywhere. Staff can
@@ -77,6 +88,14 @@ export function DashboardLayout() {
         ))}
         {canManageMasters && (
           <>
+            <div className="px-3 pb-1 pt-5 text-xs font-semibold uppercase tracking-wide text-slate-400">
+              Books
+            </div>
+            {LEDGER_NAV.map((item) => (
+              <NavLink key={item.to} to={item.to} className={linkClass}>
+                {item.label}
+              </NavLink>
+            ))}
             <div className="px-3 pb-1 pt-5 text-xs font-semibold uppercase tracking-wide text-slate-400">
               Setup
             </div>

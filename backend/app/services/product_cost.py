@@ -21,16 +21,11 @@ from app.models.currency import Currency
 from app.models.gold_rate import GoldRate
 from app.models.product import Product
 from app.models.product_stone import ProductStone
+from app.services.gold_rate import rate_in_force
 
 
 async def _current_gold_rate_pkr(db: AsyncSession) -> Decimal:
-    stmt = (
-        select(GoldRate)
-        .where(GoldRate.currency == Currency.PKR, GoldRate.purity == 24)
-        .order_by(desc(GoldRate.rate_date), desc(GoldRate.id))
-        .limit(1)
-    )
-    rate = (await db.execute(stmt)).scalar_one_or_none()
+    rate = await rate_in_force(db, currency=Currency.PKR, purity=24)
     return Decimal(str(rate.rate_per_g)) if rate else Decimal("0")
 
 

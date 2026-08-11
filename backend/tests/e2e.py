@@ -887,10 +887,21 @@ def main() -> int:
 
     # ----- ALIGNMENT: gold-rate auto-fill + per-line discount -----
     section("Alignment")
-    # Insert a rate dated far in the future so it sorts above any earlier rates.
+    # Today's rate, keyed after the earlier ones so it wins the tie on date.
+    # Deliberately not future-dated: a rate entered in advance is a plan, not a
+    # price, and is excluded from "current" — see services/gold_rate.py.
     client.post("/gold-rates", headers=auth, json={
-        "rate_date": "2099-12-31", "currency": "PKR", "rate_per_g": "7777", "purity": 24,
+        "rate_date": date.today().isoformat(), "currency": "PKR", "rate_per_g": "7777", "purity": 24,
     })
+    client.post("/gold-rates", headers=auth, json={
+        "rate_date": "2099-12-31", "currency": "PKR", "rate_per_g": "999999", "purity": 24,
+    })
+    r = client.get("/gold-rates/current", headers=auth, params={"currency": "PKR", "purity": 24})
+    check(
+        "a forward-dated rate is not treated as current",
+        Decimal(str(r.json()["rate_per_g"])) == Decimal("7777"),
+        f"got {r.json().get('rate_per_g')} — a rate keyed for a future date must not price today",
+    )
     # Create invoice with NO gold_rate → backend should auto-fill from /current
     r = client.post("/invoices", headers=auth, json={
         "customer_id": customer_id, "sale_type": "normal", "currency": "PKR",
@@ -1386,6 +1397,488 @@ def main() -> int:
     check("accountant can create masters → 201", r.status_code == 201, f"got {r.status_code}")
     r = client.delete(f"/items/{r.json()['id']}", headers={**acct_auth, "X-Confirm-Password": "acct1234"})
     check("accountant cannot delete masters → 403", r.status_code == 403, f"got {r.status_code}")
+
+    # ----- LEDGER (phase 3) -----
+    section("Ledger")
+
+    r = client.get("/ledger/accounts", headers=auth)
+    accounts = r.json()
+    by_code = {a["code"]: a for a in accounts}
+    check("chart of accounts seeded", r.status_code == 200 and len(accounts) == 24, f"got {len(accounts)}")
+    check(
+        "system heads flagged and postable",
+        by_code["1130"]["is_system"] and by_code["1130"]["is_postable"],
+        str(by_code.get("1130")),
+    )
+    check("headings are not postable", by_code["1000"]["is_postable"] is False)
+    check("parent resolved", by_code["1110"]["parent_name"] == "Current Assets", str(by_code["1110"]))
+
+    # System accounts are resolved by code at post time, so the code must be frozen.
+    r = client.patch(f"/ledger/accounts/{by_code['1130']['id']}", headers=auth, json={"code": "9999"})
+    check("cannot recode a system account → 409", r.status_code == 409, f"got {r.status_code}")
+    r = client.delete(f"/ledger/accounts/{by_code['1130']['id']}", headers=pwd_h)
+    check("cannot delete a system account → 409", r.status_code == 409, f"got {r.status_code}")
+    r = client.delete(f"/ledger/accounts/{by_code['1100']['id']}", headers=pwd_h)
+    check("cannot delete an account with children → 409", r.status_code == 409, f"got {r.status_code}")
+
+    r = client.post(
+        "/ledger/accounts",
+        headers=auth,
+        json={"code": "5310", "name": "Shop Rent", "type": "expense", "parent_id": by_code["5000"]["id"]},
+    )
+    check("create a child account → 201", r.status_code == 201, f"got {r.status_code}")
+    rent_id = r.json()["id"]
+
+    # --- the invariant: an entry that doesn't net to zero must be refused ---
+    r = client.post(
+        "/ledger/entries",
+        headers=pwd_h,
+        json={
+            "memo": "deliberately unbalanced",
+            "postings": [
+                {"account_code": "1110", "quantity": "1000"},
+                {"account_code": "5310", "quantity": "-900"},
+            ],
+        },
+    )
+    check("unbalanced entry refused → 400", r.status_code == 400, f"got {r.status_code}: {r.text[:160]}")
+
+    r = client.post(
+        "/ledger/entries",
+        headers=auth,
+        json={
+            "memo": "no password",
+            "postings": [
+                {"account_code": "1110", "quantity": "100"},
+                {"account_code": "3100", "quantity": "-100"},
+            ],
+        },
+    )
+    check("manual entry without password → 401", r.status_code == 401, f"got {r.status_code}")
+
+    # Capital injection: 500,000 cash in, against capital.
+    r = client.post(
+        "/ledger/entries",
+        headers=pwd_h,
+        json={
+            "memo": "Owner capital injection",
+            "postings": [
+                {"account_code": "1110", "quantity": "500000", "memo": "cash in"},
+                {"account_code": "3100", "quantity": "-500000"},
+            ],
+        },
+    )
+    check("balanced cash entry → 201", r.status_code == 201, f"got {r.status_code}: {r.text[:200]}")
+    cap_entry = r.json()
+    check("entry numbered JE-YY-NNNNN", cap_entry["entry_no"].startswith("JE-26-"), cap_entry["entry_no"])
+    check(
+        "debits equal credits on the entry",
+        Decimal(str(cap_entry["total_debit"])) == Decimal(str(cap_entry["total_credit"])) == Decimal("500000"),
+        f"{cap_entry['total_debit']} vs {cap_entry['total_credit']}",
+    )
+
+    # --- multi-commodity: gold bought for cash, balancing on PKR value ---
+    # 100g of 22k = 91.6667 fine grams. At 7777/fine gram that is 712,833.55.
+    gold_value = (Decimal("91.6667") * Decimal("7777")).quantize(Decimal("0.01"))
+    r = client.post(
+        "/ledger/entries",
+        headers=pwd_h,
+        json={
+            "memo": "Bought 100g of 22k bullion for cash",
+            # The counter sends what the scale said (100g) and the karat stamp.
+            # Converting to fine grams is the server's job — a human has a
+            # weight and a purity, not a 24k equivalent.
+            "postings": [
+                {
+                    "account_code": "1130",
+                    "commodity": "GOLD",
+                    "quantity": "100",
+                    "native_purity": 22,
+                    "rate": "7777",
+                },
+                {"account_code": "1110", "quantity": str(-gold_value)},
+            ],
+        },
+    )
+    check(
+        "gold and cash balance on PKR value, not on quantity → 201",
+        r.status_code == 201,
+        f"got {r.status_code}: {r.text[:250]}",
+    )
+    gold_line = next(
+        (ln for ln in r.json().get("lines", []) if ln["commodity"] == "GOLD"), {}
+    ) if r.status_code == 201 else {}
+    check(
+        "as-weighed grams converted to fine, with the original kept alongside",
+        Decimal(str(gold_line.get("quantity", 0))) == Decimal("91.6667")
+        and Decimal(str(gold_line.get("native_weight_g", 0))) == Decimal("100")
+        and gold_line.get("native_purity") == 22,
+        f"22k must not be banked as pure — got {gold_line}",
+    )
+
+    # A gold line priced at zero would balance against nothing and post metal for free.
+    r = client.post(
+        "/ledger/entries",
+        headers=pwd_h,
+        json={
+            "memo": "gold at no value",
+            "postings": [
+                {"account_code": "1130", "commodity": "GOLD", "quantity": "10", "rate": "0"},
+                {"account_code": "1110", "quantity": "0"},
+            ],
+        },
+    )
+    check("gold line with a zero rate refused → 422", r.status_code == 422, f"got {r.status_code}")
+
+    # --- position reads from the journal, not from stored columns ---
+    r = client.get("/ledger/position", headers=auth)
+    pos = r.json()
+    check(
+        "cash in hand = capital less the bullion paid for",
+        Decimal(str(pos["cash_in_hand"])) == (Decimal("500000") - gold_value),
+        f"got {pos['cash_in_hand']}, expected {Decimal('500000') - gold_value}",
+    )
+    check(
+        "gold in hand carried in fine grams",
+        Decimal(str(pos["gold_in_hand_g"])) == Decimal("91.6667"),
+        f"got {pos['gold_in_hand_g']}",
+    )
+
+    # --- statement: opening balance, running balance, closing ---
+    r = client.get("/ledger/statement", headers=auth, params={"account_code": "1110"})
+    st = r.json()
+    check("statement returns rows", r.status_code == 200 and len(st["rows"]) >= 2, str(r.status_code))
+    check(
+        "running balance ends at the closing balance",
+        Decimal(str(st["rows"][-1]["running_balance"])) == Decimal(str(st["closing_balance"])),
+        f"{st['rows'][-1]['running_balance']} vs {st['closing_balance']}",
+    )
+    check(
+        "closing = opening + debits - credits",
+        Decimal(str(st["closing_balance"]))
+        == Decimal(str(st["opening_balance"])) + Decimal(str(st["period_debit"])) - Decimal(str(st["period_credit"])),
+        str(st),
+    )
+    check(
+        "statement names the counter-account",
+        any("Capital" in " ".join(row["counter_accounts"]) for row in st["rows"]),
+        str([row["counter_accounts"] for row in st["rows"]]),
+    )
+    r = client.get("/ledger/statement", headers=auth)
+    check("statement without an account → 400", r.status_code == 400, f"got {r.status_code}")
+
+    # --- trial balance ---
+    r = client.get("/ledger/trial-balance", headers=auth)
+    tb = r.json()
+    check("trial balance is balanced", r.status_code == 200 and tb["balanced"] is True, str(tb.get("balanced")))
+    check(
+        "total debits equal total credits in PKR",
+        Decimal(str(tb["total_debit_pkr"])) == Decimal(str(tb["total_credit_pkr"])),
+        f"{tb['total_debit_pkr']} vs {tb['total_credit_pkr']}",
+    )
+    check(
+        "gold sits on its own trial-balance row",
+        any(row["commodity"] == "GOLD" for row in tb["rows"]),
+        str([r_["commodity"] for r_ in tb["rows"]]),
+    )
+
+    # --- reversal, not editing ---
+    r = client.post(f"/ledger/entries/{cap_entry['id']}/reverse", headers=pwd_h, json={"memo": "keyed twice"})
+    check("reverse an entry → 201", r.status_code in (200, 201), f"got {r.status_code}: {r.text[:200]}")
+    rev = r.json()
+    check("reversal points back at the original", rev["reverses_entry_id"] == cap_entry["id"], str(rev.get("reverses_entry_id")))
+    r = client.post(f"/ledger/entries/{cap_entry['id']}/reverse", headers=pwd_h, json={"memo": "again"})
+    check("double reversal refused → 409", r.status_code == 409, f"got {r.status_code}")
+    r = client.post(f"/ledger/entries/{rev['id']}/reverse", headers=pwd_h, json={"memo": "reverse the reversal"})
+    check("reversing a reversal refused → 409", r.status_code == 409, f"got {r.status_code}")
+    r = client.get("/ledger/trial-balance", headers=auth)
+    check("still balanced after the reversal", r.json()["balanced"] is True)
+
+    # --- opening balances move master-record numbers into the books ---
+    r = client.post("/ledger/opening-balances", headers=pwd_h)
+    check("post opening balances → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:250]}")
+    ob = r.json()
+    posted_first = len(ob["posted"])
+    check("opening balances posted for the declared parties", posted_first >= 2, f"posted {posted_first}")
+    # Sagar Jalal was created with a 50,000 opening balance earlier in this run.
+    r = client.get(
+        "/ledger/statement",
+        headers=auth,
+        params={"account_code": "1210", "party_type": "customer", "party_id": cust["id"]},
+    )
+    check(
+        "customer opening balance is now a real ledger balance",
+        Decimal(str(r.json()["closing_balance"])) == Decimal("50000"),
+        f"got {r.json()['closing_balance']}",
+    )
+    # Zahid Bhai was created holding 12.5g. At 22k that is not what he holds —
+    # opening gold is declared as fine metal, so it carries across unchanged.
+    r = client.get(
+        "/ledger/statement",
+        headers=auth,
+        params={"account_code": "1160", "party_type": "worker", "party_id": w["id"], "commodity": "GOLD"},
+    )
+    check(
+        "worker opening gold is now a metal balance",
+        Decimal(str(r.json()["closing_balance"])) == Decimal("12.5"),
+        f"got {r.json()['closing_balance']}",
+    )
+
+    r = client.post("/ledger/opening-balances", headers=pwd_h)
+    check(
+        "re-running opening balances posts nothing (idempotent)",
+        r.status_code == 200 and len(r.json()["posted"]) == 0 and len(r.json()["skipped"]) >= posted_first,
+        f"posted={len(r.json()['posted'])} skipped={len(r.json()['skipped'])}",
+    )
+    r = client.get("/ledger/trial-balance", headers=auth)
+    check("still balanced after opening balances", r.json()["balanced"] is True)
+
+    # --- RBAC: the books are not staff information ---
+    r = client.get("/ledger/position", headers=staff_auth)
+    check("staff cannot read the ledger → 403", r.status_code == 403, f"got {r.status_code}")
+    r = client.get("/ledger/position", headers=acct_auth)
+    check("accountant can read the ledger", r.status_code == 200, f"got {r.status_code}")
+    r = client.delete(f"/ledger/accounts/{rent_id}", headers={**acct_auth, "X-Confirm-Password": "acct1234"})
+    check("accountant cannot delete accounts → 403", r.status_code == 403, f"got {r.status_code}")
+    r = client.delete(f"/ledger/accounts/{rent_id}", headers=pwd_h)
+    check("admin deletes an unused account → 204", r.status_code == 204, f"got {r.status_code}")
+
+    # ----- ROUTING ENGINE (phase 4) -----
+    section("Routing engine")
+
+    taka_id = next(i["id"] for i in client.get("/items", headers=auth).json() if i["abbreviation"] == "TK")
+    r = client.post("/designs", headers=auth, json={"item_id": taka_id, "customer_id": cust["id"]})
+    check("mint a design → 201", r.status_code == 201, f"got {r.status_code}: {r.text[:200]}")
+    design = r.json()
+    check(
+        "design number takes the item's abbreviation",
+        design["design_no"] == "TK-00001",
+        design["design_no"],
+    )
+    d2 = client.post("/designs", headers=auth, json={"item_id": taka_id}).json()
+    check("design numbers count within the item", d2["design_no"] == "TK-00002", d2["design_no"])
+
+    r = client.post(f"/designs/{design['id']}/tag", headers=auth)
+    check("generate a tag → 200", r.status_code == 200, f"got {r.status_code}")
+    check("tag numbered TAG-YY-NNNNN", r.json()["tag_no"].startswith("TAG-26-"), str(r.json().get("tag_no")))
+    r = client.post(f"/designs/{design['id']}/tag", headers=auth)
+    check("second tag refused → 409", r.status_code == 409, f"got {r.status_code}")
+
+    # Zahid is a Casting worker on 3.5% agreed wastage (set up in the master
+    # data section). Issue him 100g of 22k.
+    r = client.post(
+        f"/designs/{design['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": casting_id,
+            "worker_id": w["id"],
+            "gold_issued_g": "100",
+            "gold_issued_purity": 22,
+            "gold_source_inventory_id": raw_gold["id"],
+            "labour_basis": "per_gram",
+            "labour_rate": "150",
+        },
+    )
+    check("issue to casting → 201", r.status_code == 201, f"got {r.status_code}: {r.text[:250]}")
+    leg = r.json()
+    check(
+        "agreed wastage snapshotted onto the leg at issue",
+        Decimal(str(leg["wastage_allowed_pct"])) == Decimal("3.5"),
+        str(leg.get("wastage_allowed_pct")),
+    )
+    r = client.get(f"/designs/{design['id']}", headers=auth)
+    check("design now sits in casting", r.json()["current_department_id"] == casting_id)
+
+    # One pair of hands at a time.
+    r = client.post(
+        f"/designs/{design['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": casting_id, "worker_id": w["id"], "gold_issued_g": "5",
+            "gold_source_inventory_id": raw_gold["id"],
+        },
+    )
+    check("second open leg refused → 409", r.status_code == 409, f"got {r.status_code}")
+
+    # A worker from the wrong department must be refused.
+    polish_dept_id = next(d_["id"] for d_ in depts if d_["code"] == "POL")
+    r = client.post(
+        f"/designs/{d2['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": polish_dept_id, "worker_id": w["id"], "gold_issued_g": "5",
+            "gold_source_inventory_id": raw_gold["id"],
+        },
+    )
+    check("worker from another department refused → 400", r.status_code == 400, f"got {r.status_code}")
+
+    # --- the settlement that matters ---
+    # 100g out, 94g back. Actual loss 6g; allowed 3.5g; so 2.5g is Zahid's.
+    def worker_gold(worker_id: int) -> Decimal:
+        return Decimal(
+            str(
+                client.get(
+                    "/ledger/statement",
+                    headers=auth,
+                    params={
+                        "account_code": "1160",
+                        "party_type": "worker",
+                        "party_id": worker_id,
+                        "commodity": "GOLD",
+                    },
+                ).json()["closing_balance"]
+            )
+        )
+
+    # While the metal is out, the whole issued amount sits against him.
+    check(
+        "issued metal shows as a claim on the worker while it is out",
+        worker_gold(w["id"]) == Decimal("12.5") + Decimal("91.6667"),
+        f"got {worker_gold(w['id'])}, expected 104.1667",
+    )
+    r = client.post(f"/designs/legs/{leg['id']}/receive", headers=auth, json={"gold_received_g": "94"})
+    check("receive from casting → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:250]}")
+    settled = r.json()
+    check(
+        "actual wastage = issued - received",
+        Decimal(str(settled["wastage_actual_g"])) == Decimal("6"),
+        str(settled["wastage_actual_g"]),
+    )
+    check(
+        "allowed wastage = 3.5% of issued",
+        Decimal(str(settled["wastage_allowed_g"])) == Decimal("3.5"),
+        str(settled["wastage_allowed_g"]),
+    )
+    check(
+        "only the excess beyond the allowance is the worker's",
+        Decimal(str(settled["wastage_excess_g"])) == Decimal("2.5"),
+        f"got {settled['wastage_excess_g']}, expected 2.5",
+    )
+    check(
+        "labour charged on delivered weight, not issued",
+        Decimal(str(settled["labour_amount"])) == Decimal("94") * Decimal("150"),
+        str(settled["labour_amount"]),
+    )
+
+    # Once the piece is back, the claim collapses to just the excess: his 12.5g
+    # opening plus 2.5g at 22k (2.2917 fine). If the shop were charging the whole
+    # 6g difference this would read 12.5 + 5.5 instead.
+    check(
+        "after receive the worker owes only the excess, not the whole difference",
+        abs(worker_gold(w["id"]) - Decimal("14.7917")) <= Decimal("0.0002"),
+        f"got {worker_gold(w['id'])}, expected 14.7917 (12.5 opening + 2.2917 excess)",
+    )
+    check(
+        "labour accrued to the worker as a payable",
+        Decimal(
+            str(
+                client.get(
+                    "/ledger/statement",
+                    headers=auth,
+                    params={"account_code": "2120", "party_type": "worker", "party_id": w["id"]},
+                ).json()["closing_balance"]
+            )
+        )
+        == Decimal("-14100"),
+        "workers payable should be a credit balance of 14,100",
+    )
+    r = client.get("/ledger/trial-balance", headers=auth)
+    check("books still balance after a leg round trip", r.json()["balanced"] is True)
+
+    r = client.post(f"/designs/legs/{leg['id']}/receive", headers=auth, json={"gold_received_g": "94"})
+    check("receiving a leg twice refused → 409", r.status_code == 409, f"got {r.status_code}")
+
+    # --- a heavier return is legitimate, not an error ---
+    # The polisher was created before departments existed on workers, so give
+    # him one — the routing engine refuses a worker from the wrong department.
+    client.patch(f"/vendors/{polisher['id']}", headers=auth, json={"department_id": polish_dept_id})
+    r = client.post(
+        f"/designs/{design['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": polish_dept_id,
+            "worker_id": polisher["id"],
+            "gold_issued_g": "94",
+            "gold_issued_purity": 22,
+            "gold_source_inventory_id": raw_gold["id"],
+            "labour_basis": "flat",
+            "labour_rate": "500",
+        },
+    )
+    check("issue to polish → 201", r.status_code == 201, f"got {r.status_code}: {r.text[:200]}")
+    polish_leg = r.json()
+    r = client.post(
+        f"/designs/legs/{polish_leg['id']}/receive", headers=auth, json={"gold_received_g": "95"}
+    )
+    check("a heavier return is accepted → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:200]}")
+    check(
+        "weight gain recorded as negative wastage, not a shortfall",
+        Decimal(str(r.json()["wastage_actual_g"])) == Decimal("-1"),
+        str(r.json()["wastage_actual_g"]),
+    )
+    check(
+        "nothing charged to the worker on a gain",
+        Decimal(str(r.json()["wastage_excess_g"])) == Decimal("0"),
+        str(r.json()["wastage_excess_g"]),
+    )
+    check(
+        "flat labour ignores weight",
+        Decimal(str(r.json()["labour_amount"])) == Decimal("500"),
+        str(r.json()["labour_amount"]),
+    )
+
+    # --- traceability: the screen the shop lives in ---
+    r = client.get(f"/designs/{design['id']}/trace", headers=auth)
+    check("trace returns the whole route", r.status_code == 200, f"got {r.status_code}")
+    trace = r.json()
+    hops = trace.get("hops", [])
+    check(
+        "trace lists both hops in order",
+        len(hops) == 2
+        and hops[0]["department"] == "Casting"
+        and hops[1]["department"] == "Polish",
+        str([h.get("department") for h in hops]),
+    )
+    check(
+        "trace totals roll up the wastage actually charged",
+        Decimal(str(trace["totals"]["wastage_excess_g"])) == Decimal("2.5"),
+        str(trace.get("totals")),
+    )
+
+    # --- cancelling a leg must not forgive the metal ---
+    before_issue = worker_gold(w["id"])
+    r = client.post(
+        f"/designs/{d2['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": casting_id, "worker_id": w["id"], "gold_issued_g": "20",
+            "gold_issued_purity": 22, "gold_source_inventory_id": raw_gold["id"],
+        },
+    )
+    cancel_leg_id = r.json()["id"]
+    r = client.post(
+        f"/designs/legs/{cancel_leg_id}/cancel",
+        headers=pwd_h,
+        json={"gold_recovered_g": "12", "reason": "worker left, recovered 12g of 20g"},
+    )
+    check("cancel a leg → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:250]}")
+    # 20g went out, 12g came back. The 8g the shop never saw again must stay
+    # against him — forgiving it on cancel is the hole this rewrite closes.
+    # The issue debit is reversed in full, so the net movement is the 8g at 22k.
+    unrecovered_fine = (Decimal("8") * Decimal("22") / Decimal("24")).quantize(Decimal("0.0001"))
+    check(
+        "unrecovered metal stays outstanding against the worker after a cancel",
+        abs((worker_gold(w["id"]) - before_issue) - unrecovered_fine) <= Decimal("0.0002"),
+        f"net movement {worker_gold(w['id']) - before_issue}, expected {unrecovered_fine}",
+    )
+    r = client.get("/ledger/trial-balance", headers=auth)
+    check("books still balance after a cancel", r.json()["balanced"] is True)
+
+    # --- RBAC: staff run the floor but never see the books ---
+    r = client.get("/designs", headers=staff_auth)
+    check("staff can read designs", r.status_code == 200, f"got {r.status_code}")
+    r = client.post("/designs", headers=staff_auth, json={"item_id": taka_id})
+    check("staff can mint designs → 201", r.status_code == 201, f"got {r.status_code}")
 
     # ----- LOGIN RATE LIMIT (slowapi: 10/minute) -----
     section("Login rate limit")
