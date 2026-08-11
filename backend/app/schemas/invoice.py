@@ -102,6 +102,10 @@ class InvoiceRead(TimestampedRead):
     status: InvoiceStatus
     customer_id: int
     currency: Currency
+    # Rupees per unit of `currency`, snapshotted at issue. NULL on a PKR bill,
+    # where the rate is definitionally 1. Exposed so a dollar invoice can show
+    # what it was converted at rather than leaving the customer to guess.
+    fx_rate_to_pkr: Decimal | None = None
     gold_rate_per_g: Decimal
     subtotal: Decimal
     discount_amount: Decimal

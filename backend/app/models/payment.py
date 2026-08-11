@@ -6,6 +6,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
 from app.models.bank import BankAccount
+from app.models.currency import Currency
 from app.models.mixins import TimestampMixin
 
 
@@ -67,6 +68,13 @@ class Payment(Base, TimestampMixin):
     # Always the rupee value, whatever the method — gold handed over is valued
     # at `gold_rate_per_g` so a balance is one number, not two.
     amount: Mapped[float] = mapped_column(Numeric(14, 2), nullable=False, default=0)
+    # The currency the money actually arrived in, and what it was worth in
+    # rupees on the day. A customer can settle a dollar bill in rupees or the
+    # other way round, so this is the payment's own currency, not the invoice's.
+    currency: Mapped[Currency] = mapped_column(
+        Enum(Currency, name="currency"), nullable=False, default=Currency.PKR, index=True
+    )
+    fx_rate_to_pkr: Mapped[float | None] = mapped_column(Numeric(18, 6))
 
     # Only for gold_exchange: what came across the counter, as weighed.
     gold_weight_g: Mapped[float | None] = mapped_column(Numeric(14, 4))

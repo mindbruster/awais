@@ -2574,6 +2574,89 @@ def main() -> int:
     r = client.get("/reports/margin", headers=staff_auth)
     check("staff cannot read the margin report → 403", r.status_code == 403, f"got {r.status_code}")
 
+    # ----- MULTI-CURRENCY: a dollar bill, end to end -----
+    section("Multi-currency")
+
+    # Without a rate on record, a dollar bill can be priced but must refuse to
+    # post. Guessing one produces books that balance and are wrong by the whole
+    # exchange rate, with nothing to show that it happened.
+    usd_inv = client.post(
+        "/invoices",
+        headers=auth,
+        json={
+            "customer_id": cust["id"], "sale_type": "normal", "currency": "USD",
+            "gold_rate_per_g": "400",
+            "items": [{"description": "Export bangle", "quantity": 1,
+                       "gold_weight_g": "10", "gold_purity": 22}],
+        },
+    )
+    check("raise a USD invoice → 201", usd_inv.status_code == 201, f"got {usd_inv.status_code}")
+    usd_inv = usd_inv.json()
+    r = client.post(f"/invoices/{usd_inv['id']}/issue", headers=pwd_h)
+    check(
+        "a USD bill will not post without an FX rate → 409",
+        r.status_code == 409,
+        f"got {r.status_code}: {r.text[:180]}",
+    )
+
+    r = client.post("/gold-rates/fx", headers=auth, json={
+        "currency": "PKR", "rate_date": date.today().isoformat(), "pkr_per_unit": "1",
+    })
+    check("a PKR 'exchange rate' is refused → 422", r.status_code == 422, f"got {r.status_code}")
+
+    r = client.post("/gold-rates/fx", headers=auth, json={
+        "currency": "USD", "rate_date": date.today().isoformat(), "pkr_per_unit": "280",
+    })
+    check("set today's USD rate → 201", r.status_code == 201, f"got {r.status_code}: {r.text[:180]}")
+    r = client.post("/gold-rates/fx", headers=auth, json={
+        "currency": "USD", "rate_date": "2099-12-31", "pkr_per_unit": "999",
+    })
+    r = client.get("/gold-rates/fx/current", headers=auth, params={"currency": "USD"})
+    check(
+        "a forward-dated FX rate is not treated as current",
+        Decimal(str(r.json()["pkr_per_unit"])) == Decimal("280"),
+        f"got {r.json().get('pkr_per_unit')} — a rate keyed ahead is a plan, not a price",
+    )
+
+    r = client.post(f"/invoices/{usd_inv['id']}/issue", headers=pwd_h)
+    check("the USD bill posts once a rate exists → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:200]}")
+    issued_usd = r.json()
+    usd_total = Decimal(str(issued_usd["total"]))
+    check(
+        "the rate is snapshotted onto the invoice",
+        Decimal(str(issued_usd["fx_rate_to_pkr"])) == Decimal("280"),
+        f"got {issued_usd.get('fx_rate_to_pkr')}",
+    )
+
+    # The customer's account is kept in dollars; the books balance in rupees.
+    st = client.get("/ledger/statement", headers=auth, params={
+        "account_code": "1210", "party_type": "customer", "party_id": cust["id"], "commodity": "USD",
+    }).json()
+    check(
+        "the receivable is carried in the currency the customer was billed in",
+        Decimal(str(st["closing_balance"])) == usd_total,
+        f"USD receivable {st['closing_balance']} vs bill {usd_total}",
+    )
+    check("books still balance with a USD bill on them",
+          client.get("/ledger/trial-balance", headers=auth).json()["balanced"] is True)
+
+    # Settle it in rupees. The bill's own rate converts, so paying exactly what
+    # was billed closes the balance instead of leaving rupees of FX drift.
+    r = client.post("/payments", headers=auth, json={
+        "customer_id": cust["id"], "invoice_id": usd_inv["id"],
+        "method": "cash", "currency": "PKR", "amount": str((usd_total * 280).quantize(Decimal("0.01"))),
+    })
+    check("settle a USD bill in rupees → 201", r.status_code == 201, f"got {r.status_code}: {r.text[:200]}")
+    after = client.get(f"/invoices/{usd_inv['id']}", headers=auth).json()
+    check(
+        "paying the rupee equivalent closes the dollar bill exactly",
+        Decimal(str(after["balance_due"])) == Decimal("0.00"),
+        f"balance_due {after['balance_due']} — FX drift would leave a residue nobody can explain",
+    )
+    check("the bill reads paid", after["status"] == "paid", after["status"])
+    check("books balance after a cross-currency settlement",
+          client.get("/ledger/trial-balance", headers=auth).json()["balanced"] is True)
+
     # ----- INTERNAL INVARIANTS -----
     section("Internal invariants")
     # Colliding advisory-lock keys don't error, they just make unrelated

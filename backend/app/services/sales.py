@@ -31,6 +31,7 @@ from app.models.invoice import Invoice, InvoiceStatus
 from app.models.journal import Commodity, JournalEntry, PartyType
 from app.models.payment import Payment, PaymentDirection, PaymentMethod
 from app.models.product import Product
+from app.services import fx
 from app.services.ledger import (
     EntryDraft,
     Posting,
@@ -88,22 +89,23 @@ def exchange_value(
     return fine, (fine * d(rate_per_fine_g)).quantize(_PKR)
 
 
-def _require_pkr(invoice: Invoice) -> None:
+async def _invoice_fx(db: AsyncSession, invoice: Invoice) -> Decimal:
     """
-    The ledger holds rupees, and nothing in the shop declares an FX rate yet.
+    The rate this invoice is valued at, resolved once and then kept.
 
-    A foreign-currency invoice posted as though its total were rupees would
-    balance perfectly and be wrong by the exchange rate forever, so it is
-    refused rather than guessed at — the same call `routing.current_gold_rate`
-    makes about an unvalued gram.
+    Snapshotted onto `invoices.fx_rate_to_pkr` at issue and reused for every
+    later posting against the same bill — the settlement, the void, all of it.
+    Re-resolving would value a March invoice at today's rate the moment anyone
+    paid it, so a bill and its own payment would disagree by however far the
+    rupee had moved in between, and the customer's balance would never close.
     """
-    if invoice.currency is not Currency.PKR:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f"{invoice.invoice_no} is a {invoice.currency.value} invoice and the books are "
-            "kept in PKR. There is no FX rate on record to value it with, so it cannot be "
-            "posted — raise it in PKR, or post the entry by hand at an agreed rate.",
-        )
+    if invoice.fx_rate_to_pkr is not None:
+        return d(invoice.fx_rate_to_pkr)
+    rate = await fx.require_rate(
+        db, invoice.currency, as_of=(invoice.issued_at.date() if invoice.issued_at else None)
+    )
+    invoice.fx_rate_to_pkr = rate
+    return rate
 
 
 async def post_invoice_issued(
@@ -126,7 +128,15 @@ async def post_invoice_issued(
     Returns None for a zero-value invoice — an entry with nothing on it is not
     a record of anything, and `post_entry` refuses empty drafts anyway.
     """
-    _require_pkr(invoice)
+    # The books are kept in rupees, so a dollar bill posts as a USD line with
+    # its rate attached — which is exactly what the ledger's commodity model was
+    # built for, and the same shape gold already uses. `value_pkr` is what
+    # balances; the dollar figure and the rate stay on the line so a statement
+    # can show the customer what they were actually billed.
+    fx_rate = await _invoice_fx(db, invoice)
+    foreign = invoice.currency is not Currency.PKR
+    commodity = Commodity.USD if foreign else Commodity.PKR
+
     total = d(invoice.total).quantize(_PKR)
     if total == 0:
         return None
@@ -140,6 +150,8 @@ async def post_invoice_issued(
         Posting(
             account_code=SystemAccount.CUSTOMERS.value,
             quantity=total,
+            commodity=commodity,
+            rate=fx_rate,
             party_type=PartyType.customer,
             party_id=invoice.customer_id,
             memo=f"Invoice {invoice.invoice_no}",
@@ -149,6 +161,8 @@ async def post_invoice_issued(
         Posting(
             account_code=SystemAccount.SALES.value,
             quantity=-total,
+            commodity=commodity,
+            rate=fx_rate,
             memo=f"Invoice {invoice.invoice_no}",
         )
     )
@@ -224,12 +238,27 @@ async def reverse_invoice_entries(
     ]
 
 
-def _asset_posting(payment: Payment, signed_amount: Decimal) -> Posting:
-    """The side of the payment that is not the customer: what the shop received."""
+def _asset_posting(
+    payment: Payment,
+    signed_amount: Decimal,
+    *,
+    commodity: Commodity = Commodity.PKR,
+    fx_rate: Decimal = Decimal("1"),
+) -> Posting:
+    """
+    The side of the payment that is not the customer: what the shop received.
+
+    Gold ignores `commodity`/`fx_rate` on purpose. Metal is banked in fine
+    grams at the gold rate whatever currency the bill was struck in — a dollar
+    invoice settled in old gold is still grams of gold, and valuing it through
+    an exchange rate as well would double-convert it.
+    """
     if payment.method is PaymentMethod.bank:
         return Posting(
             account_code=SystemAccount.BANK.value,
             quantity=signed_amount,
+            commodity=commodity,
+            rate=fx_rate,
             memo=payment.reference or payment.payment_no,
         )
     if payment.method is PaymentMethod.gold_exchange:
@@ -254,6 +283,8 @@ def _asset_posting(payment: Payment, signed_amount: Decimal) -> Posting:
     return Posting(
         account_code=SystemAccount.CASH_IN_HAND.value,
         quantity=signed_amount,
+        commodity=commodity,
+        rate=fx_rate,
         memo=payment.reference or payment.payment_no,
     )
 
@@ -288,6 +319,19 @@ async def post_payment(
     sign = Decimal("1") if payment.direction is PaymentDirection.received else Decimal("-1")
     signed = sign * amount
 
+    # A dollar payment settles a dollar bill at the bill's own rate, not at
+    # today's. Otherwise the customer pays exactly what they were invoiced and
+    # their balance still shows a few hundred rupees outstanding — the drift in
+    # the rupee between being billed and paying — which nobody can explain and
+    # everybody has to write off. A payment in a currency the invoice was not
+    # struck in resolves its own rate for the day it arrived.
+    if invoice is not None and payment.currency is invoice.currency:
+        fx_rate = await _invoice_fx(db, invoice)
+    else:
+        fx_rate = await fx.require_rate(db, payment.currency, as_of=payment.paid_at.date())
+    payment.fx_rate_to_pkr = fx_rate
+    commodity = Commodity.USD if payment.currency is not Currency.PKR else Commodity.PKR
+
     where = f" against {invoice.invoice_no}" if invoice is not None else ""
     verb = "received from" if sign > 0 else "paid to"
     draft = EntryDraft(
@@ -295,11 +339,13 @@ async def post_payment(
         source_type=PAYMENT_SOURCE,
         source_id=payment.id,
     )
-    draft.add(_asset_posting(payment, signed))
+    draft.add(_asset_posting(payment, signed, commodity=commodity, fx_rate=fx_rate))
     draft.add(
         Posting(
             account_code=SystemAccount.CUSTOMERS.value,
             quantity=-signed,
+            commodity=commodity,
+            rate=fx_rate,
             party_type=PartyType.customer,
             party_id=payment.customer_id,
             memo=f"{payment.payment_no}{where}",
@@ -385,10 +431,29 @@ async def amount_paid(db: AsyncSession, invoice_id: int) -> Decimal:
         (Payment.direction == PaymentDirection.received, Payment.amount),
         else_=-Payment.amount,
     )
+    # Converted into the *invoice's* currency, not summed raw. A customer can
+    # settle a dollar bill in rupees or the other way round, and adding 500 USD
+    # to 50,000 PKR as though they were the same number would report a bill as
+    # wildly overpaid or barely touched. Both sides carry the rate they were
+    # posted at, so the conversion is exact and uses no rate that wasn't already
+    # agreed: payment value in PKR, divided by the rate the bill was struck at.
+    signed_pkr = signed * func.coalesce(Payment.fx_rate_to_pkr, 1)
     stmt = _live_only(
-        select(func.coalesce(func.sum(signed), 0)).where(Payment.invoice_id == invoice_id)
+        select(func.coalesce(func.sum(signed_pkr), 0)).where(Payment.invoice_id == invoice_id)
     )
-    return d((await db.execute(stmt)).scalar_one()).quantize(_PKR)
+    paid_pkr = d((await db.execute(stmt)).scalar_one())
+
+    invoice_rate = d(
+        (
+            await db.execute(
+                select(func.coalesce(Invoice.fx_rate_to_pkr, 1)).where(Invoice.id == invoice_id)
+            )
+        ).scalar_one_or_none()
+        or 1
+    )
+    if invoice_rate <= 0:
+        invoice_rate = Decimal("1")
+    return (paid_pkr / invoice_rate).quantize(_PKR)
 
 
 async def settlement(db: AsyncSession, invoice: Invoice) -> tuple[Decimal, Decimal]:

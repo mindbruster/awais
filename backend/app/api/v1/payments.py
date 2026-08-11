@@ -11,7 +11,7 @@ an outstanding amount.
 Payments are never deleted. A mistake is corrected by reversing the entry,
 which leaves the receipt and its cancellation both visible.
 """
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -25,7 +25,7 @@ from app.models.journal import JournalEntry
 from app.models.payment import Payment, PaymentDirection, PaymentMethod
 from app.models.stock_movement import MovementType
 from app.schemas.payment import PaymentCreate, PaymentRead, PaymentReverseRequest
-from app.services import purchasing, sales
+from app.services import fx, purchasing, sales
 from app.services.audit import log_action
 from app.services.inventory import post_movement
 from app.services.ledger import d
@@ -63,6 +63,8 @@ def payment_read(
         method=payment.method,
         direction=payment.direction,
         amount=d(payment.amount),
+        currency=payment.currency,
+        fx_rate_to_pkr=payment.fx_rate_to_pkr,
         gold_weight_g=payment.gold_weight_g,
         gold_purity=payment.gold_purity,
         gold_rate_per_g=payment.gold_rate_per_g,
@@ -249,11 +251,22 @@ async def create_payment(
         and amount > 0
     ):
         _, outstanding = await sales.settlement(db, invoice)
-        if amount > outstanding:
-            over = (amount - outstanding).quantize(Decimal("0.01"))
+        # Compared in the invoice's currency, not raw. `outstanding` is what the
+        # bill still owes in the currency it was struck in; `amount` is what
+        # came across the counter in whatever currency that was. Comparing a
+        # rupee payment against a dollar balance makes every correct settlement
+        # of a foreign bill look like a hundredfold overpayment.
+        offered = amount
+        if payload.currency is not invoice.currency:
+            pay_rate = await fx.require_rate(db, payload.currency, as_of=date.today())
+            inv_rate = await fx.require_rate(db, invoice.currency, as_of=date.today())
+            offered = (amount * pay_rate / inv_rate).quantize(Decimal("0.01"))
+        if offered > outstanding:
+            over = (offered - outstanding).quantize(Decimal("0.01"))
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
-                f"That is {over} more than the {outstanding} still owed on "
+                f"That is {over} {invoice.currency.value} more than the {outstanding} "
+                f"{invoice.currency.value} still owed on "
                 f"{invoice.invoice_no}. Take the balance against the bill and the rest as an "
                 "advance, or pay the difference back with direction=paid.",
             )
@@ -264,6 +277,7 @@ async def create_payment(
         customer_id=payload.customer_id,
         method=payload.method,
         direction=payload.direction,
+        currency=payload.currency,
         amount=amount,
         gold_weight_g=payload.gold_weight_g,
         gold_purity=payload.gold_purity,

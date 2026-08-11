@@ -15,6 +15,7 @@ from app.models.design import (
     WastageBasis,
 )
 from app.models.journal import Commodity, JournalEntry, JournalLine, PartyType
+from app.models.exchange_rate import ExchangeRate
 from app.models.gold_rate import GoldRate
 from app.models.inventory import InventoryItem, InventoryType
 from app.models.invoice import Invoice, InvoiceItem, InvoiceStatus, SaleType
@@ -88,6 +89,7 @@ __all__ = [
     "SaleType",
     "Currency",
     "GoldRate",
+    "ExchangeRate",
     "Stone",
     "StoneKind",
     "ProductStone",

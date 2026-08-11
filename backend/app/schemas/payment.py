@@ -3,6 +3,7 @@ from decimal import Decimal
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.models.currency import Currency
 from app.models.payment import PaymentDirection, PaymentMethod
 from app.schemas.common import TimestampedRead
 
@@ -24,6 +25,10 @@ class PaymentCreate(BaseModel):
     invoice_id: int | None = None
     method: PaymentMethod
     direction: PaymentDirection = PaymentDirection.received
+    # What actually came across the counter. A customer can settle a dollar
+    # bill in rupees or the other way round, so this is the payment's own
+    # currency, not the invoice's.
+    currency: Currency = Currency.PKR
     amount: Decimal = Field(default=Decimal("0"), ge=0)
 
     # Gold exchange only. The rate is PKR per *fine* (24k-equivalent) gram, the
@@ -67,6 +72,8 @@ class PaymentCreate(BaseModel):
 
 
 class PaymentRead(TimestampedRead):
+    currency: Currency = Currency.PKR
+    fx_rate_to_pkr: Decimal | None = None
     payment_no: str
     invoice_id: int | None = None
     invoice_no: str | None = None

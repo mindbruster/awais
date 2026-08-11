@@ -51,6 +51,11 @@ class Invoice(Base, TimestampMixin):
         index=True,
     )
     gold_rate_per_g: Mapped[float] = mapped_column(Numeric(14, 4), default=0, nullable=False)
+    # Rupees per unit of `currency`, snapshotted when the invoice was issued.
+    # NULL on a PKR bill, where the rate is definitionally 1. Held here rather
+    # than looked up at read time so a dollar bill keeps the rate it was struck
+    # at instead of being revalued every time the rupee moves.
+    fx_rate_to_pkr: Mapped[float | None] = mapped_column(Numeric(18, 6))
 
     subtotal: Mapped[float] = mapped_column(Numeric(14, 2), default=0, nullable=False)
     discount_amount: Mapped[float] = mapped_column(Numeric(14, 2), default=0, nullable=False)
