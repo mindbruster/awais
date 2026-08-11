@@ -32,6 +32,10 @@ yarn-error.log*
 .env.*.local
 backend/.env
 frontend/.env
+# Holds real production secrets — .env.prod.example is the template that is
+# meant to be committed, this is the filled-in copy that never should be.
+.env.prod
+.env.production
 
 # IDE
 .vscode/

@@ -29,6 +29,10 @@ import { StatementPage } from "@/pages/ledger/StatementPage";
 import { JournalPage } from "@/pages/ledger/JournalPage";
 import { PositionPage } from "@/pages/ledger/PositionPage";
 import { InsightsPage } from "@/pages/InsightsPage";
+import { StockFormPage } from "@/pages/designs/StockFormPage";
+import { OldGoldPage } from "@/pages/purchasing/OldGoldPage";
+import { StonePurchasePage } from "@/pages/purchasing/StonePurchasePage";
+import { StoneStockPage } from "@/pages/purchasing/StoneStockPage";
 
 function ProtectedRoute() {
   const token = useAuthStore((s) => s.token);
@@ -75,6 +79,10 @@ export const router = createBrowserRouter([
           { path: "/settings/banks", element: <BanksPage /> },
           { path: "/designs", element: <DesignsPage /> },
           { path: "/designs/:id", element: <DesignDetailPage /> },
+          { path: "/designs/:id/stock", element: <StockFormPage /> },
+          { path: "/purchasing/old-gold", element: <OldGoldPage /> },
+          { path: "/purchasing/stones", element: <StonePurchasePage /> },
+          { path: "/purchasing/stone-stock", element: <StoneStockPage /> },
           { path: "/ledger/position", element: <PositionPage /> },
           { path: "/ledger/statement", element: <StatementPage /> },
           { path: "/ledger/journal", element: <JournalPage /> },

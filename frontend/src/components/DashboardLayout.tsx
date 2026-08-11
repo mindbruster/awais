@@ -29,6 +29,14 @@ const NAV: NavItem[] = [
   { to: "/insights", label: "Insights", roles: ["admin", "accountant"] },
 ];
 
+// Buying: metal back over the counter, and stones from suppliers. Counter staff
+// do both, so this is not hidden from them.
+const PURCHASING_NAV: NavItem[] = [
+  { to: "/purchasing/old-gold", label: "Old gold" },
+  { to: "/purchasing/stones", label: "Stone purchases" },
+  { to: "/purchasing/stone-stock", label: "Stone stock" },
+];
+
 // The books. Worker gold liabilities and cash positions are owner information,
 // so this whole section is hidden from staff — they post into the ledger by
 // doing their job, but they don't get to read it.
@@ -85,6 +93,14 @@ export function DashboardLayout() {
       <nav className="flex-1 space-y-1 overflow-y-auto px-3 pb-4">
         {visibleNav.map((item) => (
           <NavLink key={item.to} to={item.to} end={item.end} className={linkClass}>
+            {item.label}
+          </NavLink>
+        ))}
+        <div className="px-3 pb-1 pt-5 text-xs font-semibold uppercase tracking-wide text-slate-400">
+          Buying
+        </div>
+        {PURCHASING_NAV.map((item) => (
+          <NavLink key={item.to} to={item.to} className={linkClass}>
             {item.label}
           </NavLink>
         ))}

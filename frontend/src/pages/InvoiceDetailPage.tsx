@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useState } from "react";
+import { FormEvent, useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api } from "@/api/client";
+import { Modal } from "@/components/Modal";
+import { SelectField, TextArea, TextField } from "@/components/Field";
 import { PasswordConfirm } from "@/components/PasswordConfirm";
 import { toast } from "@/components/Toast";
 import { apiError } from "@/lib/api-error";
@@ -21,10 +23,34 @@ interface InvoiceItem {
   line_discount: string;
   discount_ratti: string;
   ratti_base: number;
-  // Server-derived (weight / base * (base - ratti)) — never recomputed here, so
-  // the printed document can only ever agree with what was billed.
+  sale_wastage_pct: string;
+  sale_wastage_g: string;
+  // Both server-derived: charged = net + wastage, billable = charged less the
+  // ratti discount. Never recomputed here, so the printed document can only
+  // ever agree with what was billed.
+  charged_gold_weight_g: string;
   billable_gold_weight_g: string;
   line_total: string;
+}
+
+interface Payment {
+  id: number;
+  payment_no: string;
+  invoice_id: number | null;
+  customer_id: number;
+  method: string;
+  direction: string;
+  amount: string;
+  gold_weight_g: string | null;
+  gold_purity: number | null;
+  gold_rate_per_g: string | null;
+  gold_fine_g: string | null;
+  bank_account_label: string | null;
+  paid_at: string;
+  reference: string | null;
+  notes: string | null;
+  entry_no: string | null;
+  is_reversed: boolean;
 }
 
 interface Invoice {
@@ -39,12 +65,27 @@ interface Invoice {
   discount_amount: string;
   discount_weight_g: string;
   tax_amount: string;
+  round_off: string;
   total: string;
+  bill_book_no: string | null;
   issued_at: string | null;
   paid_at: string | null;
   notes: string | null;
   items: InvoiceItem[];
+  // Summed from the payment rows on the server every read — never stored, so
+  // it cannot drift from the money that was actually taken.
+  amount_paid: string;
+  balance_due: string;
+  customer_balance: string;
+  payments: Payment[];
 }
+
+const METHOD_LABEL: Record<string, string> = {
+  cash: "Cash",
+  bank: "Bank transfer",
+  gold_exchange: "Gold exchange",
+  advance: "Advance",
+};
 
 interface Customer {
   id: number;
@@ -71,6 +112,8 @@ export function InvoiceDetailPage() {
   const [voiding, setVoiding] = useState(false);
   const [issuing, setIssuing] = useState(false);
   const [sendingWa, setSendingWa] = useState(false);
+  const [takingPayment, setTakingPayment] = useState(false);
+  const [reversing, setReversing] = useState<Payment | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -130,6 +173,22 @@ export function InvoiceDetailPage() {
     }
   };
 
+  const confirmReverse = async (password: string) => {
+    if (!reversing) return;
+    try {
+      await api.post(
+        `/payments/${reversing.id}/reverse`,
+        {},
+        { headers: { "X-Confirm-Password": password } },
+      );
+      toast("success", `${reversing.payment_no} reversed`);
+      setReversing(null);
+      load();
+    } catch (err) {
+      toast("error", apiError(err, "Reversal failed"));
+    }
+  };
+
   const sendWhatsapp = async () => {
     setSendingWa(true);
     try {
@@ -163,10 +222,21 @@ export function InvoiceDetailPage() {
               Issue
             </button>
           )}
+          {(invoice.status === "issued" || invoice.status === "paid") && (
+            <button className="btn-primary" onClick={() => setTakingPayment(true)}>
+              Take payment
+            </button>
+          )}
           {invoice.status === "issued" && (
             <>
-              <button className="btn-primary" onClick={() => action("mark-paid", "Marked paid")}>
-                Mark paid
+              {/* Not a flag any more: this records a cash payment for the
+                  outstanding balance, and the status follows from it. */}
+              <button
+                className="btn-ghost"
+                title="Records a cash payment for the outstanding balance"
+                onClick={() => action("mark-paid", "Cash payment recorded for the balance")}
+              >
+                Cash in full
               </button>
               <button
                 className="btn inline-flex items-center justify-center rounded-lg bg-red-100 px-4 py-2 text-sm font-medium text-red-700 hover:bg-red-200"
@@ -240,6 +310,9 @@ export function InvoiceDetailPage() {
           <tbody className="divide-y divide-slate-100">
             {invoice.items.map((it) => {
               const ratti = Number(it.discount_ratti) > 0;
+              const wastage =
+                Number(it.sale_wastage_pct) > 0 || Number(it.sale_wastage_g) > 0;
+              const adjusted = ratti || wastage;
               return (
               <tr key={it.id}>
                 <td className="py-2">
@@ -252,16 +325,24 @@ export function InvoiceDetailPage() {
                   {/* Spelled out on the customer's copy: the gold amount above
                       is charged on less metal than the piece contains, and the
                       document has to say so on its own. */}
+                  {wastage && (
+                    <div className="text-xs text-amber-700">
+                      Wastage{" "}
+                      {Number(it.sale_wastage_pct) > 0 ? `${it.sale_wastage_pct}%` : ""}
+                      {Number(it.sale_wastage_g) > 0 ? ` +${it.sale_wastage_g} g` : ""} — charged
+                      on {it.charged_gold_weight_g} g of {it.gold_weight_g} g
+                    </div>
+                  )}
                   {ratti && (
                     <div className="text-xs text-amber-700">
                       Ratti discount {it.discount_ratti} / {it.ratti_base} — billed on{" "}
-                      {it.billable_gold_weight_g} g of {it.gold_weight_g} g
+                      {it.billable_gold_weight_g} g of {it.charged_gold_weight_g} g
                     </div>
                   )}
                 </td>
                 <td className="py-2 text-right">{it.quantity}</td>
                 <td className="py-2 text-right">
-                  {ratti ? (
+                  {adjusted ? (
                     <>
                       <span className="text-slate-400 line-through">{it.gold_weight_g}</span>{" "}
                       <span className="font-medium">{it.billable_gold_weight_g}</span>
@@ -300,10 +381,30 @@ export function InvoiceDetailPage() {
           {Number(invoice.tax_amount) > 0 && (
             <Row label="Tax">{fmtMoney(invoice.tax_amount, invoice.currency)}</Row>
           )}
+          {Number(invoice.round_off) !== 0 && (
+            <Row label="Round off" negative={Number(invoice.round_off) > 0}>
+              {Number(invoice.round_off) > 0 ? "-" : "+"}
+              {fmtMoney(Math.abs(Number(invoice.round_off)), invoice.currency)}
+            </Row>
+          )}
           <Row label="Total" bold>
             {fmtMoney(invoice.total, invoice.currency)}
           </Row>
+          {Number(invoice.amount_paid) !== 0 && (
+            <>
+              <Row label="Paid">-{fmtMoney(invoice.amount_paid, invoice.currency)}</Row>
+              <Row label="Balance due" bold>
+                {fmtMoney(invoice.balance_due, invoice.currency)}
+              </Row>
+            </>
+          )}
         </section>
+
+        {invoice.bill_book_no && (
+          <div className="mt-3 text-xs text-slate-500">
+            Bill book #{invoice.bill_book_no}
+          </div>
+        )}
 
         {invoice.notes && (
           <section className="mt-6 border-t border-slate-200 pt-3 text-xs text-slate-500">
@@ -316,6 +417,128 @@ export function InvoiceDetailPage() {
           Thank you for your business.
         </footer>
       </div>
+
+      {/* Payments live outside the printed document: the customer's copy shows
+          the bill, the shop's screen shows what has been settled against it. */}
+      <section className="no-print card mx-auto w-full max-w-3xl">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 pb-3">
+          <div>
+            <h2 className="text-sm font-semibold uppercase text-slate-700">Payments</h2>
+            <p className="mt-0.5 text-xs text-slate-500">
+              Cash, transfers and old gold taken against this bill.
+            </p>
+          </div>
+          <div className="text-right">
+            <div className="text-xs uppercase text-slate-500">Balance due</div>
+            <div
+              className={`text-2xl font-semibold ${
+                Number(invoice.balance_due) > 0 ? "text-red-600" : "text-emerald-600"
+              }`}
+            >
+              {fmtMoney(invoice.balance_due, invoice.currency)}
+            </div>
+            <div className="text-xs text-slate-500">
+              {fmtMoney(invoice.amount_paid, invoice.currency)} of{" "}
+              {fmtMoney(invoice.total, invoice.currency)} settled
+            </div>
+          </div>
+        </div>
+
+        {/* An advance sitting on the account is not settlement of this bill —
+            it is credit the counter can choose to apply, so it is shown rather
+            than silently netted off. */}
+        {Number(invoice.customer_balance) < 0 && (
+          <div className="mt-3 rounded-lg bg-emerald-50 px-3 py-2 text-xs text-emerald-800">
+            This customer is in credit by{" "}
+            {fmtMoney(Math.abs(Number(invoice.customer_balance)), invoice.currency)} across their
+            account — take it as a payment here to apply it.
+          </div>
+        )}
+
+        {invoice.payments.length === 0 ? (
+          <p className="mt-4 text-sm text-slate-500">Nothing taken yet.</p>
+        ) : (
+          <table className="mt-3 w-full text-sm">
+            <thead className="text-left text-xs uppercase text-slate-500">
+              <tr>
+                <th className="py-2">Payment #</th>
+                <th className="py-2">Method</th>
+                <th className="py-2">Taken</th>
+                <th className="py-2 text-right">Amount</th>
+                <th className="py-2"></th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {invoice.payments.map((p) => (
+                <tr key={p.id} className={p.is_reversed ? "text-slate-400" : ""}>
+                  <td className="py-2 font-mono text-xs">
+                    {p.payment_no}
+                    {p.entry_no && <div className="text-[10px] text-slate-400">{p.entry_no}</div>}
+                  </td>
+                  <td className="py-2">
+                    {METHOD_LABEL[p.method] ?? p.method}
+                    {p.method === "gold_exchange" && (
+                      <div className="text-xs text-slate-500">
+                        {p.gold_weight_g} g @ {p.gold_purity ?? 24}k = {p.gold_fine_g} g fine ·{" "}
+                        {fmtMoney(p.gold_rate_per_g, invoice.currency)}/g fine
+                      </div>
+                    )}
+                    {p.bank_account_label && (
+                      <div className="text-xs text-slate-500">{p.bank_account_label}</div>
+                    )}
+                    {p.reference && <div className="text-xs text-slate-500">{p.reference}</div>}
+                  </td>
+                  <td className="py-2 text-xs text-slate-500">
+                    {new Date(p.paid_at).toLocaleString()}
+                    {p.is_reversed && (
+                      <span className="ml-1 rounded bg-red-100 px-1.5 py-0.5 text-[10px] text-red-700">
+                        reversed
+                      </span>
+                    )}
+                  </td>
+                  <td
+                    className={`py-2 text-right font-medium ${
+                      p.is_reversed ? "line-through" : p.direction === "paid" ? "text-red-600" : ""
+                    }`}
+                  >
+                    {p.direction === "paid" ? "-" : ""}
+                    {fmtMoney(p.amount, invoice.currency)}
+                  </td>
+                  <td className="py-2 text-right">
+                    {!p.is_reversed && (
+                      <button
+                        className="text-xs text-red-600 hover:underline"
+                        onClick={() => setReversing(p)}
+                      >
+                        Reverse
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </section>
+
+      <TakePaymentModal
+        open={takingPayment}
+        onClose={() => setTakingPayment(false)}
+        invoice={invoice}
+        onTaken={() => {
+          setTakingPayment(false);
+          load();
+        }}
+      />
+
+      <PasswordConfirm
+        open={!!reversing}
+        onClose={() => setReversing(null)}
+        title={`Reverse ${reversing?.payment_no ?? "payment"}?`}
+        description="The payment row is kept and marked reversed — a mirror entry goes into the ledger so both the receipt and its cancellation stay visible. The balance goes back up. Confirm with your password."
+        confirmLabel="Reverse payment"
+        onConfirm={confirmReverse}
+      />
 
       <PasswordConfirm
         open={voiding}
@@ -339,6 +562,229 @@ export function InvoiceDetailPage() {
         onConfirm={confirmIssue}
       />
     </div>
+  );
+}
+
+interface BankAccount {
+  id: number;
+  account_no: string;
+  title: string | null;
+  bank_name?: string | null;
+}
+
+/**
+ * Taking money at the counter.
+ *
+ * Gold handed over is entered as it was weighed, with the purity and the rate
+ * agreed there and then; the rupee value shown is the same arithmetic the
+ * server performs (fine grams x rate), and the server's figure is the one that
+ * is stored — this is only so nobody is asked to agree to a number they cannot
+ * see.
+ */
+function TakePaymentModal({
+  open,
+  onClose,
+  invoice,
+  onTaken,
+}: {
+  open: boolean;
+  onClose: () => void;
+  invoice: Invoice;
+  onTaken: () => void;
+}) {
+  const [method, setMethod] = useState("cash");
+  const [direction, setDirection] = useState("received");
+  const [amount, setAmount] = useState("0");
+  const [weight, setWeight] = useState("0");
+  const [purity, setPurity] = useState("22");
+  const [rate, setRate] = useState(invoice.gold_rate_per_g);
+  const [bankAccounts, setBankAccounts] = useState<BankAccount[]>([]);
+  const [bankAccountId, setBankAccountId] = useState(0);
+  const [reference, setReference] = useState("");
+  const [notes, setNotes] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    // Pre-fill with what is actually outstanding — the common case is the
+    // customer settling the rest of the bill.
+    setAmount(Number(invoice.balance_due) > 0 ? invoice.balance_due : "0");
+    setRate(invoice.gold_rate_per_g);
+    api
+      .get<BankAccount[]>("/bank-accounts")
+      .then((r) => {
+        setBankAccounts(r.data);
+        if (r.data.length) setBankAccountId(r.data[0].id);
+      })
+      .catch(() => {
+        /* no bank accounts configured — cash and gold still work */
+      });
+  }, [open, invoice.balance_due, invoice.gold_rate_per_g]);
+
+  const fine = ((Number(weight) || 0) * (Number(purity) || 24)) / 24;
+  const goldValue = fine * (Number(rate) || 0);
+  const isGold = method === "gold_exchange";
+
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    setSubmitting(true);
+    try {
+      await api.post("/payments", {
+        customer_id: invoice.customer_id,
+        invoice_id: invoice.id,
+        method,
+        direction,
+        // For a gold exchange the server derives the rupee value from the
+        // weight and rate, so whatever is sent here is ignored.
+        amount: isGold ? "0" : amount || "0",
+        gold_weight_g: isGold ? weight || "0" : null,
+        gold_purity: isGold ? Number(purity) || null : null,
+        gold_rate_per_g: isGold ? rate || "0" : null,
+        bank_account_id: method === "bank" ? bankAccountId || null : null,
+        reference: reference || null,
+        notes: notes || null,
+      });
+      toast("success", "Payment recorded");
+      setReference("");
+      setNotes("");
+      onTaken();
+    } catch (err) {
+      toast("error", apiError(err, "Could not record the payment"));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Modal open={open} onClose={onClose} title={`Take payment — ${invoice.invoice_no}`}>
+      <form onSubmit={submit} className="space-y-4">
+        <div className="rounded-lg bg-slate-50 px-3 py-2 text-sm">
+          <div className="flex justify-between">
+            <span className="text-slate-500">Balance due</span>
+            <span className="font-semibold">
+              {fmtMoney(invoice.balance_due, invoice.currency)}
+            </span>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 gap-3">
+          <SelectField
+            label="Method"
+            value={method}
+            onChange={(e) => setMethod(e.target.value)}
+            options={[
+              { value: "cash", label: "Cash" },
+              { value: "bank", label: "Bank transfer" },
+              { value: "gold_exchange", label: "Gold exchange (old jewellery)" },
+            ]}
+          />
+          <SelectField
+            label="Direction"
+            value={direction}
+            onChange={(e) => setDirection(e.target.value)}
+            options={[
+              { value: "received", label: "Received from customer" },
+              { value: "paid", label: "Paid back (change)" },
+            ]}
+            hint="Change given when old gold beats the bill"
+          />
+        </div>
+
+        {isGold ? (
+          <>
+            <div className="grid grid-cols-3 gap-3">
+              <TextField
+                label="Weight (g)"
+                type="number"
+                step="0.0001"
+                min={0}
+                required
+                value={weight}
+                onChange={(e) => setWeight(e.target.value)}
+              />
+              <TextField
+                label="Purity (k)"
+                type="number"
+                min={1}
+                max={24}
+                value={purity}
+                onChange={(e) => setPurity(e.target.value)}
+              />
+              <TextField
+                label="Rate / fine g"
+                type="number"
+                step="0.0001"
+                min={0}
+                required
+                value={rate}
+                onChange={(e) => setRate(e.target.value)}
+                hint="Agreed at the counter"
+              />
+            </div>
+            <div className="rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-800">
+              {weight || 0} g at {purity || 24}k is{" "}
+              <span className="font-semibold">{fine.toFixed(4)} g</span> fine ={" "}
+              <span className="font-semibold">{fmtMoney(goldValue, invoice.currency)}</span>
+              {Number(invoice.balance_due) > 0 && goldValue > Number(invoice.balance_due) && (
+                <div className="mt-1">
+                  That beats the balance by{" "}
+                  {fmtMoney(goldValue - Number(invoice.balance_due), invoice.currency)} — record
+                  the change back as a second payment with direction “Paid back”.
+                </div>
+              )}
+            </div>
+          </>
+        ) : (
+          <TextField
+            label="Amount"
+            type="number"
+            step="0.01"
+            min={0}
+            required
+            value={amount}
+            onChange={(e) => setAmount(e.target.value)}
+          />
+        )}
+
+        {method === "bank" && (
+          <SelectField
+            label="Bank account"
+            required
+            value={String(bankAccountId)}
+            onChange={(e) => setBankAccountId(Number(e.target.value))}
+            options={[
+              { value: 0, label: "— pick —" },
+              ...bankAccounts.map((b) => ({
+                value: b.id,
+                label: `${b.bank_name ?? b.title ?? "Account"} · ${b.account_no}`,
+              })),
+            ]}
+            hint="A transfer that names no account cannot be reconciled"
+          />
+        )}
+
+        <TextField
+          label="Reference"
+          value={reference}
+          onChange={(e) => setReference(e.target.value)}
+          placeholder="Slip no, cheque no…"
+        />
+        <TextArea label="Notes" value={notes} onChange={(e) => setNotes(e.target.value)} />
+
+        <div className="flex justify-end gap-2 pt-1">
+          <button type="button" className="btn-ghost" onClick={onClose}>
+            Cancel
+          </button>
+          <button
+            type="submit"
+            className="btn-primary"
+            disabled={submitting || (method === "bank" && !bankAccountId)}
+          >
+            {submitting ? "Recording…" : "Record payment"}
+          </button>
+        </div>
+      </form>
+    </Modal>
   );
 }
 

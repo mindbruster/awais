@@ -12,10 +12,13 @@ from app.api.v1 import (
     ledger,
     manufacturing,
     masters,
+    payments,
+    purchasing,
     product_stones,
     products,
     reports,
     stock_movements,
+    stocking,
     stones,
     users,
     vendors,
@@ -55,3 +58,9 @@ api_router.include_router(designs.router, prefix="/designs", tags=["designs"])
 # Analysis over the books. Degrades to plain statistics when no model provider
 # is configured — nothing here is allowed to be load-bearing.
 api_router.include_router(insights.router, prefix="/insights", tags=["insights"])
+
+# The money side: settling bills, stocking finished pieces, and both buying
+# channels. Each posts to the ledger, so none of them is a bolt-on.
+api_router.include_router(payments.router, prefix="/payments", tags=["payments"])
+api_router.include_router(stocking.router, prefix="/stocking", tags=["stocking"])
+api_router.include_router(purchasing.router, prefix="/purchasing", tags=["purchasing"])

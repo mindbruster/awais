@@ -31,6 +31,8 @@ PERMISSIONS: dict[str, set[str]] = {
         # post entries. Deleting accounts stays with admins.
         "ledger:read", "ledger:write", "ledger:post",
         "design:read",
+        # Taking money and reconciling it is the accountant's core job.
+        "payment:read", "payment:write", "payment:reverse",
     },
     "staff": {
         "customer:read", "customer:write", "customer:delete",
@@ -52,6 +54,11 @@ PERMISSIONS: dict[str, set[str]] = {
         # receive all day. They cannot see the books those postings land in —
         # worker gold liabilities and cash balances are owner information.
         "design:read", "design:write",
+        # Counter staff take money at the till and must be able to record it —
+        # a payment that goes unrecorded because the salesperson lacked a
+        # permission is worse than one recorded by the wrong person. Reversing
+        # one is a correction to the books, so that stays with the accountant.
+        "payment:read", "payment:write",
     },
 }
 

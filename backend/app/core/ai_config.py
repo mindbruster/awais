@@ -9,8 +9,15 @@ the AI layer is that it can be absent, and a config import error is a worse
 failure than a missing API key.
 
 Reads the process environment, falling back to the same `backend/.env` the rest
-of the app loads — an operator who puts ANTHROPIC_API_KEY next to DATABASE_URL
-has done the reasonable thing and should not get an unexplained 503.
+of the app loads — an operator who puts the key next to DATABASE_URL has done
+the reasonable thing and should not get an unexplained 503.
+
+Two providers. `anthropic` talks to the Claude API directly. `openrouter` is a
+single gateway in front of most other vendors, including Z.AI's GLM family, and
+is the cheaper route: GLM 4.7 Flash costs roughly a thousandth of a frontier
+model per token, which for narrating a handful of report rows is close enough to
+free. Both go through the same code path, because the shop must never depend on
+which one is switched on.
 """
 from __future__ import annotations
 
@@ -22,14 +29,26 @@ from pathlib import Path
 # backend/app/core/ai_config.py -> backend/.env
 _ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 
-DEFAULT_MODEL = "claude-opus-5"
+PROVIDERS = ("none", "anthropic", "openrouter")
+
+DEFAULT_MODELS = {
+    "anthropic": "claude-opus-5",
+    # The cheapest GLM on OpenRouter. Note that despite the name, none of the
+    # GLM models are on OpenRouter's free tier — the ":free" catalogue rotates
+    # and currently carries none of them. This one is inexpensive rather than
+    # free; see docs/AI_SETUP.md for genuinely free alternatives.
+    "openrouter": "z-ai/glm-4.7-flash",
+}
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 SETUP_INSTRUCTIONS = (
-    "AI features are not configured. Set AI_PROVIDER=anthropic and "
-    "ANTHROPIC_API_KEY (optionally AI_MODEL, default "
-    f"'{DEFAULT_MODEL}') in backend/.env or the environment, install the SDK "
-    "with `pip install anthropic`, and restart the API. Every other figure on "
-    "this page is computed without a model and keeps working regardless."
+    "AI features are not configured. Either set AI_PROVIDER=openrouter with "
+    "OPENROUTER_API_KEY (optionally AI_MODEL, default "
+    f"'{DEFAULT_MODELS['openrouter']}'), or AI_PROVIDER=anthropic with "
+    f"ANTHROPIC_API_KEY (default '{DEFAULT_MODELS['anthropic']}'), in "
+    "backend/.env or the environment, then restart the API. Every other figure "
+    "on this page is computed without a model and keeps working regardless."
 )
 
 
@@ -62,37 +81,52 @@ def _env(name: str) -> str | None:
 
 @dataclass(frozen=True)
 class AISettings:
-    provider: str  # "none" | "anthropic"
+    provider: str  # one of PROVIDERS
     anthropic_api_key: str | None
+    openrouter_api_key: str | None
     model: str
+    # Sent as HTTP-Referer / X-Title on OpenRouter so usage is attributable in
+    # their dashboard. Optional and cosmetic; requests work without them.
+    app_url: str | None
+    app_name: str
+
+    @property
+    def api_key(self) -> str | None:
+        if self.provider == "anthropic":
+            return self.anthropic_api_key
+        if self.provider == "openrouter":
+            return self.openrouter_api_key
+        return None
 
     @property
     def configured(self) -> bool:
         """True only when a call could actually be made."""
-        if self.provider == "anthropic":
-            return bool(self.anthropic_api_key)
-        return False
+        return self.provider in ("anthropic", "openrouter") and bool(self.api_key)
 
     @property
     def unconfigured_reason(self) -> str | None:
         if self.provider == "none":
             return SETUP_INSTRUCTIONS
-        if self.provider == "anthropic" and not self.anthropic_api_key:
+        if self.provider not in PROVIDERS:
             return (
-                "AI_PROVIDER=anthropic but ANTHROPIC_API_KEY is empty. "
-                + SETUP_INSTRUCTIONS
+                f"Unknown AI_PROVIDER '{self.provider}'. Supported: "
+                f"{', '.join(PROVIDERS)}. " + SETUP_INSTRUCTIONS
             )
-        if self.provider not in ("none", "anthropic"):
-            return (
-                f"Unknown AI_PROVIDER '{self.provider}'. Supported: none, anthropic. "
-                + SETUP_INSTRUCTIONS
-            )
+        if not self.api_key:
+            key_name = "ANTHROPIC_API_KEY" if self.provider == "anthropic" else "OPENROUTER_API_KEY"
+            return f"AI_PROVIDER={self.provider} but {key_name} is empty. " + SETUP_INSTRUCTIONS
         return None
 
 
 def get_ai_settings() -> AISettings:
+    provider = (_env("AI_PROVIDER") or "none").lower()
     return AISettings(
-        provider=(_env("AI_PROVIDER") or "none").lower(),
+        provider=provider,
         anthropic_api_key=_env("ANTHROPIC_API_KEY"),
-        model=_env("AI_MODEL") or DEFAULT_MODEL,
+        openrouter_api_key=_env("OPENROUTER_API_KEY"),
+        # The default follows the provider, so switching provider doesn't leave
+        # a model name from the other one behind and fail with "unknown model".
+        model=_env("AI_MODEL") or DEFAULT_MODELS.get(provider, DEFAULT_MODELS["openrouter"]),
+        app_url=_env("AI_APP_URL"),
+        app_name=_env("AI_APP_NAME") or "Jewelry ERP",
     )

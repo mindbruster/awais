@@ -1,3 +1,4 @@
+import os
 from functools import lru_cache
 from typing import Annotated, List
 
@@ -71,6 +72,28 @@ class Settings(BaseSettings):
             insecure.append("SEED_ADMIN_PASSWORD")
         if self.debug:
             insecure.append("DEBUG (must be false outside development)")
+
+        # Local-disk storage on a platform with an ephemeral filesystem deletes
+        # every product photograph on each redeploy, silently and permanently.
+        # It is the one production misconfiguration that destroys data the shop
+        # cannot recreate, and it gives no signal at all — so it fails at boot
+        # rather than at the next deploy. Set STORAGE_BACKEND=local explicitly
+        # if the deployment genuinely has a persistent volume mounted.
+        storage = os.getenv("STORAGE_BACKEND", "").strip().lower()
+        if not storage:
+            insecure.append(
+                "STORAGE_BACKEND (set 's3' for object storage, or 'local' only if a "
+                "persistent volume is mounted at UPLOAD_DIR — the default loses every "
+                "uploaded photo on redeploy)"
+            )
+        elif storage == "s3":
+            missing = [
+                name
+                for name in ("S3_ENDPOINT", "S3_BUCKET", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY")
+                if not os.getenv(name)
+            ]
+            if missing:
+                insecure.append(f"STORAGE_BACKEND=s3 but {', '.join(missing)} not set")
 
         if insecure:
             raise ValueError(

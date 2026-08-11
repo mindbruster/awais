@@ -1,6 +1,7 @@
 import enum
+from datetime import datetime
 
-from sqlalchemy import Enum, Integer, Numeric, String, Text
+from sqlalchemy import DateTime, Enum, ForeignKey, Integer, Numeric, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -29,6 +30,18 @@ class Product(Base, TimestampMixin):
     stone_weight_ct: Mapped[float] = mapped_column(Numeric(12, 4), default=0, nullable=False)
 
     image_url: Mapped[str | None] = mapped_column(String(500))
+
+    # Filled in by the stock form when a design leaves the workshop. Gross is
+    # what the scale says with stones in; `gold_weight_g` above is the metal
+    # alone, which is what gets priced.
+    gross_weight_g: Mapped[float | None] = mapped_column(Numeric(12, 4))
+    other_charges: Mapped[float] = mapped_column(Numeric(14, 2), default=0, nullable=False)
+    stocked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The piece this product came off, so a sale can be traced back through
+    # every department that touched it.
+    design_id: Mapped[int | None] = mapped_column(
+        ForeignKey("designs.id", ondelete="SET NULL"), index=True
+    )
 
     # Phase 7 — total making cost rolled up from manufacturing job (labor + polish
     # + stone fixing + other). Material value is tracked separately on

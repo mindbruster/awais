@@ -6,7 +6,8 @@ from pydantic import BaseModel, Field, computed_field, model_validator
 from app.models.currency import Currency
 from app.models.invoice import InvoiceStatus, SaleType
 from app.schemas.common import TimestampedRead
-from app.services.pricing import DEFAULT_RATTI_BASE, apply_ratti_discount
+from app.schemas.payment import PaymentRead
+from app.services.pricing import DEFAULT_RATTI_BASE, apply_ratti_discount, apply_sale_wastage
 
 
 class InvoiceItemCreate(BaseModel):
@@ -25,6 +26,12 @@ class InvoiceItemCreate(BaseModel):
     # giveaway can be reported on its own.
     discount_ratti: Decimal = Field(default=Decimal("0"), ge=0)
     ratti_base: int = Field(default=DEFAULT_RATTI_BASE, ge=1)
+    # Wastage the customer is charged: the shop bills for more gold than the
+    # piece contains. The counter quotes it as a percentage or as flat grams
+    # depending on what the customer is arguing in, and both can appear on one
+    # line, so they are additive rather than exclusive.
+    sale_wastage_pct: Decimal = Field(default=Decimal("0"), ge=0)
+    sale_wastage_g: Decimal = Field(default=Decimal("0"), ge=0)
 
     @model_validator(mode="after")
     def ratti_within_base(self) -> "InvoiceItemCreate":
@@ -47,14 +54,26 @@ class InvoiceItemRead(TimestampedRead, InvoiceItemCreate):
 
     @computed_field  # type: ignore[prop-decorator]
     @property
+    def charged_gold_weight_g(self) -> Decimal:
+        """The net weight plus the wastage the customer is being billed for."""
+        return apply_sale_wastage(
+            self.gold_weight_g, self.sale_wastage_pct, self.sale_wastage_g
+        )
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
     def billable_gold_weight_g(self) -> Decimal:
         """
-        The weight the customer is actually charged for after the ratti
-        discount. Derived here from the one implementation in pricing.py so no
-        client has to re-derive the formula (and drift from it).
+        The weight the money is actually calculated on: marked up by wastage,
+        then reduced by the ratti discount — the same order `price_line` uses,
+        because applying the percentage to an already-discounted weight would
+        quietly shrink the discount the customer was promised.
+
+        Derived here from the one implementation in pricing.py so no client has
+        to re-derive the formula (and drift from it).
         """
         return apply_ratti_discount(
-            self.gold_weight_g, self.discount_ratti, self.ratti_base
+            self.charged_gold_weight_g, self.discount_ratti, self.ratti_base
         )
 
 
@@ -66,6 +85,13 @@ class InvoiceCreate(BaseModel):
     discount_amount: Decimal = Field(default=Decimal("0"), ge=0)
     discount_weight_g: Decimal = Field(default=Decimal("0"), ge=0)
     tax_amount: Decimal = Field(default=Decimal("0"), ge=0)
+    # The shop's paper bill book runs alongside the system after go-live and
+    # the two have to be reconcilable by hand.
+    bill_book_no: str | None = Field(default=None, max_length=50)
+    # Knocked off to reach a round figure. Positive rounds the total down,
+    # negative rounds it up — both happen at the counter. Stored as its own
+    # figure rather than folded into a discount so the margin report can see it.
+    round_off: Decimal = Decimal("0")
     notes: str | None = None
     items: list[InvoiceItemCreate] = Field(default_factory=list)
 
@@ -81,8 +107,29 @@ class InvoiceRead(TimestampedRead):
     discount_amount: Decimal
     discount_weight_g: Decimal
     tax_amount: Decimal
+    round_off: Decimal
     total: Decimal
+    bill_book_no: str | None = None
     issued_at: datetime | None = None
     paid_at: datetime | None = None
     notes: str | None = None
     items: list[InvoiceItemRead] = Field(default_factory=list)
+
+
+class InvoiceDetail(InvoiceRead):
+    """
+    One invoice with its settlement worked out.
+
+    `amount_paid` and `balance_due` are summed from the payment rows on every
+    read, never stored: a cached figure would have to be maintained by every
+    path that takes, reverses or voids money, and the first one that forgets
+    leaves a balance nobody can reconcile.
+    """
+
+    amount_paid: Decimal
+    balance_due: Decimal
+    # Rupees this customer owes across everything, from the ledger. Negative
+    # means they are in credit — an advance sitting against their account that
+    # this bill has not been settled with yet.
+    customer_balance: Decimal
+    payments: list[PaymentRead] = Field(default_factory=list)

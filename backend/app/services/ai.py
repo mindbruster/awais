@@ -37,7 +37,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.ai_config import AISettings, get_ai_settings
+from app.core.ai_config import OPENROUTER_BASE_URL, AISettings, get_ai_settings
 
 log = logging.getLogger(__name__)
 
@@ -76,14 +76,112 @@ def require_provider() -> AISettings:
     return cfg
 
 
+@dataclass
+class _Block:
+    type: str
+    text: str
+
+
+@dataclass
+class _Message:
+    """The shape the call sites already expect, whoever produced it."""
+
+    content: list[_Block]
+    stop_reason: str | None = None
+
+
+class _OpenRouterMessages:
+    """
+    OpenRouter behind the Anthropic SDK's `messages.create` signature.
+
+    An adapter rather than a second code path on purpose: the three places that
+    call a model are about wastage, margins and answering questions, and none of
+    them should know or care which vendor is switched on. Anything that leaks
+    the provider into those call sites becomes a place where switching provider
+    silently changes behaviour.
+    """
+
+    def __init__(self, cfg: AISettings, timeout: float) -> None:
+        self._cfg = cfg
+        self._timeout = timeout
+
+    async def create(
+        self,
+        *,
+        model: str,
+        max_tokens: int,
+        system: str,
+        messages: list[dict[str, Any]],
+        output_config: dict[str, Any] | None = None,
+    ) -> _Message:
+        import httpx
+
+        body: dict[str, Any] = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "system", "content": system}, *messages],
+        }
+
+        # Structured output where the model supports it. Not every model on the
+        # gateway honours json_schema, so the prompts also state the shape in
+        # words and the parse below tolerates a fenced block — belt and braces
+        # beats a 500 on a report that is meant to degrade gracefully.
+        fmt = (output_config or {}).get("format")
+        if isinstance(fmt, dict) and fmt.get("type") == "json_schema":
+            body["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "result", "strict": True, "schema": fmt["schema"]},
+            }
+
+        headers = {
+            "Authorization": f"Bearer {self._cfg.api_key}",
+            "Content-Type": "application/json",
+            "X-Title": self._cfg.app_name,
+        }
+        if self._cfg.app_url:
+            headers["HTTP-Referer"] = self._cfg.app_url
+
+        async with httpx.AsyncClient(timeout=self._timeout) as http:
+            resp = await http.post(
+                f"{OPENROUTER_BASE_URL}/chat/completions", json=body, headers=headers
+            )
+        if resp.status_code >= 400:
+            # The key must never reach a log or a response; only the status and
+            # the provider's own message do.
+            raise RuntimeError(f"OpenRouter returned {resp.status_code}: {resp.text[:300]}")
+
+        data = resp.json()
+        choice = (data.get("choices") or [{}])[0]
+        text = (choice.get("message") or {}).get("content") or ""
+        finish = choice.get("finish_reason")
+        return _Message(
+            content=[_Block(type="text", text=text)],
+            stop_reason="refusal" if finish == "content_filter" else finish,
+        )
+
+
+class _OpenRouterClient:
+    def __init__(self, cfg: AISettings, timeout: float) -> None:
+        self.messages = _OpenRouterMessages(cfg, timeout)
+
+
 def _client(cfg: AISettings, timeout: float):
     """
     Built per call, and the SDK is imported here rather than at module scope.
 
     The dependency is optional: with AI_PROVIDER unset the app must import and
-    serve every deterministic endpoint on a machine that has never seen the
-    anthropic package.
+    serve every deterministic endpoint on a machine that has never seen either
+    client library.
     """
+    if cfg.provider == "openrouter":
+        return _OpenRouterClient(cfg, timeout)
+
+    if cfg.provider != "anthropic":  # pragma: no cover - guarded by require_provider
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Unknown AI_PROVIDER '{cfg.provider}'",
+        )
+
     try:
         from anthropic import AsyncAnthropic
     except ImportError as exc:  # pragma: no cover - depends on the deployment
@@ -91,20 +189,27 @@ def _client(cfg: AISettings, timeout: float):
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
                 "AI_PROVIDER is set to 'anthropic' but the SDK is not installed. "
-                "Run `pip install anthropic` in the backend virtualenv."
+                "Run `pip install anthropic` in the backend virtualenv, or switch to "
+                "AI_PROVIDER=openrouter, which needs no extra package."
             ),
         ) from exc
 
-    if cfg.provider != "anthropic":  # pragma: no cover - guarded by require_provider
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Unknown AI_PROVIDER '{cfg.provider}'",
-        )
     return AsyncAnthropic(api_key=cfg.anthropic_api_key).with_options(timeout=timeout)
 
 
 def _text_of(message) -> str:
-    return "".join(b.text for b in message.content if b.type == "text").strip()
+    """
+    The text of a reply, with any markdown fence stripped.
+
+    Frontier models asked for JSON return JSON. Cheaper gateway models often
+    wrap it in ```json anyway, and a report that degrades gracefully must not
+    fall over because of a code fence.
+    """
+    text = "".join(b.text for b in message.content if b.type == "text").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    return text.strip()
 
 
 # --------------------------------------------------------------------------

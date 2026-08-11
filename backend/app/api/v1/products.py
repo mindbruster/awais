@@ -1,9 +1,9 @@
-import os
 import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from sqlalchemy import or_, select
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import CurrentUser, DbSession, require_password_confirm, require_perm
@@ -11,14 +11,13 @@ from app.models.product import Product
 from app.schemas.product import ProductCreate, ProductRead, ProductUpdate
 from app.services.audit import log_action
 from app.services.serial import next_product_serial
+from app.services.storage import StorageError, get_storage
 
 router = APIRouter()
 read = Depends(require_perm("product:read"))
 write = Depends(require_perm("product:write"))
 delete = Depends(require_perm("product:delete"))
 
-UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads"))
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 ALLOWED_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 MAX_IMAGE_BYTES = 5 * 1024 * 1024  # 5 MB
 
@@ -92,10 +91,8 @@ async def delete_product(product_id: int, db: DbSession, current: CurrentUser) -
     if product is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Product not found")
 
-    # Capture image path before delete so we can sweep it once the row is gone.
-    image_path: Path | None = None
-    if product.image_url and product.image_url.startswith("/static/"):
-        image_path = UPLOAD_DIR / product.image_url.removeprefix("/static/")
+    # Capture the image URL before delete so we can sweep it once the row is gone.
+    image_url = product.image_url
 
     await log_action(
         db, user=current,
@@ -106,12 +103,10 @@ async def delete_product(product_id: int, db: DbSession, current: CurrentUser) -
     await db.delete(product)
     await db.commit()
 
-    # Best-effort: ignore if it was already missing on disk.
-    if image_path is not None:
-        try:
-            image_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+    # Best-effort sweep. The backend swallows a missing or foreign object: the
+    # row is already gone and the delete must not fail after the fact.
+    if image_url:
+        await run_in_threadpool(get_storage().delete, image_url)
 
 
 @router.post("/{product_id}/image", response_model=ProductRead, dependencies=[write])
@@ -135,11 +130,28 @@ async def upload_image(
     if len(contents) > MAX_IMAGE_BYTES:
         raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "Image exceeds 5MB limit")
 
+    storage = get_storage()
+    previous_url = product.image_url
     fname = f"product_{product_id}_{uuid.uuid4().hex}{ext}"
-    fpath = UPLOAD_DIR / fname
-    fpath.write_bytes(contents)
 
-    product.image_url = f"/static/{fname}"
+    # Both backends are blocking (a disk write, or an HTTPS PUT to the bucket),
+    # so keep them off the event loop.
+    try:
+        image_url = await run_in_threadpool(storage.save, contents, filename=fname)
+    except StorageError as exc:
+        # The bucket being unreachable is an infrastructure fault, not a bad
+        # request — say so, and say which backend failed.
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+
+    # Store the new URL first. If the commit fails the fresh object is orphaned,
+    # which is recoverable; losing the row's pointer to a photograph is not.
+    product.image_url = image_url
     await db.commit()
     await db.refresh(product)
+
+    # Replacing a photo used to leak the old file forever. Sweep it now that the
+    # row no longer references it.
+    if previous_url and previous_url != image_url:
+        await run_in_threadpool(storage.delete, previous_url)
+
     return product

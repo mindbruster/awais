@@ -6,15 +6,19 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import CurrentUser, DbSession, require_password_confirm, require_perm
+from app.api.v1.payments import decorate_payments
 from app.models.customer import Customer
 from app.models.gold_rate import GoldRate
 from app.models.inventory import InventoryItem
 from app.models.invoice import Invoice, InvoiceItem, InvoiceStatus, SaleType
+from app.models.payment import Payment, PaymentDirection, PaymentMethod
 from app.models.product import Product, ProductStatus
 from app.models.stock_movement import MovementType
-from app.schemas.invoice import InvoiceCreate, InvoiceRead
+from app.schemas.invoice import InvoiceCreate, InvoiceDetail, InvoiceRead
+from app.services import sales
 from app.services.audit import log_action
 from app.services.inventory import post_movement
+from app.services.ledger import customer_balance
 from app.services.pricing import DEFAULT_RATTI_BASE, invoice_totals, price_line
 from app.services.gold_rate import rate_in_force
 from app.services.serial import next_invoice_no
@@ -52,6 +56,37 @@ async def _load_invoice(db, invoice_id: int) -> Invoice:
     return result
 
 
+async def _detail(db, invoice: Invoice) -> InvoiceDetail:
+    """
+    One invoice with its settlement attached.
+
+    `amount_paid` and `balance_due` are summed from the payment rows on every
+    read rather than stored on the invoice: a cached figure would need
+    maintaining by every path that takes, reverses or voids money, and the
+    first one that forgets leaves a balance nobody can reconcile.
+    """
+    paid, due = await sales.settlement(db, invoice)
+    payments = list(
+        (
+            await db.execute(
+                select(Payment)
+                .where(Payment.invoice_id == invoice.id)
+                .order_by(Payment.paid_at, Payment.id)
+            )
+        )
+        .unique()
+        .scalars()
+        .all()
+    )
+    return InvoiceDetail(
+        **InvoiceRead.model_validate(invoice).model_dump(),
+        amount_paid=paid,
+        balance_due=due,
+        customer_balance=await customer_balance(db, invoice.customer_id),
+        payments=await decorate_payments(db, payments),
+    )
+
+
 def _recompute(invoice: Invoice) -> None:
     line_totals: list[Decimal] = []
     for it in invoice.items:
@@ -75,6 +110,12 @@ def _recompute(invoice: Invoice) -> None:
             # Rows predating the column carry NULL/0; fall back to the customary
             # base rather than dividing by zero.
             ratti_base=int(it.ratti_base or DEFAULT_RATTI_BASE),
+            # Wastage marks the metal up before the ratti discount gives some of
+            # it back. Both levers are on the line and both have to reach
+            # pricing, or the customer is billed on the net weight and the
+            # shop's main margin lever silently does nothing.
+            sale_wastage_pct=Decimal(str(it.sale_wastage_pct or 0)),
+            sale_wastage_g=Decimal(str(it.sale_wastage_g or 0)),
             # Stock deduction and the profit report both scale by quantity, so
             # pricing must too — otherwise a multi-unit line ships and costs N
             # pieces while billing for one.
@@ -92,6 +133,13 @@ def _recompute(invoice: Invoice) -> None:
         discount_weight_g=Decimal(str(invoice.discount_weight_g)),
         tax_amount=Decimal(str(invoice.tax_amount)),
     )
+    # The round-off is applied here rather than inside invoice_totals because it
+    # is not a pricing rule: it is the paisa the counter waives to reach a
+    # figure the customer can hand over. Stored as its own column so the margin
+    # report can see it instead of it vanishing into the discount. Positive
+    # rounds the total down, negative rounds it up.
+    round_off = Decimal(str(invoice.round_off or 0))
+    total = max(total - round_off, Decimal("0")).quantize(Decimal("0.01"))
     invoice.subtotal = subtotal
     invoice.total = total
 
@@ -126,11 +174,11 @@ async def list_invoices(
 
 @router.post(
     "",
-    response_model=InvoiceRead,
+    response_model=InvoiceDetail,
     status_code=status.HTTP_201_CREATED,
     dependencies=[write],
 )
-async def create_invoice(payload: InvoiceCreate, db: DbSession) -> Invoice:
+async def create_invoice(payload: InvoiceCreate, db: DbSession) -> InvoiceDetail:
     customer = await db.get(Customer, payload.customer_id)
     if customer is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid customer_id")
@@ -152,37 +200,39 @@ async def create_invoice(payload: InvoiceCreate, db: DbSession) -> Invoice:
         discount_amount=payload.discount_amount,
         discount_weight_g=payload.discount_weight_g,
         tax_amount=payload.tax_amount,
+        bill_book_no=payload.bill_book_no,
+        round_off=payload.round_off,
         notes=payload.notes,
     )
     invoice.items = [InvoiceItem(**it.model_dump()) for it in payload.items]
     _recompute(invoice)
     db.add(invoice)
     await db.commit()
-    return await _load_invoice(db, invoice.id)
+    return await _detail(db, await _load_invoice(db, invoice.id))
 
 
-@router.get("/{invoice_id}", response_model=InvoiceRead, dependencies=[read])
-async def get_invoice(invoice_id: int, db: DbSession) -> Invoice:
-    stmt = (
-        select(Invoice)
-        .options(selectinload(Invoice.items))
-        .where(Invoice.id == invoice_id)
-    )
-    invoice = (await db.execute(stmt)).scalar_one_or_none()
-    if invoice is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Invoice not found")
-    return invoice
+@router.get("/{invoice_id}", response_model=InvoiceDetail, dependencies=[read])
+async def get_invoice(invoice_id: int, db: DbSession) -> InvoiceDetail:
+    return await _detail(db, await _load_invoice(db, invoice_id))
 
 
 @router.post(
     "/{invoice_id}/issue",
-    response_model=InvoiceRead,
+    response_model=InvoiceDetail,
     dependencies=[issue_perm, Depends(require_password_confirm)],
 )
 async def issue_invoice(
     invoice_id: int, db: DbSession, current: CurrentUser
-) -> Invoice:
-    """Issue a draft invoice. For normal sales, deduct stock for each linked product."""
+) -> InvoiceDetail:
+    """
+    Issue a draft invoice: deduct stock for each linked product on a normal
+    sale, and post the sale to the books.
+
+    Stock and the ledger move together or not at all. An invoice that shipped
+    metal without recording a receivable is exactly the disagreement between
+    the two that this system exists to prevent, so both happen in the one
+    transaction.
+    """
     stmt = (
         select(Invoice)
         .options(selectinload(Invoice.items))
@@ -237,6 +287,8 @@ async def issue_invoice(
 
     invoice.status = InvoiceStatus.issued
     invoice.issued_at = datetime.now(timezone.utc)
+    # The customer now owes the shop: debit Customers, credit Sales.
+    entry = await sales.post_invoice_issued(db, invoice, user_id=current.id)
     await log_action(
         db, user=current,
         action="invoice.issue",
@@ -246,32 +298,77 @@ async def issue_invoice(
             "sale_type": invoice.sale_type.value,
             "currency": invoice.currency.value,
             "total": str(invoice.total),
+            "entry_no": entry.entry_no if entry else None,
         },
     )
     await db.commit()
-    return await _load_invoice(db, invoice.id)
+    return await _detail(db, await _load_invoice(db, invoice.id))
 
 
-@router.post("/{invoice_id}/mark-paid", response_model=InvoiceRead, dependencies=[mark_paid_perm])
-async def mark_paid(invoice_id: int, db: DbSession, current: CurrentUser) -> Invoice:
-    stmt = (
-        select(Invoice).options(selectinload(Invoice.items)).where(Invoice.id == invoice_id)
-    )
-    invoice = (await db.execute(stmt)).scalar_one_or_none()
-    if invoice is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Invoice not found")
-    if invoice.status not in (InvoiceStatus.issued,):
+@router.post("/{invoice_id}/mark-paid", response_model=InvoiceDetail, dependencies=[mark_paid_perm])
+async def mark_paid(invoice_id: int, db: DbSession, current: CurrentUser) -> InvoiceDetail:
+    """
+    Settle the whole outstanding balance in cash, in one click.
+
+    This used to flip a status flag, which is why nobody could say how much had
+    been taken, when, or by what method. It is now a **shortcut that records a
+    real cash payment** for whatever is still owed: it mints a payment row,
+    posts it to the ledger (debit Cash in Hand, credit Customers) and lets the
+    status follow the money like every other settlement. `paid` is therefore a
+    summary of the payment rows, never a claim made independently of them.
+
+    Anything other than "the customer handed over the full balance in notes" —
+    part payment, a bank transfer, old gold — goes through POST /payments,
+    which is the same code path with the details filled in.
+    """
+    invoice = await _load_invoice(db, invoice_id)
+    if invoice.status is not InvoiceStatus.issued:
         raise HTTPException(status.HTTP_409_CONFLICT, "Only issued invoices can be marked paid")
-    invoice.status = InvoiceStatus.paid
-    invoice.paid_at = datetime.now(timezone.utc)
+
+    _, due = await sales.settlement(db, invoice)
+    if due <= 0:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"{invoice.invoice_no} has nothing outstanding — there is no payment to record.",
+        )
+
+    payment = Payment(
+        payment_no=await sales.next_payment_no(db),
+        invoice_id=invoice.id,
+        customer_id=invoice.customer_id,
+        method=PaymentMethod.cash,
+        direction=PaymentDirection.received,
+        amount=due,
+        paid_at=datetime.now(timezone.utc),
+        reference=f"Marked paid — {invoice.invoice_no}",
+        created_by_user_id=current.id,
+    )
+    db.add(payment)
+    # The entry carries the payment's id as its source, so the row has to exist
+    # before it can be posted against.
+    await db.flush()
+
+    customer = await db.get(Customer, invoice.customer_id)
+    entry = await sales.post_payment(
+        db, payment, customer=customer, invoice=invoice, user_id=current.id
+    )
+    payment.journal_entry_id = entry.id
+    await sales.refresh_status(db, invoice)
+
     await log_action(
         db, user=current,
         action="invoice.mark_paid",
         resource_type="invoice", resource_id=invoice.id,
-        details={"invoice_no": invoice.invoice_no, "total": str(invoice.total)},
+        details={
+            "invoice_no": invoice.invoice_no,
+            "total": str(invoice.total),
+            "payment_no": payment.payment_no,
+            "amount": str(due),
+            "entry_no": entry.entry_no,
+        },
     )
     await db.commit()
-    return await _load_invoice(db, invoice.id)
+    return await _detail(db, await _load_invoice(db, invoice.id))
 
 
 @router.post("/{invoice_id}/send-whatsapp", dependencies=[read])
@@ -301,21 +398,34 @@ async def send_whatsapp(invoice_id: int, db: DbSession) -> dict:
 
 @router.post(
     "/{invoice_id}/void",
-    response_model=InvoiceRead,
+    response_model=InvoiceDetail,
     dependencies=[void_perm, Depends(require_password_confirm)],
 )
 async def void_invoice(
     invoice_id: int, db: DbSession, current: CurrentUser
-) -> Invoice:
-    """Void an issued invoice and reverse stock movements."""
-    stmt = (
-        select(Invoice).options(selectinload(Invoice.items)).where(Invoice.id == invoice_id)
-    )
-    invoice = (await db.execute(stmt)).scalar_one_or_none()
-    if invoice is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Invoice not found")
+) -> InvoiceDetail:
+    """
+    Void an issued invoice: put the stock back and reverse what it posted.
+
+    A voided invoice is corrected, never erased — the original entry stays in
+    the journal with a reversal pointing at it, so the books can still explain
+    how the receivable appeared and why it went away.
+    """
+    invoice = await _load_invoice(db, invoice_id)
     if invoice.status not in (InvoiceStatus.draft, InvoiceStatus.issued):
         raise HTTPException(status.HTTP_409_CONFLICT, "Cannot void in current status")
+
+    # Money already taken against this bill has to be dealt with first. Voiding
+    # underneath a live payment would leave cash in the till credited to an
+    # invoice that no longer exists, and the customer's balance would go into
+    # credit without anyone deciding that.
+    taken = await sales.live_payment_count(db, invoice.id)
+    if taken:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"{invoice.invoice_no} has {taken} payment(s) recorded against it. Reverse or "
+            "refund them before voiding the bill.",
+        )
 
     if invoice.status == InvoiceStatus.issued:
         is_normal = invoice.sale_type == SaleType.normal
@@ -350,6 +460,7 @@ async def void_invoice(
             # On-approval: stock was never moved; just clear the marker.
             product.status = ProductStatus.in_stock
 
+    reversals = await sales.reverse_invoice_entries(db, invoice, user_id=current.id)
     invoice.status = InvoiceStatus.void
     await log_action(
         db, user=current,
@@ -359,7 +470,8 @@ async def void_invoice(
             "invoice_no": invoice.invoice_no,
             "sale_type": invoice.sale_type.value,
             "previous_status": "issued" if invoice.issued_at else "draft",
+            "reversals": [e.entry_no for e in reversals],
         },
     )
     await db.commit()
-    return await _load_invoice(db, invoice.id)
+    return await _detail(db, await _load_invoice(db, invoice.id))

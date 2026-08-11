@@ -205,11 +205,18 @@ export function InvoicesPage() {
                       )}
                       {inv.status === "issued" && (
                         <>
+                          {/* No longer a flag: this records a cash payment for
+                              whatever is still outstanding, which is why it
+                              says what it does. Part payments, transfers and
+                              gold exchange live on the invoice's detail page. */}
                           <button
                             className="rounded bg-emerald-600 px-2 py-1 text-xs text-white hover:bg-emerald-700"
-                            onClick={() => action(inv.id, "mark-paid", "Marked paid")}
+                            title="Records a cash payment for the outstanding balance"
+                            onClick={() =>
+                              action(inv.id, "mark-paid", "Cash payment recorded for the balance")
+                            }
                           >
-                            Mark paid
+                            Cash in full
                           </button>
                           <button
                             className="rounded bg-red-100 px-2 py-1 text-xs text-red-700 hover:bg-red-200"
@@ -286,6 +293,8 @@ interface DraftItem {
   labor_amount: string;
   line_discount: string;
   discount_ratti: string;
+  sale_wastage_pct: string;
+  sale_wastage_g: string;
 }
 
 // The customary base the counter quotes against. Stored per line (the column
@@ -293,16 +302,35 @@ interface DraftItem {
 const RATTI_BASE = 96;
 
 /**
- * Preview of backend `apply_ratti_discount` — billable = weight / base * (base
- * - ratti). Only ever shown, never sent: the server recomputes it from
- * discount_ratti, so a drift here can misinform but cannot mis-bill.
+ * Previews of the backend pricing, mirroring services/pricing.py. Only ever
+ * shown while the operator is still typing — the server recomputes every figure
+ * from the fields that were sent, so a drift here can misinform but cannot
+ * mis-bill. Once the invoice exists the detail page reads the server's own
+ * derived weights instead of these.
+ *
+ * charged  = net * (1 + pct/100) + flat      (wastage marks the metal up)
+ * billable = charged / base * (base - ratti) (the ratti discount gives back)
  */
-function billableGold(weight: string, ratti: string): number {
-  const w = Number(weight) || 0;
-  const r = Number(ratti) || 0;
-  const remaining = RATTI_BASE - r;
+function chargedGold(weight: string, pct: string, grams: string): number {
+  return (Number(weight) || 0) * (1 + (Number(pct) || 0) / 100) + (Number(grams) || 0);
+}
+
+function billableGold(it: DraftItem): number {
+  const charged = chargedGold(it.gold_weight_g, it.sale_wastage_pct, it.sale_wastage_g);
+  const remaining = RATTI_BASE - (Number(it.discount_ratti) || 0);
   if (remaining <= 0) return 0;
-  return (w / RATTI_BASE) * remaining;
+  return (charged / RATTI_BASE) * remaining;
+}
+
+/** Preview of `price_line`: gold + stone + labour, x qty, less the line discount. */
+function lineTotal(it: DraftItem, invoiceRate: string): number {
+  const qty = Math.max(it.quantity || 1, 0);
+  const rate = Number(it.gold_rate_per_g) || Number(invoiceRate) || 0;
+  const purity = Number(it.gold_purity) ? Number(it.gold_purity) / 24 : 1;
+  const gold = billableGold(it) * purity * rate * qty;
+  const stone = (Number(it.stone_weight_ct) || 0) * (Number(it.stone_rate_per_ct) || 0) * qty;
+  const labour = (Number(it.labor_amount) || 0) * qty;
+  return Math.max(gold + stone + labour - (Number(it.line_discount) || 0), 0);
 }
 
 const blankItem = (): DraftItem => ({
@@ -317,6 +345,8 @@ const blankItem = (): DraftItem => ({
   labor_amount: "0",
   line_discount: "0",
   discount_ratti: "0",
+  sale_wastage_pct: "0",
+  sale_wastage_g: "0",
 });
 
 function NewInvoiceModal({
@@ -337,9 +367,34 @@ function NewInvoiceModal({
   const [discount, setDiscount] = useState("0");
   const [discountWeight, setDiscountWeight] = useState("0");
   const [tax, setTax] = useState("0");
+  const [billBookNo, setBillBookNo] = useState("");
+  const [roundOff, setRoundOff] = useState("0");
   const [notes, setNotes] = useState("");
   const [items, setItems] = useState<DraftItem[]>([blankItem()]);
   const [submitting, setSubmitting] = useState(false);
+
+  // Preview of what the server will compute, so the round-off button has a
+  // figure to work from and the operator can see the effect before saving.
+  const subtotalPreview = items.reduce((sum, it) => sum + lineTotal(it, goldRate), 0);
+  const beforeRounding = Math.max(
+    subtotalPreview -
+      (Number(discount) || 0) -
+      (Number(discountWeight) || 0) * (Number(goldRate) || 0) +
+      (Number(tax) || 0),
+    0,
+  );
+  const totalPreview = Math.max(beforeRounding - (Number(roundOff) || 0), 0);
+
+  /**
+   * The paisa (and rupees) the counter waives to reach a figure the customer
+   * can hand over. It is written to `round_off` rather than quietly adjusting
+   * the total, because a round-off folded into the price is an untracked
+   * discount the margin report can never see.
+   */
+  const roundToNearest100 = () => {
+    const remainder = beforeRounding % 100;
+    setRoundOff(remainder.toFixed(2));
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -406,6 +461,8 @@ function NewInvoiceModal({
         discount_amount: discount || "0",
         discount_weight_g: discountWeight || "0",
         tax_amount: tax || "0",
+        bill_book_no: billBookNo || null,
+        round_off: roundOff || "0",
         notes: notes || null,
         items: items.map((it) => ({
           product_id: it.product_id,
@@ -420,6 +477,8 @@ function NewInvoiceModal({
           line_discount: it.line_discount || "0",
           discount_ratti: it.discount_ratti || "0",
           ratti_base: RATTI_BASE,
+          sale_wastage_pct: it.sale_wastage_pct || "0",
+          sale_wastage_g: it.sale_wastage_g || "0",
         })),
       });
       toast("success", "Invoice draft created");
@@ -428,6 +487,8 @@ function NewInvoiceModal({
       setDiscount("0");
       setDiscountWeight("0");
       setTax("0");
+      setBillBookNo("");
+      setRoundOff("0");
       onCreated();
     } catch (err) {
       toast("error", apiError(err, "Could not create invoice"));
@@ -602,19 +663,54 @@ function NewInvoiceModal({
                     hint="Subtracted from line"
                   />
                 </div>
+                <div className="mt-2 grid grid-cols-8 gap-2">
+                  <TextField
+                    label="Wastage %"
+                    type="number"
+                    step="0.001"
+                    min={0}
+                    value={it.sale_wastage_pct}
+                    onChange={(e) => updateItem(i, { sale_wastage_pct: e.target.value })}
+                    hint="Charged to customer"
+                  />
+                  <TextField
+                    label="Wastage (g)"
+                    type="number"
+                    step="0.0001"
+                    min={0}
+                    value={it.sale_wastage_g}
+                    onChange={(e) => updateItem(i, { sale_wastage_g: e.target.value })}
+                    hint="Flat, adds to %"
+                  />
+                </div>
                 {/* The operator has to see what the customer is actually being
-                    charged for before saving — the ratti figure alone doesn't
-                    read as a weight. */}
-                {Number(it.discount_ratti) > 0 && (
+                    charged for before saving — a percentage and a ratti figure
+                    do not read as a weight, and the weight is what the money is
+                    calculated on. */}
+                {(Number(it.sale_wastage_pct) > 0 ||
+                  Number(it.sale_wastage_g) > 0 ||
+                  Number(it.discount_ratti) > 0) && (
                   <div className="mt-2 text-xs text-amber-700">
-                    Ratti discount {it.discount_ratti}/{RATTI_BASE} — billable gold{" "}
-                    <span className="line-through text-slate-400">
+                    Net{" "}
+                    <span className="text-slate-500">
                       {(Number(it.gold_weight_g) || 0).toFixed(4)} g
-                    </span>{" "}
-                    →{" "}
-                    <span className="font-semibold">
-                      {billableGold(it.gold_weight_g, it.discount_ratti).toFixed(4)} g
                     </span>
+                    {(Number(it.sale_wastage_pct) > 0 || Number(it.sale_wastage_g) > 0) && (
+                      <>
+                        {" "}
+                        → with wastage{" "}
+                        {Number(it.sale_wastage_pct) > 0 ? `${it.sale_wastage_pct}%` : ""}
+                        {Number(it.sale_wastage_g) > 0 ? ` +${it.sale_wastage_g}g` : ""}{" "}
+                        <span className="text-slate-500">
+                          {chargedGold(it.gold_weight_g, it.sale_wastage_pct, it.sale_wastage_g).toFixed(4)} g
+                        </span>
+                      </>
+                    )}
+                    {Number(it.discount_ratti) > 0 && (
+                      <> → less {it.discount_ratti}/{RATTI_BASE} ratti</>
+                    )}{" "}
+                    → billed on{" "}
+                    <span className="font-semibold">{billableGold(it).toFixed(4)} g</span>
                   </div>
                 )}
               </div>
@@ -648,6 +744,47 @@ function NewInvoiceModal({
             value={tax}
             onChange={(e) => setTax(e.target.value)}
           />
+        </div>
+
+        <div className="grid grid-cols-3 items-end gap-3">
+          <TextField
+            label="Bill book #"
+            value={billBookNo}
+            onChange={(e) => setBillBookNo(e.target.value)}
+            placeholder="e.g. 441"
+            hint="The paper bill this matches"
+          />
+          <TextField
+            label="Round off"
+            type="number"
+            step="0.01"
+            value={roundOff}
+            onChange={(e) => setRoundOff(e.target.value)}
+            hint="Subtracted; negative rounds up"
+          />
+          <button type="button" className="btn-ghost mb-1" onClick={roundToNearest100}>
+            Round to nearest 100
+          </button>
+        </div>
+
+        <div className="rounded-lg bg-slate-50 px-4 py-3 text-sm">
+          <div className="flex justify-between text-slate-600">
+            <span>Before rounding</span>
+            <span>{fmtMoney(beforeRounding, currency)}</span>
+          </div>
+          {Number(roundOff) !== 0 && (
+            <div className="flex justify-between text-amber-700">
+              <span>Round off</span>
+              <span>-{fmtMoney(roundOff, currency)}</span>
+            </div>
+          )}
+          <div className="mt-1 flex justify-between border-t border-slate-200 pt-1 font-semibold text-slate-900">
+            <span>Total (preview)</span>
+            <span>{fmtMoney(totalPreview, currency)}</span>
+          </div>
+          <p className="mt-1 text-xs text-slate-500">
+            Recalculated by the server on save — this is a guide, not the bill.
+          </p>
         </div>
 
         <TextArea label="Notes" value={notes} onChange={(e) => setNotes(e.target.value)} />

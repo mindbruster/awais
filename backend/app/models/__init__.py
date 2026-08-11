@@ -21,7 +21,15 @@ from app.models.invoice import Invoice, InvoiceItem, InvoiceStatus, SaleType
 from app.models.item import Item
 from app.models.location import City, Country
 from app.models.manufacturing import JobStage, ManufacturingJob
+from app.models.payment import Payment, PaymentDirection, PaymentMethod
 from app.models.product import Product, ProductStatus
+from app.models.purchase import (
+    GoldKind,
+    OldGoldPurchase,
+    StonePurchase,
+    StonePurchaseItem,
+    Supplier,
+)
 from app.models.product_stone import ProductStone
 from app.models.role import Role
 from app.models.stock_movement import MovementType, StockMovement
@@ -54,6 +62,15 @@ __all__ = [
     "LegStatus",
     "LabourBasis",
     "LegStone",
+    "WastageBasis",
+    "Payment",
+    "PaymentMethod",
+    "PaymentDirection",
+    "Supplier",
+    "GoldKind",
+    "OldGoldPurchase",
+    "StonePurchase",
+    "StonePurchaseItem",
     "Product",
     "ProductStatus",
     "Customer",

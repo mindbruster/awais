@@ -58,6 +58,14 @@ class Invoice(Base, TimestampMixin):
     tax_amount: Mapped[float] = mapped_column(Numeric(14, 2), default=0, nullable=False)
     total: Mapped[float] = mapped_column(Numeric(14, 2), default=0, nullable=False)
 
+    # The shop's own paper bill book still runs alongside the system for a
+    # while after go-live, and the two have to be reconcilable by hand.
+    bill_book_no: Mapped[str | None] = mapped_column(String(50), index=True)
+    # The difference knocked off to reach a round figure, stored explicitly.
+    # A round-off that silently adjusts the total is an untracked discount, and
+    # the margin report would never see it.
+    round_off: Mapped[float] = mapped_column(Numeric(14, 2), default=0, nullable=False)
+
     issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
@@ -107,4 +115,13 @@ class InvoiceItem(Base, TimestampMixin):
     # `line_discount` and has to be visible as its own giveaway in reporting.
     discount_ratti: Mapped[float] = mapped_column(Numeric(8, 3), default=0, nullable=False)
     ratti_base: Mapped[int] = mapped_column(Integer, default=96, nullable=False)
+
+    # Wastage charged to the customer: the shop bills for more gold than the
+    # piece contains. This is revenue and one of the three margin levers in the
+    # trade, alongside the rate spread and making charges — so it is stored as
+    # its own figure rather than folded into the weight, or the profit report
+    # cannot show where the money actually came from. Quoted either way round;
+    # the counter picks whichever the customer is arguing in.
+    sale_wastage_pct: Mapped[float] = mapped_column(Numeric(6, 3), default=0, nullable=False)
+    sale_wastage_g: Mapped[float] = mapped_column(Numeric(14, 4), default=0, nullable=False)
     line_total: Mapped[float] = mapped_column(Numeric(14, 2), default=0, nullable=False)

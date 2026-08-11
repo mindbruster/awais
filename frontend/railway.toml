@@ -1,0 +1,35 @@
+# Railway service config for the SPA (nginx serving a static build).
+#
+# Service must be created with Root Directory = /frontend.
+#
+# IMPORTANT — VITE_API_BASE_URL is a BUILD-time value, not a runtime one. Vite
+# inlines it into the JavaScript bundle, so there is nothing left to read an
+# environment variable at runtime. Railway passes service variables to the
+# Docker build as build arguments, which is why the Dockerfile declares
+# `ARG VITE_API_BASE_URL` — set the variable on this service:
+#
+#     VITE_API_BASE_URL = https://api.<your-domain>/api/v1
+#
+# and then REDEPLOY (not restart) after any change to it. A restart re-runs the
+# old bundle with the old URL baked in and looks like the change did nothing.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+watchPatterns = ["frontend/**", "railway.json"]
+
+[deploy]
+# The nginx entrypoint is named explicitly because Railway's startCommand
+# replaces the image CMD: without it, the envsubst pass that turns
+# `listen ${PORT}` into a real port number never runs and nginx starts on the
+# wrong port, which Railway reports only as a failed healthcheck.
+startCommand = "/docker-entrypoint.sh nginx -g 'daemon off;'"
+numReplicas = 1
+
+# A static route, not "/", so the healthcheck cannot be answered by the SPA
+# fallback and cannot be confused with a client-side route.
+healthcheckPath = "/healthz"
+healthcheckTimeout = 60
+
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

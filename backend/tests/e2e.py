@@ -1456,6 +1456,12 @@ def main() -> int:
     )
     check("manual entry without password → 401", r.status_code == 401, f"got {r.status_code}")
 
+    # Measured as a delta, not an absolute: sales now settle through the ledger
+    # too, so the shop's cash is not only what this section put there.
+    cash_before = Decimal(
+        str(client.get("/ledger/position", headers=auth).json()["cash_in_hand"])
+    )
+
     # Capital injection: 500,000 cash in, against capital.
     r = client.post(
         "/ledger/entries",
@@ -1534,9 +1540,10 @@ def main() -> int:
     r = client.get("/ledger/position", headers=auth)
     pos = r.json()
     check(
-        "cash in hand = capital less the bullion paid for",
-        Decimal(str(pos["cash_in_hand"])) == (Decimal("500000") - gold_value),
-        f"got {pos['cash_in_hand']}, expected {Decimal('500000') - gold_value}",
+        "cash moved by the capital put in less the bullion paid for",
+        Decimal(str(pos["cash_in_hand"])) - cash_before == (Decimal("500000") - gold_value),
+        f"moved {Decimal(str(pos['cash_in_hand'])) - cash_before}, "
+        f"expected {Decimal('500000') - gold_value}",
     )
     check(
         "gold in hand carried in fine grams",
@@ -2120,6 +2127,240 @@ def main() -> int:
     )
     r = client.get("/insights/wastage-anomalies", headers=staff_auth, params={"days": 90})
     check("staff cannot read the wastage analysis → 403", r.status_code == 403, f"got {r.status_code}")
+
+    # ----- THE MONEY PATH: stock a piece, sell it, settle it, buy metal back -----
+    section("Stock, settle, purchase")
+
+    def cash_in_hand() -> Decimal:
+        return Decimal(str(client.get("/ledger/position", headers=auth).json()["cash_in_hand"]))
+
+    def gold_in_hand() -> Decimal:
+        return Decimal(str(client.get("/ledger/position", headers=auth).json()["gold_in_hand_g"]))
+
+    # --- stock the design that came off the workshop floor ---
+    r = client.get(f"/stocking/designs/{set_design['id']}/preview", headers=auth)
+    check("stock preview → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:220]}")
+    preview = r.json()
+    check(
+        "preview rolls up labour from every leg",
+        Decimal(str(preview["totals"]["labour_total"])) == Decimal("1750") + Decimal("6000"),
+        f"got {preview['totals'].get('labour_total')}, expected 7750 (setting 1750 + lacker 6000)",
+    )
+
+    r = client.post(
+        f"/stocking/designs/{set_design['id']}/stock",
+        headers=pwd_h,
+        json={
+            "name": "Setting Taka",
+            "category": "taka",
+            "gross_weight_g": "48.2",
+            "gold_weight_g": "48.2",
+            "gold_purity": 22,
+            "other_charges": "250",
+            "finished_inventory_location": "showroom",
+        },
+    )
+    check("stock the design → 201", r.status_code == 201, f"got {r.status_code}: {r.text[:250]}")
+    stocked = r.json()
+    stocked_product_id = stocked.get("product_id") or stocked.get("product", {}).get("id")
+    check("stocking produced a product", stocked_product_id is not None, str(stocked)[:200])
+    prod = client.get(f"/products/{stocked_product_id}", headers=auth).json()
+    check(
+        "making cost = every leg's labour plus other charges",
+        Decimal(str(prod["total_cost"])) == Decimal("8000"),
+        f"got {prod['total_cost']}, expected 8000 (7750 labour + 250 other)",
+    )
+    check(
+        "the piece knows which design it came off",
+        prod.get("design_id") == set_design["id"],
+        f"got {prod.get('design_id')}",
+    )
+    r = client.get(f"/designs/{set_design['id']}", headers=auth)
+    check("design is now stocked", r.json()["status"] == "stocked", r.json()["status"])
+    r = client.post(
+        f"/stocking/designs/{set_design['id']}/stock",
+        headers=pwd_h,
+        json={"name": "Stocked twice", "gross_weight_g": "48.2", "gold_weight_g": "48.2", "gold_purity": 22},
+    )
+    check("stocking the same design twice refused → 409", r.status_code == 409, f"got {r.status_code}: {r.text[:160]}")
+    check("books balance after stocking", client.get("/ledger/trial-balance", headers=auth).json()["balanced"] is True)
+
+    # --- sell it, with wastage marked up and a ratti discount given back ---
+    sale = client.post(
+        "/invoices",
+        headers=auth,
+        json={
+            "customer_id": cust["id"],
+            "sale_type": "normal",
+            "currency": "PKR",
+            "bill_book_no": "BB-4471",
+            "items": [{
+                "product_id": stocked_product_id,
+                "description": "Setting Taka",
+                "quantity": 1,
+                "gold_weight_g": "10",
+                "gold_purity": 22,
+                "sale_wastage_pct": "10",
+                "discount_ratti": "6",
+            }],
+        },
+    )
+    check("create the sale → 201", sale.status_code == 201, f"got {sale.status_code}: {sale.text[:250]}")
+    sale = sale.json()
+    # 10g +10% wastage = 11g, then 6 ratti off = 11 * 90/96 = 10.3125g billable.
+    check(
+        "wastage marks up and ratti discounts down, in that order",
+        Decimal(str(sale["items"][0]["gold_amount"]))
+        == (Decimal("10.3125") * Decimal("22") / Decimal("24") * day_rate).quantize(Decimal("0.01")),
+        f"got {sale['items'][0]['gold_amount']} — expected pricing on 10.3125 g",
+    )
+    check("bill book number kept for reconciliation", sale["bill_book_no"] == "BB-4471")
+
+    r = client.post(f"/invoices/{sale['id']}/issue", headers=pwd_h)
+    check("issue the sale → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:250]}")
+    issued = r.json()
+    total_due = Decimal(str(issued["total"]))
+    check(
+        "issuing puts the whole bill on the customer's account",
+        Decimal(str(issued.get("balance_due", 0))) == total_due,
+        f"balance_due {issued.get('balance_due')} vs total {total_due}",
+    )
+
+    # --- settle: part cash, the rest in old gold across the counter ---
+    cash_before_pay = cash_in_hand()
+    part = (total_due / 2).quantize(Decimal("0.01"))
+    r = client.post(
+        "/payments",
+        headers=auth,
+        json={
+            "customer_id": cust["id"], "invoice_id": sale["id"],
+            "method": "cash", "amount": str(part),
+        },
+    )
+    check("take a part cash payment → 201", r.status_code == 201, f"got {r.status_code}: {r.text[:250]}")
+    check(
+        "cash in hand rises by exactly what was taken",
+        cash_in_hand() - cash_before_pay == part,
+        f"moved {cash_in_hand() - cash_before_pay}, expected {part}",
+    )
+    inv_now = client.get(f"/invoices/{sale['id']}", headers=auth).json()
+    check(
+        "balance due falls by the payment",
+        Decimal(str(inv_now["balance_due"])) == (total_due - part),
+        f"got {inv_now['balance_due']}, expected {total_due - part}",
+    )
+
+    gold_before_ex = gold_in_hand()
+    r = client.post(
+        "/payments",
+        headers=auth,
+        json={
+            "customer_id": cust["id"], "invoice_id": sale["id"],
+            "method": "gold_exchange",
+            "gold_weight_g": "5", "gold_purity": 22, "gold_rate_per_g": str(day_rate),
+        },
+    )
+    check("take old gold in exchange → 201", r.status_code == 201, f"got {r.status_code}: {r.text[:250]}")
+    exchange = r.json()
+    # 5g of 22k is 4.5833 fine grams — the metal must not be banked as pure.
+    check(
+        "exchanged gold enters stock in fine grams",
+        abs((gold_in_hand() - gold_before_ex) - Decimal("4.5833")) <= Decimal("0.0002"),
+        f"moved {gold_in_hand() - gold_before_ex}, expected 4.5833",
+    )
+    check(
+        "the exchange is valued at the agreed rate, server-side",
+        Decimal(str(exchange["amount"])) == (Decimal("4.5833") * day_rate).quantize(Decimal("0.01")),
+        f"got {exchange['amount']}",
+    )
+    check("books balance after settlement", client.get("/ledger/trial-balance", headers=auth).json()["balanced"] is True)
+
+    # A reversal must be a contra entry, never a deleted row.
+    r = client.post(f"/payments/{exchange['id']}/reverse", headers=pwd_h, json={"reason": "keyed twice"})
+    check("reverse a payment → 200", r.status_code in (200, 201), f"got {r.status_code}: {r.text[:220]}")
+    check(
+        "the reversed payment row still exists",
+        client.get(f"/payments?invoice_id={sale['id']}", headers=auth).status_code == 200,
+    )
+    check(
+        "reversing puts the metal back out of stock",
+        abs((gold_in_hand() - gold_before_ex)) <= Decimal("0.0002"),
+        f"gold still {gold_in_hand() - gold_before_ex} above pre-exchange",
+    )
+    check("books balance after the reversal", client.get("/ledger/trial-balance", headers=auth).json()["balanced"] is True)
+
+    # --- buy metal back over the counter ---
+    cash_before_buy = cash_in_hand()
+    gold_before_buy = gold_in_hand()
+    buy_rate = (day_rate * Decimal("0.95") * Decimal("22") / Decimal("24")).quantize(Decimal("0.0001"))
+    r = client.post(
+        "/purchasing/old-gold",
+        headers=auth,
+        json={
+            "customer_id": cust["id"], "kind": "used",
+            "weight_g": "20", "purity": 22, "rate_per_g": str(buy_rate),
+        },
+    )
+    check("buy old gold → 201", r.status_code == 201, f"got {r.status_code}: {r.text[:250]}")
+    buy = r.json()
+    check(
+        "old gold enters stock in fine grams",
+        abs((gold_in_hand() - gold_before_buy) - Decimal("18.3333")) <= Decimal("0.0002"),
+        f"moved {gold_in_hand() - gold_before_buy}, expected 18.3333",
+    )
+    check(
+        "cash goes out at the shop's buying rate, not the market rate",
+        cash_before_buy - cash_in_hand() == Decimal(str(buy["amount"]))
+        and Decimal(str(buy["amount"])) < (Decimal("18.3333") * day_rate),
+        f"paid {buy['amount']}; the spread below market is the margin",
+    )
+    check("books balance after buying metal", client.get("/ledger/trial-balance", headers=auth).json()["balanced"] is True)
+
+    # --- buy stones from a party, then see them in the stock report ---
+    supplier = client.post(
+        "/purchasing/suppliers", headers=auth, json={"name": "Hanif Jeweller", "phone": "03001112222"}
+    )
+    check("create a supplier → 201", supplier.status_code == 201, f"got {supplier.status_code}: {supplier.text[:200]}")
+    supplier = supplier.json()
+    diamond_id = next(
+        s_["id"] for s_ in client.get("/stones", headers=auth).json() if s_["name"] == "12 PTR"
+    )
+    r = client.post(
+        "/purchasing/stone-purchases",
+        headers=auth,
+        json={
+            "supplier_id": supplier["id"],
+            "extra_cost_pct": "2",
+            "items": [{
+                "stone_id": diamond_id, "quantity": 100, "weight_ct": "25",
+                "rate_per_ct": "4000", "quality": "Commercial", "cut": "Round", "clarity": "VS1",
+            }],
+        },
+    )
+    check("buy a stone lot → 201", r.status_code == 201, f"got {r.status_code}: {r.text[:250]}")
+    lot = r.json()
+    check(
+        "the supplier's loading is applied on top of the lines",
+        Decimal(str(lot["total"])) == Decimal("102000.00"),
+        f"got {lot['total']}, expected 100000 + 2%",
+    )
+    r = client.get("/purchasing/stone-stock", headers=auth)
+    check("stone stock report → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:220]}")
+    rows_ = r.json().get("rows", [])
+    d12 = next((x for x in rows_ if x.get("stone_id") == diamond_id), None)
+    check(
+        "the lot shows as purchased",
+        d12 and Decimal(str(d12["purchased_weight_ct"])) == Decimal("25"),
+        str(d12),
+    )
+    check(
+        "available = purchased less what setting consumed",
+        d12
+        and Decimal(str(d12["available_weight_ct"]))
+        == Decimal(str(d12["purchased_weight_ct"])) - Decimal(str(d12["used_weight_ct"])),
+        str(d12),
+    )
+    check("books balance after buying stones", client.get("/ledger/trial-balance", headers=auth).json()["balanced"] is True)
 
     # ----- LOGIN RATE LIMIT (slowapi: 10/minute) -----
     section("Login rate limit")

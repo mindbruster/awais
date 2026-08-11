@@ -10,6 +10,31 @@ def d(v) -> Decimal:
     return Decimal(str(v or 0))
 
 
+def apply_sale_wastage(
+    net_weight_g: Decimal,
+    wastage_pct: Decimal = Decimal("0"),
+    wastage_g: Decimal = Decimal("0"),
+) -> Decimal:
+    """
+    Add the wastage the customer is charged for on top of the metal delivered.
+
+        billable = net * (1 + pct/100) + flat
+
+    This is revenue, not loss: the shop bills for more gold than the piece
+    contains. It is the inverse of the ratti discount and both can appear on the
+    same line — the counter marks up with wastage and gives back with ratti, and
+    each has to stay visible separately or the margin report cannot say which
+    lever moved.
+
+    Percentage and flat grams are additive rather than exclusive so a quote like
+    "10% plus half a gram" survives; either alone is the common case.
+    """
+    base = d(net_weight_g)
+    return (base * (Decimal("1") + d(wastage_pct) / Decimal("100")) + d(wastage_g)).quantize(
+        Decimal("0.0001")
+    )
+
+
 def apply_ratti_discount(
     gold_weight_g: Decimal,
     discount_ratti: Decimal,
@@ -51,13 +76,18 @@ def price_line(
     line_discount: Decimal = Decimal("0"),
     discount_ratti: Decimal = Decimal("0"),
     ratti_base: int = DEFAULT_RATTI_BASE,
+    sale_wastage_pct: Decimal = Decimal("0"),
+    sale_wastage_g: Decimal = Decimal("0"),
     quantity: int = 1,
 ) -> tuple[Decimal, Decimal, Decimal]:
     """
     Returns (gold_amount, stone_amount, line_total).
 
-    Gold is reduced by any ratti discount first, then purity-adjusted:
-    billable = weight / base * (base - ratti), effective = billable * purity/24.
+    Gold is marked up by any sale wastage, reduced by any ratti discount, then
+    purity-adjusted:
+        charged  = net * (1 + wastage_pct/100) + wastage_g
+        billable = charged / base * (base - ratti)
+        effective = billable * purity/24
     The two are separate levers — the ratti discount is what the shop gives
     away, the purity factor is what the metal actually is — and applying the
     discount before the purity factor keeps "6 ratti off" meaning the same
@@ -75,7 +105,13 @@ def price_line(
     the counter knocked off this line, not a per-piece rate.
     """
     qty = Decimal(str(max(int(quantity or 1), 0)))
-    billable_g = apply_ratti_discount(gold_weight_g, discount_ratti, ratti_base)
+    # Mark up first, discount second. Wastage is what the shop adds to the metal
+    # delivered; the ratti discount is what it then gives back off the asking
+    # figure. Doing it the other way round would apply the wastage percentage to
+    # an already-discounted weight and quietly shrink the discount the customer
+    # was promised.
+    charged_g = apply_sale_wastage(gold_weight_g, sale_wastage_pct, sale_wastage_g)
+    billable_g = apply_ratti_discount(charged_g, discount_ratti, ratti_base)
     purity_factor = d(gold_purity) / Decimal("24") if gold_purity else Decimal("1")
     gold_amount = (billable_g * purity_factor * d(gold_rate_per_g) * qty).quantize(Decimal("0.01"))
     stone_amount = (d(stone_weight_ct) * d(stone_rate_per_ct) * qty).quantize(Decimal("0.01"))

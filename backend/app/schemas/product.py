@@ -1,3 +1,4 @@
+from datetime import datetime
 from decimal import Decimal
 
 from pydantic import BaseModel, Field
@@ -44,3 +45,10 @@ class ProductRead(TimestampedRead, ProductBase):
     # Read-only: locked by the costing service on the first pass, never set by
     # the caller. Exposed so the UI can show what rate a piece was costed at.
     gold_rate_at_cost: Decimal | None = None
+    # Set by the stock form. Lets a sale be traced back through every department
+    # that touched the piece, which is the question the shop asks when a
+    # customer returns one.
+    design_id: int | None = None
+    gross_weight_g: Decimal | None = None
+    other_charges: Decimal = Decimal("0")
+    stocked_at: datetime | None = None
