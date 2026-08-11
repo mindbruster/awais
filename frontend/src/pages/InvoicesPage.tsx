@@ -285,6 +285,24 @@ interface DraftItem {
   stone_rate_per_ct: string;
   labor_amount: string;
   line_discount: string;
+  discount_ratti: string;
+}
+
+// The customary base the counter quotes against. Stored per line (the column
+// exists) so an unusual base is possible, but nothing in the UI varies it yet.
+const RATTI_BASE = 96;
+
+/**
+ * Preview of backend `apply_ratti_discount` — billable = weight / base * (base
+ * - ratti). Only ever shown, never sent: the server recomputes it from
+ * discount_ratti, so a drift here can misinform but cannot mis-bill.
+ */
+function billableGold(weight: string, ratti: string): number {
+  const w = Number(weight) || 0;
+  const r = Number(ratti) || 0;
+  const remaining = RATTI_BASE - r;
+  if (remaining <= 0) return 0;
+  return (w / RATTI_BASE) * remaining;
 }
 
 const blankItem = (): DraftItem => ({
@@ -298,6 +316,7 @@ const blankItem = (): DraftItem => ({
   stone_rate_per_ct: "0",
   labor_amount: "0",
   line_discount: "0",
+  discount_ratti: "0",
 });
 
 function NewInvoiceModal({
@@ -399,6 +418,8 @@ function NewInvoiceModal({
           stone_rate_per_ct: it.stone_rate_per_ct || "0",
           labor_amount: it.labor_amount || "0",
           line_discount: it.line_discount || "0",
+          discount_ratti: it.discount_ratti || "0",
+          ratti_base: RATTI_BASE,
         })),
       });
       toast("success", "Invoice draft created");
@@ -511,7 +532,7 @@ function NewInvoiceModal({
                     </button>
                   </div>
                 </div>
-                <div className="mt-2 grid grid-cols-7 gap-2">
+                <div className="mt-2 grid grid-cols-8 gap-2">
                   <TextField
                     label="Gold (g)"
                     type="number"
@@ -519,6 +540,16 @@ function NewInvoiceModal({
                     min={0}
                     value={it.gold_weight_g}
                     onChange={(e) => updateItem(i, { gold_weight_g: e.target.value })}
+                  />
+                  <TextField
+                    label="Disc (ratti)"
+                    type="number"
+                    step="0.001"
+                    min={0}
+                    max={RATTI_BASE}
+                    value={it.discount_ratti}
+                    onChange={(e) => updateItem(i, { discount_ratti: e.target.value })}
+                    hint={`of ${RATTI_BASE}`}
                   />
                   <TextField
                     label="Purity"
@@ -571,6 +602,21 @@ function NewInvoiceModal({
                     hint="Subtracted from line"
                   />
                 </div>
+                {/* The operator has to see what the customer is actually being
+                    charged for before saving — the ratti figure alone doesn't
+                    read as a weight. */}
+                {Number(it.discount_ratti) > 0 && (
+                  <div className="mt-2 text-xs text-amber-700">
+                    Ratti discount {it.discount_ratti}/{RATTI_BASE} — billable gold{" "}
+                    <span className="line-through text-slate-400">
+                      {(Number(it.gold_weight_g) || 0).toFixed(4)} g
+                    </span>{" "}
+                    →{" "}
+                    <span className="font-semibold">
+                      {billableGold(it.gold_weight_g, it.discount_ratti).toFixed(4)} g
+                    </span>
+                  </div>
+                )}
               </div>
             ))}
           </div>

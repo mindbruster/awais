@@ -1,0 +1,579 @@
+"""
+The model layer. Provider-agnostic, flag-gated, and never load-bearing.
+
+Mirrors `app.services.whatsapp`: a setting picks the provider, and an
+unconfigured provider produces a 503 carrying setup instructions rather than an
+obscure failure deeper in.
+
+The split of responsibility is the important part and it is deliberate:
+
+* The **statistics find the outlier.** Every figure the insights endpoints
+  return is computed in SQL from the books. The model is handed those figures
+  and asked only to write the sentence that explains them and to name the jobs
+  involved. It is never asked to compute, compare or rank, because a model that
+  is allowed to produce a number will eventually produce a wrong one and the
+  shop has no way to tell.
+* `narrate` **cannot raise.** A missing key, an expired card, a timeout or a
+  provider outage returns `None` and the endpoint ships its numbers with the
+  prose omitted. A shop running this during a power cut is worse off with an
+  ERP that stops than with one that never had narration.
+
+`/ask` is the one place a model is on the critical path, because the request
+*is* "have the model write a query". That endpoint 503s when unconfigured, and
+everything the model produces there is validated before it reaches Postgres and
+returned alongside the answer so it can be checked.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import re
+from dataclasses import dataclass
+from datetime import date, datetime
+from decimal import Decimal
+from typing import Any
+
+from fastapi import HTTPException, status
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.ai_config import AISettings, get_ai_settings
+
+log = logging.getLogger(__name__)
+
+# A generated query is a report, not a job. These bound how much damage a
+# runaway one can do to a shop that is also trying to bill a customer.
+QUERY_TIMEOUT_MS = 5_000
+MAX_ROWS = 200
+
+_NARRATION_TIMEOUT_S = 30.0
+# How many result rows the narrator is shown. Kept well under the row cap so a
+# large result doesn't blow the prompt; the model is told when it is seeing a
+# slice so it can say so rather than summarising what it wasn't given.
+_NARRATION_ROWS = 50
+_SQL_TIMEOUT_S = 60.0
+
+
+# --------------------------------------------------------------------------
+# Provider plumbing
+# --------------------------------------------------------------------------
+def ai_settings() -> AISettings:
+    return get_ai_settings()
+
+
+def ai_available() -> bool:
+    return ai_settings().configured
+
+
+def require_provider() -> AISettings:
+    """503 with instructions, in the shape whatsapp.send_text uses."""
+    cfg = ai_settings()
+    if not cfg.configured:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=cfg.unconfigured_reason,
+        )
+    return cfg
+
+
+def _client(cfg: AISettings, timeout: float):
+    """
+    Built per call, and the SDK is imported here rather than at module scope.
+
+    The dependency is optional: with AI_PROVIDER unset the app must import and
+    serve every deterministic endpoint on a machine that has never seen the
+    anthropic package.
+    """
+    try:
+        from anthropic import AsyncAnthropic
+    except ImportError as exc:  # pragma: no cover - depends on the deployment
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "AI_PROVIDER is set to 'anthropic' but the SDK is not installed. "
+                "Run `pip install anthropic` in the backend virtualenv."
+            ),
+        ) from exc
+
+    if cfg.provider != "anthropic":  # pragma: no cover - guarded by require_provider
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Unknown AI_PROVIDER '{cfg.provider}'",
+        )
+    return AsyncAnthropic(api_key=cfg.anthropic_api_key).with_options(timeout=timeout)
+
+
+def _text_of(message) -> str:
+    return "".join(b.text for b in message.content if b.type == "text").strip()
+
+
+# --------------------------------------------------------------------------
+# Narration — decoration, never a dependency
+# --------------------------------------------------------------------------
+NARRATION_RULES = (
+    "You explain figures that have already been computed from a jewellery "
+    "workshop's books. Absolute rules:\n"
+    "- Never state a number that is not in the data you were given. Do not "
+    "add, average, project or estimate. If a figure is not there, describe it "
+    "in words instead.\n"
+    "- One sentence per subject, at most about 30 words. Plain shop English.\n"
+    "- Say what the figures show and cite the identifiers given (job/leg "
+    "numbers, invoice numbers). Do not recommend disciplinary action or "
+    "accuse anyone of theft; a shortfall has many innocent causes.\n"
+)
+
+
+async def narrate_map(
+    *,
+    task: str,
+    payload: dict[str, Any],
+    keys: list[str],
+) -> dict[str, str]:
+    """
+    One sentence per key, or `{}` if anything at all goes wrong.
+
+    Batched into a single request: the flagged rows on a report are explained
+    together, so a shop with eight flagged workers pays for one call rather
+    than eight.
+    """
+    if not keys:
+        return {}
+    cfg = ai_settings()
+    if not cfg.configured:
+        return {}
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "narratives": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string", "enum": keys},
+                        "sentence": {"type": "string"},
+                    },
+                    "required": ["key", "sentence"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["narratives"],
+        "additionalProperties": False,
+    }
+
+    try:
+        client = _client(cfg, _NARRATION_TIMEOUT_S)
+        message = await client.messages.create(
+            model=cfg.model,
+            max_tokens=4000,
+            system=NARRATION_RULES + "\n" + task,
+            output_config={"effort": "low", "format": {"type": "json_schema", "schema": schema}},
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "Write one sentence for each of these keys: "
+                        f"{json.dumps(keys)}\n\nComputed figures:\n"
+                        f"{json.dumps(payload, default=str, indent=1)}"
+                    ),
+                }
+            ],
+        )
+        if message.stop_reason == "refusal":
+            log.warning("ai.narrate refused by the model; shipping figures only")
+            return {}
+        data = json.loads(_text_of(message))
+        return {
+            str(row["key"]): str(row["sentence"]).strip()
+            for row in data.get("narratives", [])
+            if row.get("key") in keys and row.get("sentence")
+        }
+    except Exception as exc:  # narration is decoration — never fail the report
+        log.warning("ai.narrate unavailable (%s: %s)", type(exc).__name__, exc)
+        return {}
+
+
+# --------------------------------------------------------------------------
+# Natural language over the books
+# --------------------------------------------------------------------------
+# A curated, read-only view of the schema. Handing over the real DDL would give
+# the model users.hashed_password and every audit row; this is the subset a
+# question about the business can legitimately need, and the guard below
+# enforces that the query stays inside it.
+ALLOWED_TABLES = {
+    "designs",
+    "job_legs",
+    "leg_stones",
+    "departments",
+    "items",
+    "vendors",
+    "customers",
+    "products",
+    "invoices",
+    "invoice_items",
+    "journal_entries",
+    "journal_lines",
+    "accounts",
+    "stones",
+}
+
+SCHEMA_DESCRIPTION = """\
+Postgres. Money is numeric in PKR unless a currency column says otherwise;
+weights are grams, stone weights are carats. Only these tables and columns
+exist for you:
+
+designs(id, design_no, tag_no, item_id, customer_id, current_department_id,
+  status['in_production','stocked','sold','cancelled'], product_id, notes,
+  created_at, updated_at)
+  -- one physical piece, identified from the moment work starts on it.
+
+job_legs(id, design_id, sequence, department_id, worker_id,
+  status['issued','received','cancelled'], issued_at, received_at,
+  gold_issued_g, gold_issued_purity, gold_received_g, piece_count,
+  stones_issued_ct, stones_used_ct, stones_returned_ct,
+  wastage_basis['percent_of_issued','per_100_pieces'], wastage_allowed_pct,
+  wastage_per_100_pcs_g, wastage_allowed_g, wastage_actual_g,
+  wastage_excess_g, labour_basis['per_gram','per_piece','flat'], labour_rate,
+  labour_amount, created_at)
+  -- one visit to one department. wastage_actual_g = issued - received and is
+  -- SIGNED (negative means the piece came back heavier, which is normal).
+  -- wastage_excess_g is only the part beyond what the worker was allowed.
+  -- A leg is finished when status = 'received'.
+
+leg_stones(id, leg_id, stone_id, quantity_issued, weight_issued_ct,
+  quantity_returned, weight_returned_ct, rate_per_ct)
+stones(id, name, shape, quality, colour, size, rate_per_ct)
+departments(id, name, code, sequence, consumes_stones, default_wastage_pct,
+  default_rate_per_piece)
+items(id, name, abbreviation)
+vendors(id, name, phone, type, default_wastage_pct, is_active)
+  -- workers/karigars as well as suppliers.
+customers(id, name, phone, city_id, opening_balance, is_active)
+
+products(id, sku, name, item_id, gross_weight_g, net_weight_g, purity,
+  material_cost, total_cost, selling_price)
+  -- total_cost is making (labour) cost, material_cost is capitalised gold and
+  -- stones. COGS for a sold line = (total_cost + material_cost) * quantity.
+
+invoices(id, invoice_no, customer_id, currency, sale_type['normal',
+  'on_approval'], status['draft','issued','paid','returned','void'],
+  gold_rate_per_g, subtotal, discount_amount, discount_weight_g, tax_amount,
+  total, issued_at, paid_at, created_at)
+  -- only 'issued' and 'paid' are real sales.
+invoice_items(id, invoice_id, product_id, description, quantity,
+  gold_weight_g, gold_purity, gold_rate_per_g, gold_amount, stone_weight_ct,
+  stone_rate_per_ct, stone_amount, labor_amount, line_discount,
+  discount_ratti, ratti_base, line_total)
+  -- discount_ratti is a discount quoted in ratti against ratti_base (usually
+  -- 96): the customer is billed for gold_weight_g/base*(base-ratti).
+
+journal_entries(id, entry_no, entry_date, memo, source_type, source_id,
+  reverses_entry_id, posted_at)
+journal_lines(id, entry_id, account_id, commodity['PKR','USD','GOLD'],
+  quantity, rate, value_pkr, native_weight_g, native_purity,
+  party_type['customer','worker','supplier'], party_id, memo)
+  -- double entry: quantity is signed, positive = debit. GOLD lines carry FINE
+  -- grams in quantity; native_weight_g is as weighed.
+accounts(id, code, name, type['asset','liability','equity','income',
+  'expense'], parent_id, is_active)
+"""
+
+SQL_RULES = f"""\
+You turn a jewellery shop owner's question into exactly ONE read-only Postgres
+SELECT statement over the schema below.
+
+Hard requirements:
+- Output a single SELECT (a leading read-only WITH is allowed). No semicolons,
+  no comments, no second statement.
+- Never write: INSERT, UPDATE, DELETE, MERGE, DROP, ALTER, CREATE, TRUNCATE,
+  GRANT, COPY, SET, or a writing CTE.
+- Only the tables listed below exist. Do not reference any other table.
+- Always alias computed columns with a readable name.
+- Add an ORDER BY when "top", "worst", "most" or "least" is implied, and a
+  LIMIT when the question implies a handful of rows.
+- Only count invoices with status IN ('issued','paid') as sales, and only
+  job_legs with status = 'received' as finished work, unless asked otherwise.
+- Cast money and weights so they read cleanly; round to 2 decimals for money
+  and 4 for grams.
+
+The question may be in English, Urdu (اردو) or Roman-Urdu — shop staff type
+all three, often mixed. "Karigar" is a worker, "sona"/"gold" is gold,
+"kitna"/"kitni" is how much, "nuqsan"/"zaya"/"waste" is wastage, "munafa" is
+profit, "bikri" is sales, "udhaar" is amount owed. Read the question in
+whichever language it is written and produce SQL for it.
+
+Schema:
+{SCHEMA_DESCRIPTION}"""
+
+_FORBIDDEN = re.compile(
+    r"\b("
+    r"insert|update|delete|merge|drop|alter|create|truncate|grant|revoke|"
+    r"copy|vacuum|reindex|refresh|cluster|comment|call|do|execute|prepare|"
+    r"deallocate|set|reset|listen|notify|lock|begin|commit|rollback|savepoint|"
+    r"into|returning|pg_sleep|pg_read_file|pg_read_binary_file|pg_ls_dir|"
+    r"lo_import|lo_export|dblink"
+    r")\b",
+    re.IGNORECASE,
+)
+# The table name after FROM/JOIN. Subqueries open with '(' and are skipped —
+# their own FROM clauses get matched on the next pass of the same regex.
+_SOURCES = re.compile(r"\b(?:from|join)\s+([a-zA-Z_][a-zA-Z0-9_.\"]*)", re.IGNORECASE)
+# Names introduced by a WITH clause. They are selected from like tables, so
+# without this a perfectly legal read-only CTE reads as an unknown table.
+_CTE_NAMES = re.compile(
+    r"(?:\bwith\b(?:\s+recursive\b)?|,)\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:\([^)]*\))?\s+as\s*\(",
+    re.IGNORECASE,
+)
+
+
+@dataclass
+class GeneratedQuery:
+    sql: str
+    model: str
+    notes: str | None
+
+
+def validate_select(sql: str) -> str:
+    """
+    Reject anything that is not one bare SELECT over the curated tables.
+
+    This is the security boundary, not the prompt. The prompt is a request; a
+    model that ignores it, or a question crafted to make it ignore it, has to
+    fail here. Everything is a rejection rather than a repair — silently
+    rewriting a query the owner is about to read would defeat the point of
+    showing them the SQL.
+    """
+    cleaned = (sql or "").strip().rstrip(";").strip()
+    if not cleaned:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "The model returned no SQL.")
+
+    if ";" in cleaned:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Refusing to run more than one statement.",
+        )
+    # Comments can hide a second statement from a human reading the result,
+    # which is the one thing this endpoint promises not to do.
+    if "--" in cleaned or "/*" in cleaned:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "Refusing to run SQL containing comments."
+        )
+    if not re.match(r"^(select|with)\b", cleaned, re.IGNORECASE):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "Only a single SELECT can be run here."
+        )
+    forbidden = _FORBIDDEN.search(cleaned)
+    if forbidden:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Refusing to run SQL containing '{forbidden.group(1).upper()}'.",
+        )
+
+    readable = ALLOWED_TABLES | {n.lower() for n in _CTE_NAMES.findall(cleaned)}
+    for raw_name in _SOURCES.findall(cleaned):
+        name = raw_name.strip('"').lower()
+        # Schema-qualified names are rejected outright rather than unwrapped:
+        # pg_catalog.pg_authid is a table too.
+        if "." in name or name not in readable:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"'{raw_name}' is not one of the tables this report may read.",
+            )
+    return cleaned
+
+
+async def generate_sql(question: str) -> GeneratedQuery:
+    """Ask the model for one SELECT. Raises 503 when no provider is configured."""
+    cfg = require_provider()
+    schema = {
+        "type": "object",
+        "properties": {
+            "sql": {"type": "string"},
+            "notes": {
+                "type": "string",
+                "description": "One short line on what the query counts, in the question's language.",
+            },
+        },
+        "required": ["sql", "notes"],
+        "additionalProperties": False,
+    }
+    client = _client(cfg, _SQL_TIMEOUT_S)
+    try:
+        message = await client.messages.create(
+            model=cfg.model,
+            max_tokens=8000,
+            system=SQL_RULES,
+            output_config={"effort": "medium", "format": {"type": "json_schema", "schema": schema}},
+            messages=[{"role": "user", "content": question}],
+        )
+    except Exception as exc:
+        log.warning("ai.generate_sql failed (%s: %s)", type(exc).__name__, exc)
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            f"The model could not be reached: {type(exc).__name__}.",
+        ) from exc
+
+    if message.stop_reason == "refusal":
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "The model declined to answer that question.",
+        )
+    data = json.loads(_text_of(message))
+    return GeneratedQuery(
+        sql=validate_select(data.get("sql", "")),
+        model=message.model,
+        notes=(data.get("notes") or "").strip() or None,
+    )
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        # Decimal all the way to the wire; TS parses the string.
+        return str(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    return value
+
+
+def _plan_relations(node: Any, found: set[str]) -> None:
+    """Walk an EXPLAIN plan collecting every relation the planner will touch."""
+    if isinstance(node, dict):
+        name = node.get("Relation Name")
+        if isinstance(name, str):
+            found.add(name.lower())
+        for value in node.values():
+            _plan_relations(value, found)
+    elif isinstance(node, list):
+        for value in node:
+            _plan_relations(value, found)
+
+
+async def _assert_planner_only_reads_allowed_tables(db: AsyncSession, sql: str) -> None:
+    """
+    Ask Postgres which tables the query actually reads, and refuse anything
+    outside the allowlist.
+
+    The text checks upstream are a cheap first pass, but pattern-matching SQL is
+    not something a regex can do correctly — a comma-separated FROM list, an
+    unusually quoted identifier or a relation reached through a sublink all slip
+    past one. The planner has already resolved the query properly, so asking it
+    is the difference between a guard that looks right and one that is. This runs
+    inside the same read-only transaction, and EXPLAIN without ANALYZE plans
+    without executing, so a rejected query never touches a row.
+    """
+    try:
+        plan_rows = (await db.execute(text(f"EXPLAIN (FORMAT JSON) {sql}"))).scalar_one()
+    except Exception as exc:
+        log.warning("ai.explain_failed", extra={"error": str(exc).splitlines()[0][:300]})
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "The generated query could not be planned. Try rephrasing the question.",
+        ) from exc
+
+    if isinstance(plan_rows, str):
+        plan_rows = json.loads(plan_rows)
+    relations: set[str] = set()
+    _plan_relations(plan_rows, relations)
+
+    disallowed = sorted(r for r in relations if r not in ALLOWED_TABLES)
+    if disallowed:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"That question would read {', '.join(disallowed)}, which this report may not access.",
+        )
+
+
+async def run_select(db: AsyncSession, sql: str) -> tuple[list[str], list[dict[str, Any]]]:
+    """
+    Run a validated SELECT in a read-only transaction with a statement timeout.
+
+    The guard above is a text check and text checks are never complete, so the
+    database is told the same thing in a way it will enforce: this transaction
+    may not write, and it may not run for longer than a report should. The row
+    cap is applied by wrapping the query rather than by trusting a LIMIT the
+    model may or may not have written.
+    """
+    capped = f"SELECT * FROM (\n{sql}\n) AS ai_query LIMIT {MAX_ROWS}"
+    try:
+        await db.execute(text(f"SET LOCAL statement_timeout = {QUERY_TIMEOUT_MS}"))
+        await db.execute(text("SET LOCAL transaction_read_only = on"))
+        await _assert_planner_only_reads_allowed_tables(db, capped)
+        result = await db.execute(text(capped))
+        columns = list(result.keys())
+        rows = [
+            {k: _jsonable(v) for k, v in row.items()} for row in result.mappings().all()
+        ]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        await db.rollback()
+        # Deliberately opaque. Echoing the database's error turns a failed
+        # generated query into a schema-probing oracle: an attacker steering the
+        # question can read column and table names straight out of the error
+        # text, which is precisely what the allowlist above exists to prevent.
+        log.warning("ai.query_failed", extra={"error": str(exc).splitlines()[0][:300]})
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "The generated query could not be run. Try rephrasing the question.",
+        ) from exc
+    finally:
+        # Nothing was written, and rolling back is what drops the SET LOCALs so
+        # the next request on this session is not silently read-only.
+        await db.rollback()
+    return columns, rows
+
+
+async def answer_from_rows(
+    *, question: str, sql: str, columns: list[str], rows: list[dict[str, Any]]
+) -> str | None:
+    """
+    Turn the rows into a sentence. `None` if the model is unreachable — the
+    rows and the SQL are the answer; this is the reading of them.
+    """
+    cfg = ai_settings()
+    if not cfg.configured:
+        return None
+    try:
+        client = _client(cfg, _NARRATION_TIMEOUT_S)
+        message = await client.messages.create(
+            model=cfg.model,
+            max_tokens=4000,
+            system=(
+                "You read the result of a database query back to a jewellery "
+                "shop owner. Answer in one or two sentences, in the same "
+                "language the question was asked in (English, Urdu or "
+                "Roman-Urdu). Use ONLY numbers that appear in the rows — never "
+                "compute, total or estimate anything yourself. If the rows are "
+                "empty, say plainly that nothing matched. If they were capped "
+                f"at {MAX_ROWS} rows, say so."
+            ),
+            output_config={"effort": "low"},
+            messages=[
+                {
+                    "role": "user",
+                    # Tell the model exactly how much of the result it can see.
+                    # Labelling the prompt with the full count while showing a
+                    # slice invites a confident summary of data it never
+                    # received — "the highest is X" when the real highest sat in
+                    # the rows that were cut.
+                    "content": (
+                        f"Question: {question}\n\nSQL run:\n{sql}\n\n"
+                        f"Columns: {json.dumps(columns)}\n"
+                        + (
+                            f"Rows: showing the first {_NARRATION_ROWS} of {len(rows)}. "
+                            "Say so if the answer depends on rows you cannot see.\n"
+                            if len(rows) > _NARRATION_ROWS
+                            else f"Rows ({len(rows)}):\n"
+                        )
+                        + json.dumps(rows[:_NARRATION_ROWS], default=str)
+                    ),
+                }
+            ],
+        )
+        if message.stop_reason == "refusal":
+            return None
+        return _text_of(message) or None
+    except Exception as exc:
+        log.warning("ai.answer_from_rows unavailable (%s: %s)", type(exc).__name__, exc)
+        return None

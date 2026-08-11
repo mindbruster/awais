@@ -8,6 +8,8 @@ import { apiError } from "@/lib/api-error";
 import { fmtMoney } from "@/lib/money";
 import { statusPill } from "@/pages/designs/DesignsPage";
 
+type WastageBasis = "percent_of_issued" | "per_100_pieces";
+
 interface LegStone {
   id: number;
   stone_id: number;
@@ -35,6 +37,9 @@ interface Leg {
   gold_received_g: string;
   stones_used_ct: string;
   stones_returned_ct: string;
+  piece_count: number;
+  wastage_basis: WastageBasis;
+  wastage_per_100_pcs_g: string | null;
   wastage_allowed_pct: string | null;
   wastage_allowed_g: string;
   wastage_actual_g: string;
@@ -66,6 +71,7 @@ interface Trace {
   totals: {
     hops: number;
     open_hops: number;
+    pieces: number;
     gold_issued_g: string;
     gold_received_g: string;
     wastage_allowed_g: string;
@@ -82,6 +88,9 @@ interface Department {
   id: number;
   name: string;
   consumes_stones: boolean;
+  default_wastage_basis: WastageBasis;
+  default_wastage_per_100_pcs_g: string | null;
+  default_rate_per_piece: string | null;
 }
 
 interface Worker {
@@ -133,10 +142,69 @@ function when(iso: string | null): string {
   });
 }
 
-function settle(issued: number, received: number, allowedPct: number) {
-  const allowed = round4((issued * allowedPct) / 100);
+/** The terms a leg settles on, read off the leg — never off the department. */
+interface Terms {
+  basis: WastageBasis;
+  allowedPct: number;
+  per100: number;
+  pieces: number;
+}
+
+function termsOf(leg: Leg): Terms {
+  return {
+    basis: leg.wastage_basis,
+    allowedPct: Number(leg.wastage_allowed_pct ?? 0),
+    per100: Number(leg.wastage_per_100_pcs_g ?? 0),
+    pieces: leg.piece_count,
+  };
+}
+
+function settle(issued: number, received: number, t: Terms) {
+  const allowed =
+    t.basis === "per_100_pieces"
+      ? round4((t.per100 * t.pieces) / 100)
+      : round4((issued * t.allowedPct) / 100);
   const actual = round4(issued - received);
   return { allowed, actual, excess: Math.max(round4(actual - allowed), 0) };
+}
+
+// Grams are quoted to three places on the floor — 0.400 per 100, not 0.4.
+const g3 = (n: number) =>
+  n.toLocaleString(undefined, { minimumFractionDigits: 3, maximumFractionDigits: 4 });
+
+/**
+ * The allowance spelled out as the shop works it out, so the operator can check
+ * the arithmetic rather than trust the number.
+ */
+function allowanceWorking(t: Terms, allowed: number): string {
+  return t.basis === "per_100_pieces"
+    ? `${t.pieces} pcs × ${g3(t.per100)}g/100 = ${g3(allowed)} g allowed`
+    : `${t.allowedPct}% of issued`;
+}
+
+/** The same terms in a phrase, for "X beyond the … agreed with him". */
+function termsPhrase(t: Terms): string {
+  return t.basis === "per_100_pieces"
+    ? `${g3(t.per100)}g per 100 pieces`
+    : `${t.allowedPct}%`;
+}
+
+/** What the worker earns, on the basis this leg was issued under. */
+function labourOn(leg: Leg, receivedG: number): number {
+  const rate = Number(leg.labour_rate);
+  if (leg.labour_basis === "per_gram") return rate * receivedG;
+  if (leg.labour_basis === "per_piece") return rate * leg.piece_count;
+  return rate;
+}
+
+/**
+ * The per-piece charge as a sum: "350 stones × ₨ 5.00 = ₨ 1,750.00". Anything
+ * else is shown as the plain amount — there is nothing to show a working for.
+ */
+function labourWorking(leg: Leg, amount: number): string | undefined {
+  if (leg.labour_basis !== "per_piece") return undefined;
+  const noun = leg.stones.length > 0 ? "stones" : "pcs";
+  return `${leg.piece_count} ${noun} × ${fmtMoney(leg.labour_rate)} = ${fmtMoney(amount)}`;
 }
 
 export function DesignDetailPage() {
@@ -302,7 +370,15 @@ function Totals({ totals }: { totals: Trace["totals"] }) {
         sub="beyond allowance"
         tone={excess > 0 ? "bad" : "good"}
       />
-      <Tile label="Labour" value={fmtMoney(totals.labour_amount)} sub="accrued on closed legs" />
+      <Tile
+        label="Labour"
+        value={fmtMoney(totals.labour_amount)}
+        sub={
+          totals.pieces
+            ? `${totals.pieces} pcs handled · accrued on closed legs`
+            : "accrued on closed legs"
+        }
+      />
     </div>
   );
 }
@@ -369,6 +445,10 @@ function Route({ legs, daysHeld }: { legs: Leg[]; daysHeld: Map<number, number |
 function LegCard({ leg, daysHeld }: { leg: Leg; daysHeld: number | null }) {
   const cancelled = leg.status === "cancelled";
   const open = leg.status === "issued";
+  const terms = termsOf(leg);
+  const labourSub =
+    labourWorking(leg, Number(leg.labour_amount)) ??
+    `${leg.labour_basis.replace("_", " ")} @ ${Number(leg.labour_rate)}`;
   return (
     <div className={`card ${cancelled ? "opacity-60" : ""}`}>
       <div className="flex flex-wrap items-baseline justify-between gap-2">
@@ -408,7 +488,11 @@ function LegCard({ leg, daysHeld }: { leg: Leg; daysHeld: number | null }) {
         <Figure
           label="Labour"
           value={fmtMoney(open ? null : leg.labour_amount)}
-          sub={`${leg.labour_basis.replace("_", " ")} @ ${Number(leg.labour_rate)}`}
+          sub={
+            open && leg.labour_basis === "per_piece"
+              ? `${leg.piece_count} × ${fmtMoney(leg.labour_rate)} on receive`
+              : labourSub
+          }
         />
         <Figure
           label="Stones"
@@ -422,6 +506,13 @@ function LegCard({ leg, daysHeld }: { leg: Leg; daysHeld: number | null }) {
               : undefined
           }
         />
+        {leg.piece_count > 0 && (
+          <Figure
+            label="Pieces"
+            value={String(leg.piece_count)}
+            sub={leg.stones.length > 0 ? "stones set" : "items handled"}
+          />
+        )}
       </div>
 
       {!open && !cancelled && (
@@ -430,15 +521,18 @@ function LegCard({ leg, daysHeld }: { leg: Leg; daysHeld: number | null }) {
           allowed={Number(leg.wastage_allowed_g)}
           actual={Number(leg.wastage_actual_g)}
           excess={Number(leg.wastage_excess_g)}
-          allowedPct={leg.wastage_allowed_pct}
+          terms={terms}
           worker={leg.worker_name}
         />
       )}
       {open && (
         <p className="mt-4 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-800">
           {wt(leg.gold_issued_g)} is with {leg.worker_name ?? "this worker"}. Wastage is settled
-          when the piece comes back — {Number(leg.wastage_allowed_pct ?? 0)}% is allowed on this
-          leg.
+          when the piece comes back —{" "}
+          {terms.basis === "per_100_pieces"
+            ? `${allowanceWorking(terms, round4((terms.per100 * terms.pieces) / 100))}`
+            : `${terms.allowedPct}% is allowed on this leg`}
+          .
         </p>
       )}
 
@@ -498,14 +592,14 @@ function Settlement({
   allowed,
   actual,
   excess,
-  allowedPct,
+  terms,
   worker,
   className = "",
 }: {
   allowed: number;
   actual: number;
   excess: number;
-  allowedPct: string | number | null;
+  terms: Terms;
   worker: string | null;
   className?: string;
 }) {
@@ -520,7 +614,7 @@ function Settlement({
         <div>
           <p className="text-xs uppercase tracking-wide text-slate-500">Allowed</p>
           <p className="mt-0.5 font-mono">{wt(allowed)}</p>
-          <p className="text-xs text-slate-500">{Number(allowedPct ?? 0)}% of issued</p>
+          <p className="text-xs text-slate-500">{allowanceWorking(terms, allowed)}</p>
         </div>
         <div>
           <p className="text-xs uppercase tracking-wide text-slate-500">
@@ -564,8 +658,8 @@ function Settlement({
           </div>
           {excess > 0 && (
             <p className="mt-3 rounded-md bg-red-50 px-3 py-2 text-xs text-red-800">
-              {wt(excess)} beyond the {Number(allowedPct ?? 0)}% agreed with{" "}
-              {worker ?? "this worker"} — charged back to him, not to the shop.
+              {wt(excess)} beyond the {termsPhrase(terms)} agreed with {worker ?? "this worker"} —
+              charged back to him, not to the shop.
             </p>
           )}
         </>
@@ -593,14 +687,11 @@ function ReceivePanel({
   const [cancelReason, setCancelReason] = useState("");
 
   const issued = Number(leg.gold_issued_g);
-  const allowedPct = Number(leg.wastage_allowed_pct ?? 0);
+  const terms = termsOf(leg);
   // Typed weight, not the committed one: this is what makes the settlement
   // visible before the operator signs off on it.
-  const preview = settle(issued, Number(received || 0), allowedPct);
-  const labour =
-    leg.labour_basis === "per_gram"
-      ? Number(leg.labour_rate) * Number(received || 0)
-      : Number(leg.labour_rate);
+  const preview = settle(issued, Number(received || 0), terms);
+  const labour = labourOn(leg, Number(received || 0));
 
   const setReturn = (id: number, patch: Partial<{ qty: string; ct: string }>) =>
     setReturns((r) => ({ ...r, [id]: { ...(r[id] ?? { qty: "", ct: "" }), ...patch } }));
@@ -669,7 +760,11 @@ function ReceivePanel({
         {received === "" ? (
           <p className="rounded-lg border border-dashed border-slate-300 px-3 py-4 text-center text-xs text-slate-500">
             Weigh the piece and enter it above — the wastage settlement appears here before you
-            commit it. {allowedPct}% of {wt(leg.gold_issued_g)} is allowed.
+            commit it.{" "}
+            {terms.basis === "per_100_pieces"
+              ? allowanceWorking(terms, round4((terms.per100 * terms.pieces) / 100))
+              : `${terms.allowedPct}% of ${wt(leg.gold_issued_g)} is allowed`}
+            .
           </p>
         ) : (
           <>
@@ -677,11 +772,16 @@ function ReceivePanel({
               allowed={preview.allowed}
               actual={preview.actual}
               excess={preview.excess}
-              allowedPct={allowedPct}
+              terms={terms}
               worker={leg.worker_name}
             />
             <p className="text-xs text-slate-500">
               Labour on this leg: <span className="font-mono">{fmtMoney(labour)}</span>
+              {labourWorking(leg, labour) && (
+                <span className="mt-0.5 block font-mono text-slate-400">
+                  {labourWorking(leg, labour)}
+                </span>
+              )}
             </p>
           </>
         )}
@@ -804,6 +904,8 @@ function IssuePanel({ designId, reload }: { designId: number; reload: () => void
   const [purity, setPurity] = useState("22");
   const [basis, setBasis] = useState("per_gram");
   const [rate, setRate] = useState("0");
+  const [pieces, setPieces] = useState("");
+  const [per100, setPer100] = useState("");
   const [lines, setLines] = useState<StoneLine[]>([]);
   const [stoneSrc, setStoneSrc] = useState("");
   const [notes, setNotes] = useState("");
@@ -845,6 +947,19 @@ function IssuePanel({ designId, reload }: { designId: number; reload: () => void
 
   const worker = eligible.find((w) => String(w.id) === workerId);
   const dept = departments.find((d) => String(d.id) === deptId);
+  const perPieces = dept?.default_wastage_basis === "per_100_pieces";
+
+  // The department's standing terms are the shop's own numbers, so they are
+  // filled in rather than asked for again. They stay editable: what is sent is
+  // what the leg is frozen on, and one job can legitimately be off the norm.
+  useEffect(() => {
+    if (!dept) return;
+    setPer100(dept.default_wastage_per_100_pcs_g ?? "");
+    if (dept.default_rate_per_piece !== null && dept.default_rate_per_piece !== undefined) {
+      setBasis("per_piece");
+      setRate(dept.default_rate_per_piece);
+    }
+  }, [dept]);
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
@@ -865,6 +980,11 @@ function IssuePanel({ designId, reload }: { designId: number; reload: () => void
             rate_per_ct: l.rate || "0",
           })),
         stone_source_inventory_id: lines.length ? Number(stoneSrc) : null,
+        piece_count: Number(pieces || 0),
+        // Sent explicitly rather than left to the server's fallback so the leg
+        // is frozen on exactly the terms shown on this form.
+        wastage_basis: dept?.default_wastage_basis ?? "percent_of_issued",
+        wastage_per_100_pcs_g: perPieces ? per100 || "0" : null,
         labour_basis: basis,
         labour_rate: rate || "0",
         notes: notes || null,
@@ -872,6 +992,7 @@ function IssuePanel({ designId, reload }: { designId: number; reload: () => void
       toast("success", `Issued to ${worker?.name ?? "worker"}`);
       setGold("");
       setNotes("");
+      setPieces("");
       setLines([]);
       reload();
     } catch (err) {
@@ -950,6 +1071,62 @@ function IssuePanel({ designId, reload }: { designId: number; reload: () => void
           onChange={(e) => setRate(e.target.value)}
         />
       </div>
+
+      <div className="grid grid-cols-2 gap-3">
+        <TextField
+          label="Pieces"
+          type="number"
+          min={0}
+          required={perPieces}
+          value={pieces}
+          onChange={(e) => setPieces(e.target.value)}
+          hint={
+            perPieces
+              ? "Stones to be set — the allowance is worked out from this"
+              : dept?.consumes_stones
+              ? "Stones to be set on this leg"
+              : "Items handled on this leg"
+          }
+        />
+        {perPieces && (
+          <TextField
+            label="Waste per 100 pcs (g)"
+            type="number"
+            step="0.0001"
+            min={0}
+            value={per100}
+            onChange={(e) => setPer100(e.target.value)}
+            hint={`${dept?.name} standard`}
+          />
+        )}
+      </div>
+      {perPieces && (
+        <p className="rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-600">
+          {Number(pieces || 0) > 0 ? (
+            <>
+              Allowance frozen onto this leg:{" "}
+              <span className="font-mono">
+                {Number(pieces)} pcs × {g3(Number(per100 || 0))}g/100 ={" "}
+                {g3(round4((Number(per100 || 0) * Number(pieces)) / 100))} g
+              </span>
+              {basis === "per_piece" && (
+                <>
+                  {" · "}
+                  <span className="font-mono">
+                    {Number(pieces)} × {fmtMoney(rate || 0)} ={" "}
+                    {fmtMoney(Number(rate || 0) * Number(pieces))}
+                  </span>
+                </>
+              )}
+            </>
+          ) : (
+            <>
+              {dept?.name} allows wastage per 100 pieces. Without a piece count the allowance is
+              zero and the worker carries the whole loss, so the count is required.
+            </>
+          )}
+        </p>
+      )}
 
       <div className="border-t border-slate-100 pt-3">
         <div className="flex items-center justify-between">
@@ -1067,7 +1244,15 @@ function IssuePanel({ designId, reload }: { designId: number; reload: () => void
       <TextArea label="Notes" value={notes} onChange={(e) => setNotes(e.target.value)} />
       <button
         className="btn-primary w-full"
-        disabled={busy || !workerId || !goldSrc || !gold || (lines.length > 0 && !stoneSrc)}
+        disabled={
+          busy ||
+          !workerId ||
+          !goldSrc ||
+          !gold ||
+          (lines.length > 0 && !stoneSrc) ||
+          // The API refuses this too; blocking it here saves the round trip.
+          (perPieces && Number(pieces || 0) <= 0)
+        }
       >
         {busy ? "Issuing…" : "Issue (deducts stock)"}
       </button>

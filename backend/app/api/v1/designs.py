@@ -19,7 +19,15 @@ from sqlalchemy import or_, select
 from app.api.deps import CurrentUser, DbSession, require_password_confirm, require_perm
 from app.models.customer import Customer
 from app.models.department import Department
-from app.models.design import Design, DesignStatus, JobLeg, LegStatus, LegStone
+from app.models.design import (
+    Design,
+    DesignStatus,
+    JobLeg,
+    LabourBasis,
+    LegStatus,
+    LegStone,
+    WastageBasis,
+)
 from app.models.inventory import InventoryItem
 from app.models.item import Item
 from app.models.stock_movement import MovementType
@@ -99,6 +107,11 @@ def _leg_read(leg: JobLeg) -> JobLegRead:
         gold_received_g=d(leg.gold_received_g),
         stones_used_ct=d(leg.stones_used_ct),
         stones_returned_ct=d(leg.stones_returned_ct),
+        piece_count=leg.piece_count,
+        wastage_basis=leg.wastage_basis,
+        wastage_per_100_pcs_g=(
+            d(leg.wastage_per_100_pcs_g) if leg.wastage_per_100_pcs_g is not None else None
+        ),
         wastage_allowed_pct=(
             d(leg.wastage_allowed_pct) if leg.wastage_allowed_pct is not None else None
         ),
@@ -181,6 +194,21 @@ async def _get_leg(db: DbSession, leg_id: int, *, lock: bool = False) -> JobLeg:
     if leg is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Leg not found")
     return leg
+
+
+def _department_basis(department: Department) -> WastageBasis:
+    """
+    The convention this department settles wastage under.
+
+    Stored as free text on the department, so an unrecognised value is read as
+    the percentage basis: that is what every worker's agreed rate is already
+    expressed in, and falling through to the per-100 basis instead would judge
+    the leg against an allowance nobody has configured.
+    """
+    try:
+        return WastageBasis(department.default_wastage_basis)
+    except ValueError:
+        return WastageBasis.percent_of_issued
 
 
 async def _get_inventory(db: DbSession, item_id: int) -> InventoryItem:
@@ -312,6 +340,53 @@ async def issue_leg(
             "stone_source_inventory_id is required when issuing stones.",
         )
 
+    # The department's standing terms fill in whatever the counter didn't state.
+    # Resolved here and frozen onto the leg below, never re-read at receive:
+    # setting's rate gets renegotiated and an old leg must settle on the deal
+    # that was in force when the metal left the safe.
+    basis = payload.wastage_basis or _department_basis(department)
+    per_100 = payload.wastage_per_100_pcs_g
+    if per_100 is None and department.default_wastage_per_100_pcs_g is not None:
+        per_100 = d(department.default_wastage_per_100_pcs_g)
+    pieces = payload.piece_count if payload.piece_count is not None else 0
+    labour_rate = payload.labour_rate
+    if labour_rate is None:
+        labour_rate = (
+            d(department.default_rate_per_piece)
+            if payload.labour_basis is LabourBasis.per_piece
+            and department.default_rate_per_piece is not None
+            else Decimal("0")
+        )
+
+    if basis is WastageBasis.per_100_pieces:
+        # Both of these would settle to a zero allowance without a word, and the
+        # worker would be charged for every gram he lost on work the shop had
+        # already agreed loses metal. Refused rather than defaulted.
+        if pieces <= 0:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"{department.name} allows wastage per 100 pieces, so this leg needs a piece "
+                f"count. Send piece_count — with none, {worker.name} would be allowed nothing "
+                "and charged for the whole loss.",
+            )
+        if per_100 is None:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"{department.name} allows wastage per 100 pieces but no grams-per-100 figure "
+                "is set. Send wastage_per_100_pcs_g, or configure the department's default.",
+            )
+
+    # The same silent-zero trap on the pay side: per-piece labour multiplies the
+    # rate by the count, so a missing count settles the worker's earnings at
+    # nothing. Guarded here rather than at receive, when the metal is already
+    # out and refusing would strand the leg.
+    if payload.labour_basis is LabourBasis.per_piece and pieces <= 0:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Labour on this leg is charged per piece, so it needs a piece count. "
+            f"Send piece_count — with none, {worker.name} would be paid nothing.",
+        )
+
     rate = await current_gold_rate(db)
     gold_source = await _get_inventory(db, payload.gold_source_inventory_id)
 
@@ -332,8 +407,11 @@ async def issue_leg(
         # force when the metal left the safe.
         # Frozen now, never re-read. See settle_wastage.
         wastage_allowed_pct=agreed_wastage_pct(worker),
+        piece_count=pieces,
+        wastage_basis=basis,
+        wastage_per_100_pcs_g=per_100,
         labour_basis=payload.labour_basis,
-        labour_rate=payload.labour_rate,
+        labour_rate=labour_rate,
         notes=payload.notes,
     )
     db.add(leg)
@@ -393,7 +471,12 @@ async def issue_leg(
             "worker": worker.name,
             "gold_issued_g": str(d(leg.gold_issued_g)),
             "stones_issued_ct": str(stones_ct),
+            "piece_count": pieces,
+            "wastage_basis": basis.value,
+            "wastage_per_100_pcs_g": str(per_100) if per_100 is not None else None,
             "wastage_allowed_pct": str(d(leg.wastage_allowed_pct)),
+            "labour_basis": payload.labour_basis.value,
+            "labour_rate": str(d(labour_rate)),
         },
     )
     await db.commit()
@@ -677,6 +760,9 @@ async def trace_design(design_id: int, db: DbSession) -> DesignTrace:
         "labour_amount": Decimal("0"),
     }
     open_hops = 0
+    # Counted, not summed with the weights: pieces are what the per-piece
+    # charges and the per-100 allowances above were derived from.
+    pieces = 0
 
     for leg in design.legs:
         end = leg.received_at or datetime.now(timezone.utc)
@@ -693,6 +779,13 @@ async def trace_design(design_id: int, db: DbSession) -> DesignTrace:
                 gold_in_g=d(leg.gold_issued_g),
                 gold_purity=leg.gold_issued_purity,
                 gold_out_g=d(leg.gold_received_g),
+                piece_count=leg.piece_count,
+                wastage_basis=leg.wastage_basis,
+                wastage_per_100_pcs_g=(
+                    d(leg.wastage_per_100_pcs_g)
+                    if leg.wastage_per_100_pcs_g is not None
+                    else None
+                ),
                 wastage_allowed_pct=(
                     d(leg.wastage_allowed_pct) if leg.wastage_allowed_pct is not None else None
                 ),
@@ -723,6 +816,7 @@ async def trace_design(design_id: int, db: DbSession) -> DesignTrace:
             continue
         if leg.status is LegStatus.issued:
             open_hops += 1
+        pieces += leg.piece_count
         totals["gold_issued_g"] += d(leg.gold_issued_g)
         totals["gold_received_g"] += d(leg.gold_received_g)
         totals["wastage_allowed_g"] += d(leg.wastage_allowed_g)
@@ -755,5 +849,5 @@ async def trace_design(design_id: int, db: DbSession) -> DesignTrace:
             ((completed or datetime.now(timezone.utc)) - started).days if started else None
         ),
         hops=hops,
-        totals=TraceTotals(hops=len(hops), open_hops=open_hops, **totals),
+        totals=TraceTotals(hops=len(hops), open_hops=open_hops, pieces=pieces, **totals),
     )

@@ -25,6 +25,8 @@ const NAV: NavItem[] = [
   { to: "/vendors", label: "Workers" },
   { to: "/gold-rates", label: "Gold rates" },
   { to: "/reports", label: "Reports" },
+  // Owner-level analysis; staff already cannot see the money reports it reads.
+  { to: "/insights", label: "Insights", roles: ["admin", "accountant"] },
 ];
 
 // The books. Worker gold liabilities and cash positions are owner information,

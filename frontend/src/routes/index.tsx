@@ -28,6 +28,7 @@ import { ChartOfAccountsPage } from "@/pages/ledger/ChartOfAccountsPage";
 import { StatementPage } from "@/pages/ledger/StatementPage";
 import { JournalPage } from "@/pages/ledger/JournalPage";
 import { PositionPage } from "@/pages/ledger/PositionPage";
+import { InsightsPage } from "@/pages/InsightsPage";
 
 function ProtectedRoute() {
   const token = useAuthStore((s) => s.token);
@@ -78,6 +79,7 @@ export const router = createBrowserRouter([
           { path: "/ledger/statement", element: <StatementPage /> },
           { path: "/ledger/journal", element: <JournalPage /> },
           { path: "/ledger/accounts", element: <ChartOfAccountsPage /> },
+          { path: "/insights", element: <InsightsPage /> },
         ],
       },
     ],

@@ -6,6 +6,7 @@ from app.api.v1 import (
     customers,
     designs,
     gold_rates,
+    insights,
     inventory,
     invoices,
     ledger,
@@ -50,3 +51,7 @@ api_router.include_router(masters.bank_accounts_router, prefix="/bank-accounts",
 # The books, and the workshop floor that posts into them.
 api_router.include_router(ledger.router, prefix="/ledger", tags=["ledger"])
 api_router.include_router(designs.router, prefix="/designs", tags=["designs"])
+
+# Analysis over the books. Degrades to plain statistics when no model provider
+# is configured — nothing here is allowed to be load-bearing.
+api_router.include_router(insights.router, prefix="/insights", tags=["insights"])

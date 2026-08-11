@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.account import SystemAccount
 from app.models.currency import Currency
-from app.models.design import Design, JobLeg, LabourBasis
+from app.models.design import Design, JobLeg, LabourBasis, WastageBasis
 from app.models.gold_rate import GoldRate
 from app.models.item import Item
 from app.models.journal import Commodity, JournalEntry, PartyType
@@ -120,30 +120,54 @@ def settle_wastage(leg: JobLeg) -> None:
     allowance agreed with this worker is his — a shop that charges the whole
     difference is charging for metal it agreed he could lose.
 
-    The percentage is read only off the leg, never off the worker. Terms get
-    renegotiated, and a live lookup here would judge metal against a deal
-    struck after it left the safe — in both directions: a rate agreed later
-    would retroactively excuse a shortfall, and a department default filled in
-    afterwards would make a worker who was never on terms liable for the lot.
-    """
-    pct = d(leg.wastage_allowed_pct)
+    The terms are read only off the leg, never off the worker or department.
+    They get renegotiated, and a live lookup here would judge metal against a
+    deal struck after it left the safe — in both directions: a rate agreed
+    later would retroactively excuse a shortfall, and a department default
+    filled in afterwards would make a worker who was never on terms liable for
+    the lot.
 
+    Two ways of agreeing the allowance, and they are not interchangeable:
+
+    * percent_of_issued — allowed = issued * pct/100. What casting and
+      goldsmithing work on.
+    * per_100_pieces    — allowed = per_100 / 100 * pieces. What setting works
+      on: 0.400g per hundred stones over 350 stones allows 1.400g. A setter's
+      loss follows how many stones he handles, not how heavy the piece is, so
+      charging him a percentage would under-charge a light piece carrying many
+      stones and over-charge a heavy one carrying few.
+    """
     issued = d(leg.gold_issued_g)
     actual = (issued - d(leg.gold_received_g)).quantize(_G)
-    allowed = (issued * pct / Decimal("100")).quantize(_G)
 
-    leg.wastage_allowed_pct = pct
+    if leg.wastage_basis is WastageBasis.per_100_pieces:
+        per_100 = d(leg.wastage_per_100_pcs_g)
+        allowed = (per_100 * Decimal(leg.piece_count or 0) / Decimal("100")).quantize(_G)
+    else:
+        pct = d(leg.wastage_allowed_pct)
+        allowed = (issued * pct / Decimal("100")).quantize(_G)
+        leg.wastage_allowed_pct = pct
+
     leg.wastage_allowed_g = allowed
     leg.wastage_actual_g = actual
     leg.wastage_excess_g = max(actual - allowed, Decimal("0"))
 
 
 def compute_labour(leg: JobLeg) -> Decimal:
-    """Per-gram labour is charged on the weight the worker delivered, not on
-    what he was issued — he is paid for the piece he produced."""
+    """
+    What the worker has earned on this leg.
+
+    * per_gram  — on the weight he delivered, not what he was issued: he is
+                  paid for the piece he produced.
+    * per_piece — on the count he handled. Stone setting at 5 or 10 rupees a
+                  stone, lacquering at 500 or 1000 an item.
+    * flat      — the rate, whatever the leg carried.
+    """
     rate = d(leg.labour_rate)
     if leg.labour_basis is LabourBasis.per_gram:
         return (rate * d(leg.gold_received_g)).quantize(_PKR)
+    if leg.labour_basis is LabourBasis.per_piece:
+        return (rate * Decimal(leg.piece_count or 0)).quantize(_PKR)
     return rate.quantize(_PKR)
 
 

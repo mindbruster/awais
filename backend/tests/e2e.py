@@ -1880,6 +1880,247 @@ def main() -> int:
     r = client.post("/designs", headers=staff_auth, json={"item_id": taka_id})
     check("staff can mint designs → 201", r.status_code == 201, f"got {r.status_code}")
 
+    # ----- SHOP FORMULAS (ratti discount, setting hisaab, lacker) -----
+    # The client's own worked examples, kept as the specification.
+    section("Shop formulas")
+
+    # --- discount quoted in ratti, against a base of 96 ---
+    # 6 ratti  -> weight / 96 * 90
+    # 10 ratti -> weight / 96 * 86
+    rate_row = client.get("/gold-rates/current", headers=auth, params={"currency": "PKR", "purity": 24}).json()
+    day_rate = Decimal(str(rate_row["rate_per_g"]))
+
+    def gold_amount_for(ratti: str) -> Decimal:
+        inv = client.post(
+            "/invoices",
+            headers=auth,
+            json={
+                "customer_id": customer_id,
+                "sale_type": "normal",
+                "currency": "PKR",
+                "items": [{
+                    "description": f"Taka, {ratti} ratti discount",
+                    "quantity": 1,
+                    "gold_weight_g": "10",
+                    "gold_purity": 22,
+                    "discount_ratti": ratti,
+                }],
+            },
+        )
+        assert inv.status_code == 201, inv.text[:300]
+        return Decimal(str(inv.json()["items"][0]["gold_amount"]))
+
+    # The billable weight is rounded to the 4 decimals weights are held in
+    # *before* it is priced, so an invoice can be recomputed from the weight
+    # printed on it. Pricing the unrounded figure would leave the customer's
+    # own arithmetic a few rupees off the total, which is the sort of thing
+    # that costs an argument at the counter.
+    def priced(billable: Decimal) -> Decimal:
+        return (billable.quantize(Decimal("0.0001")) * Decimal("22") / Decimal("24") * day_rate).quantize(
+            Decimal("0.01")
+        )
+
+    expected_none = priced(Decimal("10"))
+    expected_6 = priced(Decimal("10") / 96 * 90)
+    expected_10 = priced(Decimal("10") / 96 * 86)
+
+    check("no ratti discount prices the full weight", gold_amount_for("0") == expected_none,
+          f"got {gold_amount_for('0')}, expected {expected_none}")
+    check(
+        "6 ratti discount bills 90/96 of the gold",
+        gold_amount_for("6") == expected_6,
+        f"got {gold_amount_for('6')}, expected {expected_6}",
+    )
+    check(
+        "10 ratti discount bills 86/96 of the gold",
+        gold_amount_for("10") == expected_10,
+        f"got {gold_amount_for('10')}, expected {expected_10}",
+    )
+    r = client.post(
+        "/invoices",
+        headers=auth,
+        json={
+            "customer_id": customer_id, "sale_type": "normal", "currency": "PKR",
+            "items": [{"description": "over-discounted", "quantity": 1, "gold_weight_g": "10",
+                       "gold_purity": 22, "discount_ratti": "120"}],
+        },
+    )
+    check(
+        "a discount beyond the base is refused, never credited back",
+        r.status_code in (400, 422)
+        or Decimal(str(r.json()["items"][0]["gold_amount"])) == Decimal("0"),
+        f"got {r.status_code}: {r.text[:160]}",
+    )
+
+    # --- a multi-unit line must bill for every unit ---
+    # Stock deduction and the profit report both scale by quantity, so pricing
+    # has to as well: billing one piece while shipping three gives two away.
+    multi = client.post(
+        "/invoices",
+        headers=auth,
+        json={
+            "customer_id": customer_id, "sale_type": "normal", "currency": "PKR",
+            "items": [{
+                "description": "Three identical bangles",
+                "quantity": 3,
+                "gold_weight_g": "10",
+                "gold_purity": 22,
+                "labor_amount": "1000",
+            }],
+        },
+    ).json()
+    line = multi["items"][0]
+    check(
+        "gold on a 3-unit line is priced for 3 units",
+        Decimal(str(line["gold_amount"])) == (expected_none * 3),
+        f"got {line['gold_amount']}, expected {expected_none * 3}",
+    )
+    check(
+        "labour on a 3-unit line is priced for 3 units",
+        Decimal(str(line["line_total"])) == (expected_none * 3) + Decimal("3000"),
+        f"got {line['line_total']}, expected {(expected_none * 3) + Decimal('3000')}",
+    )
+
+    # --- setting: waste per 100 stones, and a charge per stone ---
+    # 0.400 g per 100 over 350 stones = 1.400 g allowed; 350 x Rs 5 = Rs 1,750.
+    setting_dept_id = next(d_["id"] for d_ in depts if d_["code"] == "SET")
+    setter = client.post(
+        "/vendors",
+        headers=auth,
+        json={"name": "Setting Ustaad", "type": "stone_fixer", "department_id": setting_dept_id},
+    ).json()
+    set_design = client.post("/designs", headers=auth, json={"item_id": taka_id}).json()
+    r = client.post(
+        f"/designs/{set_design['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": setting_dept_id,
+            "worker_id": setter["id"],
+            "gold_issued_g": "50",
+            "gold_issued_purity": 22,
+            "gold_source_inventory_id": raw_gold["id"],
+            "piece_count": 350,
+            "wastage_basis": "per_100_pieces",
+            "wastage_per_100_pcs_g": "0.400",
+            "labour_basis": "per_piece",
+            "labour_rate": "5",
+        },
+    )
+    check("issue a setting leg for 350 stones → 201", r.status_code == 201, f"got {r.status_code}: {r.text[:250]}")
+    set_leg = r.json()
+    check("piece count recorded on the leg", set_leg["piece_count"] == 350, str(set_leg.get("piece_count")))
+
+    # Lose 2g against a 1.4g allowance: 0.6g is the setter's.
+    r = client.post(
+        f"/designs/legs/{set_leg['id']}/receive", headers=auth, json={"gold_received_g": "48"}
+    )
+    check("receive the setting leg → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:250]}")
+    settled_set = r.json()
+    check(
+        "allowance is 0.400g per 100 over 350 stones = 1.400g",
+        Decimal(str(settled_set["wastage_allowed_g"])) == Decimal("1.4"),
+        f"got {settled_set['wastage_allowed_g']}, expected 1.4000",
+    )
+    check(
+        "excess beyond the per-100 allowance is the setter's",
+        Decimal(str(settled_set["wastage_excess_g"])) == Decimal("0.6"),
+        f"got {settled_set['wastage_excess_g']}, expected 0.6000",
+    )
+    check(
+        "stone setting charged per stone: 350 x Rs 5",
+        Decimal(str(settled_set["labour_amount"])) == Decimal("1750"),
+        f"got {settled_set['labour_amount']}, expected 1750.00",
+    )
+    r = client.get("/ledger/trial-balance", headers=auth)
+    check("books balance after a per-100 settlement", r.json()["balanced"] is True)
+
+    # --- lacker: weight out, weight in, difference, charge per item ---
+    r = client.post(
+        "/departments",
+        headers=auth,
+        json={"name": "Lacker", "code": "LAC", "sequence": 85, "default_rate_per_piece": "500"},
+    )
+    check("create the lacker department → 201", r.status_code == 201, f"got {r.status_code}")
+    lac_dept = r.json()
+    lacquerer = client.post(
+        "/vendors",
+        headers=auth,
+        json={"name": "Coating Wala", "type": "other", "department_id": lac_dept["id"]},
+    ).json()
+    r = client.post(
+        f"/designs/{set_design['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": lac_dept["id"],
+            "worker_id": lacquerer["id"],
+            "gold_issued_g": "48",
+            "gold_issued_purity": 22,
+            "gold_source_inventory_id": raw_gold["id"],
+            "piece_count": 12,
+            "labour_basis": "per_piece",
+            "labour_rate": "500",
+        },
+    )
+    check("issue a lacker leg → 201", r.status_code == 201, f"got {r.status_code}: {r.text[:250]}")
+    lac_leg = r.json()
+    r = client.post(
+        f"/designs/legs/{lac_leg['id']}/receive", headers=auth, json={"gold_received_g": "48.2"}
+    )
+    check("receive the lacker leg → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:250]}")
+    lac = r.json()
+    check(
+        "coating added weight — recorded as a gain, not a shortfall",
+        Decimal(str(lac["wastage_actual_g"])) == Decimal("-0.2")
+        and Decimal(str(lac["wastage_excess_g"])) == Decimal("0"),
+        f"actual={lac['wastage_actual_g']} excess={lac['wastage_excess_g']}",
+    )
+    check(
+        "lacker charged per item: 12 x Rs 500",
+        Decimal(str(lac["labour_amount"])) == Decimal("6000"),
+        f"got {lac['labour_amount']}, expected 6000.00",
+    )
+
+    # A per-100 leg with no piece count would silently allow nothing and charge
+    # the worker the entire loss.
+    guard_design = client.post("/designs", headers=auth, json={"item_id": taka_id}).json()
+    r = client.post(
+        f"/designs/{guard_design['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": setting_dept_id, "worker_id": setter["id"], "gold_issued_g": "10",
+            "gold_source_inventory_id": raw_gold["id"], "piece_count": 0,
+            "wastage_basis": "per_100_pieces", "wastage_per_100_pcs_g": "0.400",
+        },
+    )
+    check(
+        "per-100 leg without a piece count is refused → 400",
+        r.status_code == 400,
+        f"got {r.status_code}: {r.text[:160]}",
+    )
+
+    # ----- AI INSIGHTS (degrade-without-a-provider contract) -----
+    section("AI insights")
+    r = client.get("/insights/wastage-anomalies", headers=auth, params={"days": 90})
+    check(
+        "wastage analysis returns figures with no model configured",
+        r.status_code == 200,
+        f"got {r.status_code}: {r.text[:200]}",
+    )
+    r = client.get("/insights/margin-watch", headers=auth, params={"days": 90})
+    check(
+        "margin watch returns figures with no model configured",
+        r.status_code == 200,
+        f"got {r.status_code}: {r.text[:200]}",
+    )
+    r = client.post("/insights/ask", headers=auth, json={"question": "kitna sona Zahid ke paas hai"})
+    check(
+        "ask returns a clean 503 when no model is configured",
+        r.status_code == 503,
+        f"got {r.status_code}: {r.text[:200]}",
+    )
+    r = client.get("/insights/wastage-anomalies", headers=staff_auth, params={"days": 90})
+    check("staff cannot read the wastage analysis → 403", r.status_code == 403, f"got {r.status_code}")
+
     # ----- LOGIN RATE LIMIT (slowapi: 10/minute) -----
     section("Login rate limit")
     for _ in range(10):

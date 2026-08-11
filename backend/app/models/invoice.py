@@ -100,4 +100,11 @@ class InvoiceItem(Base, TimestampMixin):
     # Per-line discount expressed in the invoice's currency. Subtracted from
     # (gold + stone + labor) before line_total. Capped to never go negative.
     line_discount: Mapped[float] = mapped_column(Numeric(14, 2), default=0, nullable=False)
+
+    # Discount quoted the way the counter negotiates it — in ratti, against a
+    # base of 96. Six ratti bills 90/96 of the gold weight. It reduces billable
+    # metal rather than the money, which is a different lever from
+    # `line_discount` and has to be visible as its own giveaway in reporting.
+    discount_ratti: Mapped[float] = mapped_column(Numeric(8, 3), default=0, nullable=False)
+    ratti_base: Mapped[int] = mapped_column(Integer, default=96, nullable=False)
     line_total: Mapped[float] = mapped_column(Numeric(14, 2), default=0, nullable=False)

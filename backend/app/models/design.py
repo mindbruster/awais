@@ -36,8 +36,25 @@ class LegStatus(str, enum.Enum):
 
 class LabourBasis(str, enum.Enum):
     per_gram = "per_gram"
+    # Charged on the number of pieces handled: stones set, or items lacquered.
     per_piece = "per_piece"
     flat = "flat"
+
+
+class WastageBasis(str, enum.Enum):
+    """
+    How the metal a worker may keep is agreed.
+
+    Two conventions are in use and they are not interchangeable. Casting and
+    goldsmithing agree a percentage of the weight issued. Setting agrees a
+    weight per hundred stones — a setter handling 350 small stones loses metal
+    in proportion to how many he sets, not to how heavy the piece is, so a
+    percentage would under-charge a light piece with many stones and
+    over-charge a heavy one with few.
+    """
+
+    percent_of_issued = "percent_of_issued"
+    per_100_pieces = "per_100_pieces"
 
 
 class Design(Base, TimestampMixin):
@@ -156,7 +173,23 @@ class JobLeg(Base, TimestampMixin):
     stones_used_ct: Mapped[float] = mapped_column(Numeric(14, 4), nullable=False, default=0)
     stones_returned_ct: Mapped[float] = mapped_column(Numeric(14, 4), nullable=False, default=0)
 
+    # How many pieces this leg covers — stones to be set, items to be lacquered.
+    # Drives both the per-piece charge and, where the department works that way,
+    # the wastage allowance.
+    piece_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
     # --- wastage settlement ---
+    # Which convention this leg was agreed under, snapshotted alongside the
+    # figures so a department switching conventions later cannot change how an
+    # old leg is judged.
+    wastage_basis: Mapped[WastageBasis] = mapped_column(
+        Enum(WastageBasis, name="wastage_basis"),
+        nullable=False,
+        default=WastageBasis.percent_of_issued,
+    )
+    # Grams the worker may keep per hundred pieces handled. Used when
+    # wastage_basis is per_100_pieces; the shop states it as e.g. 0.400g/100.
+    wastage_per_100_pcs_g: Mapped[float | None] = mapped_column(Numeric(14, 4))
     # The allowance agreed with this worker, snapshotted when the material went
     # out. Terms get renegotiated; a leg must be judged against the deal that
     # was in force when the metal left the safe, not today's.

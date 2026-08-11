@@ -12,6 +12,7 @@ from app.models.design import (
     LabourBasis,
     LegStatus,
     LegStone,
+    WastageBasis,
 )
 from app.models.journal import Commodity, JournalEntry, JournalLine, PartyType
 from app.models.gold_rate import GoldRate

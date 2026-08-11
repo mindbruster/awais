@@ -3,7 +3,7 @@ from decimal import Decimal
 
 from pydantic import BaseModel, Field
 
-from app.models.design import DesignStatus, LabourBasis, LegStatus
+from app.models.design import DesignStatus, LabourBasis, LegStatus, WastageBasis
 from app.schemas.common import ORMModel, TimestampedRead
 
 
@@ -29,6 +29,16 @@ class LegStoneIssue(BaseModel):
 
 
 class LegIssue(BaseModel):
+    """
+    What goes out to a department, and on what terms.
+
+    The three settlement fields are `None` rather than zero when omitted so the
+    router can tell "the counter didn't state it, use the department's standing
+    terms" from "the counter deliberately said none". A shop issuing to setting
+    twenty times a day must not have to retype 0.400g/100 and Rs 5 a stone, but
+    an explicit zero has to survive as a zero.
+    """
+
     department_id: int
     worker_id: int
     gold_issued_g: Decimal = Field(gt=0)
@@ -36,8 +46,12 @@ class LegIssue(BaseModel):
     gold_source_inventory_id: int
     stones: list[LegStoneIssue] = Field(default_factory=list)
     stone_source_inventory_id: int | None = None
+    # Pieces this leg covers — stones to be set, items to be lacquered.
+    piece_count: int | None = Field(default=None, ge=0)
+    wastage_basis: WastageBasis | None = None
+    wastage_per_100_pcs_g: Decimal | None = Field(default=None, ge=0)
     labour_basis: LabourBasis = LabourBasis.per_gram
-    labour_rate: Decimal = Field(default=Decimal("0"), ge=0)
+    labour_rate: Decimal | None = Field(default=None, ge=0)
     notes: str | None = None
 
 
@@ -101,6 +115,12 @@ class JobLegRead(TimestampedRead):
     gold_received_g: Decimal
     stones_used_ct: Decimal
     stones_returned_ct: Decimal
+    piece_count: int
+    # Both settlement terms travel with the leg, not with the department, so a
+    # client can show how the allowance below was arrived at long after the
+    # department has been retuned.
+    wastage_basis: WastageBasis
+    wastage_per_100_pcs_g: Decimal | None = None
     wastage_allowed_pct: Decimal | None = None
     wastage_allowed_g: Decimal
     wastage_actual_g: Decimal
@@ -154,6 +174,9 @@ class TraceHop(ORMModel):
     gold_in_g: Decimal
     gold_purity: int | None = None
     gold_out_g: Decimal
+    piece_count: int
+    wastage_basis: WastageBasis
+    wastage_per_100_pcs_g: Decimal | None = None
     wastage_allowed_pct: Decimal | None = None
     wastage_allowed_g: Decimal
     wastage_actual_g: Decimal
@@ -171,6 +194,10 @@ class TraceHop(ORMModel):
 class TraceTotals(ORMModel):
     hops: int
     open_hops: int
+    # Stones set and items lacquered across the piece's route. Kept as a count,
+    # not a weight: it is what the per-piece charges and the per-100 wastage
+    # allowances were worked out from.
+    pieces: int
     gold_issued_g: Decimal
     gold_received_g: Decimal
     wastage_allowed_g: Decimal

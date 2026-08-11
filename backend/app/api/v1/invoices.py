@@ -15,7 +15,7 @@ from app.models.stock_movement import MovementType
 from app.schemas.invoice import InvoiceCreate, InvoiceRead
 from app.services.audit import log_action
 from app.services.inventory import post_movement
-from app.services.pricing import invoice_totals, price_line
+from app.services.pricing import DEFAULT_RATTI_BASE, invoice_totals, price_line
 from app.services.gold_rate import rate_in_force
 from app.services.serial import next_invoice_no
 from app.services.whatsapp import render_invoice_message, send_text
@@ -71,6 +71,14 @@ def _recompute(invoice: Invoice) -> None:
             stone_rate_per_ct=Decimal(str(it.stone_rate_per_ct)),
             labor_amount=Decimal(str(it.labor_amount)),
             line_discount=Decimal(str(it.line_discount or 0)),
+            discount_ratti=Decimal(str(it.discount_ratti or 0)),
+            # Rows predating the column carry NULL/0; fall back to the customary
+            # base rather than dividing by zero.
+            ratti_base=int(it.ratti_base or DEFAULT_RATTI_BASE),
+            # Stock deduction and the profit report both scale by quantity, so
+            # pricing must too — otherwise a multi-unit line ships and costs N
+            # pieces while billing for one.
+            quantity=it.quantity or 1,
         )
         it.gold_amount = gold_amount
         it.stone_amount = stone_amount

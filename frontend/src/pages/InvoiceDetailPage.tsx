@@ -19,6 +19,11 @@ interface InvoiceItem {
   stone_amount: string;
   labor_amount: string;
   line_discount: string;
+  discount_ratti: string;
+  ratti_base: number;
+  // Server-derived (weight / base * (base - ratti)) — never recomputed here, so
+  // the printed document can only ever agree with what was billed.
+  billable_gold_weight_g: string;
   line_total: string;
 }
 
@@ -233,7 +238,9 @@ export function InvoiceDetailPage() {
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-100">
-            {invoice.items.map((it) => (
+            {invoice.items.map((it) => {
+              const ratti = Number(it.discount_ratti) > 0;
+              return (
               <tr key={it.id}>
                 <td className="py-2">
                   {it.description}
@@ -242,9 +249,27 @@ export function InvoiceDetailPage() {
                       {it.gold_purity}k @ {fmtMoney(it.gold_rate_per_g, invoice.currency)}/g · gold {fmtMoney(it.gold_amount, invoice.currency)} · stone {fmtMoney(it.stone_amount, invoice.currency)}
                     </div>
                   ) : null}
+                  {/* Spelled out on the customer's copy: the gold amount above
+                      is charged on less metal than the piece contains, and the
+                      document has to say so on its own. */}
+                  {ratti && (
+                    <div className="text-xs text-amber-700">
+                      Ratti discount {it.discount_ratti} / {it.ratti_base} — billed on{" "}
+                      {it.billable_gold_weight_g} g of {it.gold_weight_g} g
+                    </div>
+                  )}
                 </td>
                 <td className="py-2 text-right">{it.quantity}</td>
-                <td className="py-2 text-right">{it.gold_weight_g}</td>
+                <td className="py-2 text-right">
+                  {ratti ? (
+                    <>
+                      <span className="text-slate-400 line-through">{it.gold_weight_g}</span>{" "}
+                      <span className="font-medium">{it.billable_gold_weight_g}</span>
+                    </>
+                  ) : (
+                    it.gold_weight_g
+                  )}
+                </td>
                 <td className="py-2 text-right">{it.stone_weight_ct}</td>
                 <td className="py-2 text-right">{fmtMoney(it.labor_amount, invoice.currency)}</td>
                 <td className="py-2 text-right text-red-600">
@@ -252,7 +277,8 @@ export function InvoiceDetailPage() {
                 </td>
                 <td className="py-2 text-right font-medium">{fmtMoney(it.line_total, invoice.currency)}</td>
               </tr>
-            ))}
+              );
+            })}
           </tbody>
         </table>
 

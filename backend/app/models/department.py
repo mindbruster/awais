@@ -34,5 +34,17 @@ class Department(Base, TimestampMixin):
     # shop hasn't agreed a departmental norm and the per-worker figure governs.
     default_wastage_pct: Mapped[float | None] = mapped_column(Numeric(6, 3))
 
+    # Setting is agreed per hundred stones rather than as a percentage of
+    # weight, because a setter's loss tracks how many stones he handles, not
+    # how heavy the piece is. Configured here once so the shop floor doesn't
+    # retype it on every job.
+    default_wastage_basis: Mapped[str] = mapped_column(
+        String(20), default="percent_of_issued", nullable=False
+    )
+    default_wastage_per_100_pcs_g: Mapped[float | None] = mapped_column(Numeric(14, 4))
+    # Rupees per piece for departments that charge by the piece — stone setting
+    # at 5 or 10 a stone, lacquering at 500 or 1000 an item.
+    default_rate_per_piece: Mapped[float | None] = mapped_column(Numeric(14, 4))
+
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
     notes: Mapped[str | None] = mapped_column(Text)

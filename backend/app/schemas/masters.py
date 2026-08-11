@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.models.attribute_option import AttributeKind
 from app.models.currency import Currency
+from app.models.design import WastageBasis
 from app.schemas.common import TimestampedRead
 
 
@@ -24,6 +25,15 @@ class DepartmentBase(BaseModel):
     sequence: int = Field(default=0, ge=0)
     consumes_stones: bool = False
     default_wastage_pct: Decimal | None = Field(default=None, ge=0, le=100)
+    # Setting agrees its allowance per hundred stones instead of as a
+    # percentage of weight, so the basis has to be configurable per department
+    # rather than assumed. Percentage is the default because that is what every
+    # worker's own agreed rate is expressed in.
+    default_wastage_basis: WastageBasis = WastageBasis.percent_of_issued
+    default_wastage_per_100_pcs_g: Decimal | None = Field(default=None, ge=0)
+    # Rupees per piece for stages that charge by the piece — stone setting at 5
+    # or 10 a stone, lacquering at 500 or 1000 an item.
+    default_rate_per_piece: Decimal | None = Field(default=None, ge=0)
     is_active: bool = True
     notes: str | None = None
 
@@ -43,6 +53,9 @@ class DepartmentUpdate(BaseModel):
     sequence: int | None = Field(default=None, ge=0)
     consumes_stones: bool | None = None
     default_wastage_pct: Decimal | None = Field(default=None, ge=0, le=100)
+    default_wastage_basis: WastageBasis | None = None
+    default_wastage_per_100_pcs_g: Decimal | None = Field(default=None, ge=0)
+    default_rate_per_piece: Decimal | None = Field(default=None, ge=0)
     is_active: bool | None = None
     notes: str | None = None
 
