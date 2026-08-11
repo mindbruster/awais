@@ -29,6 +29,7 @@ from app.models.customer import Customer
 from app.models.invoice import Invoice, InvoiceStatus
 from app.models.journal import Commodity, JournalEntry, PartyType
 from app.models.payment import Payment, PaymentDirection, PaymentMethod
+from app.models.product import Product
 from app.services.ledger import (
     EntryDraft,
     Posting,
@@ -108,11 +109,18 @@ async def post_invoice_issued(
     db: AsyncSession, invoice: Invoice, *, user_id: int | None = None
 ) -> JournalEntry | None:
     """
-    The customer now owes the shop: debit Customers, credit Sales.
+    The customer now owes the shop, and the pieces leave the shelf.
 
-    Only the invoice total is posted. Relieving the cost of the goods sold
-    belongs to a cost-of-sales head the chart does not carry yet, and inventing
-    one here would put a number in the books that no report can explain.
+    Two movements, one entry. Revenue: debit Customers, credit Sales for the
+    invoice total. Cost: for every line carrying a stocked product, credit 1150
+    Finished Goods by the metal that piece embodies and debit 5400 Cost of
+    Goods Sold by its value. Without the second, 1150 only ever grows — stocking
+    debits it and nothing relieves it — and within a month the books claim the
+    shop is holding every piece it has ever sold.
+
+    The metal is relieved in *fine* grams at the rate locked onto the product
+    when it was stocked, so the credit is exactly the debit that put it there
+    and a piece cannot leave the books worth more or less than it arrived.
 
     Returns None for a zero-value invoice — an entry with nothing on it is not
     a record of anything, and `post_entry` refuses empty drafts anyway.
@@ -143,6 +151,39 @@ async def post_invoice_issued(
             memo=f"Invoice {invoice.invoice_no}",
         )
     )
+
+    for item in invoice.items:
+        if item.product_id is None:
+            continue
+        product = await db.get(Product, item.product_id)
+        # Only pieces that were actually stocked carry a locked rate. A line
+        # against a product that never went through the stock form has nothing
+        # sitting in 1150 to relieve, so relieving it would invent a balance.
+        if product is None or product.gold_rate_at_cost is None:
+            continue
+        fine = fine_grams(product.gold_weight_g, product.gold_purity) * (item.quantity or 1)
+        if fine <= 0:
+            continue
+        rate = d(product.gold_rate_at_cost)
+        draft.add(
+            Posting(
+                account_code=SystemAccount.FINISHED_GOODS.value,
+                quantity=-fine,
+                commodity=Commodity.GOLD,
+                rate=rate,
+                native_weight_g=-d(product.gold_weight_g) * (item.quantity or 1),
+                native_purity=product.gold_purity,
+                memo=f"{product.serial_no} sold",
+            )
+        )
+        draft.add(
+            Posting(
+                account_code=SystemAccount.COST_OF_GOODS_SOLD.value,
+                quantity=(fine * rate).quantize(_PKR),
+                memo=f"{product.serial_no} on {invoice.invoice_no}",
+            )
+        )
+
     return await post_entry(db, draft, user_id=user_id)
 
 

@@ -34,6 +34,7 @@ class SystemAccount(str, enum.Enum):
     WASTAGE_RECOVERED = "4200"
     LABOUR_COST = "5100"
     WASTAGE_EXPENSE = "5200"
+    COST_OF_GOODS_SOLD = "5400"
     OTHER_EXPENSES = "5300"
 
 

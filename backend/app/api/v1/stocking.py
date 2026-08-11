@@ -44,6 +44,13 @@ from app.services.routing import current_gold_rate
 from app.services.serial import next_product_serial
 from app.services.stocking import Rollup, StoneUse, Weights
 
+async def _get_inventory(db: DbSession, item_id: int) -> InventoryItem:
+    item = await db.get(InventoryItem, item_id)
+    if item is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Inventory item #{item_id} not found")
+    return item
+
+
 router = APIRouter()
 read = Depends(require_perm("design:read"))
 write = Depends(require_perm("design:write"))
@@ -360,6 +367,27 @@ async def stock_design(
         notes=f"{design.design_no} stocked as {product.serial_no}",
         user_id=current.id,
     )
+
+    # The metal is now on the shelf as a finished piece, so it has to leave the
+    # pot it came back into. Every leg receive credited the raw-gold source, so
+    # without this the same grams sit in raw_gold *and* in finished_product and
+    # the stock report counts the shop's gold twice. The ledger already makes
+    # this move (1130 -> 1150); this is its counterpart in the stock ledger.
+    source_leg = next(
+        (leg for leg in reversed(design.legs) if leg.gold_source_inventory_id is not None),
+        None,
+    )
+    if source_leg is not None and weights.net_metal_g > 0:
+        await post_movement(
+            db,
+            item=await _get_inventory(db, source_leg.gold_source_inventory_id),
+            type=MovementType.manufacturing_out,
+            weight_g_delta=-weights.net_metal_g,
+            reference_type=stocking.SOURCE_TYPE,
+            reference_id=product.id,
+            notes=f"{design.design_no} metal moved into finished goods as {product.serial_no}",
+            user_id=current.id,
+        )
 
     entry = await stocking.post_stocking(
         db,

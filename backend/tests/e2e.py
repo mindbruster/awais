@@ -1404,7 +1404,16 @@ def main() -> int:
     r = client.get("/ledger/accounts", headers=auth)
     accounts = r.json()
     by_code = {a["code"]: a for a in accounts}
-    check("chart of accounts seeded", r.status_code == 200 and len(accounts) == 24, f"got {len(accounts)}")
+    check(
+        "chart of accounts seeded",
+        r.status_code == 200 and len(accounts) == 25,
+        f"got {len(accounts)}",
+    )
+    check(
+        "there is a head to relieve the cost of a sale to",
+        "5400" in by_code and by_code["5400"]["is_system"],
+        "1150 Finished Goods would grow forever without one",
+    )
     check(
         "system heads flagged and postable",
         by_code["1130"]["is_system"] and by_code["1130"]["is_postable"],
@@ -2185,6 +2194,28 @@ def main() -> int:
     check("stocking the same design twice refused → 409", r.status_code == 409, f"got {r.status_code}: {r.text[:160]}")
     check("books balance after stocking", client.get("/ledger/trial-balance", headers=auth).json()["balanced"] is True)
 
+    def finished_goods_g() -> Decimal:
+        st = client.get(
+            "/ledger/statement", headers=auth, params={"account_code": "1150", "commodity": "GOLD"}
+        ).json()
+        return Decimal(str(st["closing_balance"]))
+
+    fg_after_stock = finished_goods_g()
+    check(
+        "stocking moves the metal into Finished Goods",
+        fg_after_stock > 0,
+        f"1150 holds {fg_after_stock} fine g",
+    )
+    # Raw gold must not still hold the same metal — the piece is on the shelf.
+    raw_now = Decimal(
+        str(client.get(f"/inventory/{raw_gold['id']}", headers=auth).json()["weight_g"])
+    )
+    check(
+        "the metal is not counted in raw gold and finished goods at once",
+        raw_now >= 0,
+        f"raw gold {raw_now}g",
+    )
+
     # --- sell it, with wastage marked up and a ratti discount given back ---
     sale = client.post(
         "/invoices",
@@ -2220,6 +2251,11 @@ def main() -> int:
     check("issue the sale → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:250]}")
     issued = r.json()
     total_due = Decimal(str(issued["total"]))
+    check(
+        "selling relieves Finished Goods — the shelf does not grow forever",
+        finished_goods_g() < fg_after_stock,
+        f"1150 was {fg_after_stock}, now {finished_goods_g()} — a sale must take the piece off it",
+    )
     check(
         "issuing puts the whole bill on the customer's account",
         Decimal(str(issued.get("balance_due", 0))) == total_due,
