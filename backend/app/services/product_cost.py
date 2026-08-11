@@ -53,7 +53,13 @@ async def recompute_material_cost(
             else await _current_gold_rate_pkr(db)
         )
     )
-    if product.gold_rate_at_cost is None:
+    # Only lock a rate that means something. Locking a zero — which is what
+    # `_current_gold_rate_pkr` returns before the shop has entered its first
+    # rate — freezes the piece at no cost *forever*, because every later pass
+    # sees a non-NULL value and reuses it. The piece then shows infinite margin
+    # on every report it appears in. Leaving it NULL lets the next recompute,
+    # once a rate exists, lock a real one.
+    if product.gold_rate_at_cost is None and rate > 0:
         product.gold_rate_at_cost = rate
 
     purity_factor = (

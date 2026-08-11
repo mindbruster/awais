@@ -1217,6 +1217,12 @@ def main() -> int:
         and Decimal(str(d7_row["weight_g"])) == Decimal("0"),
         str(d7_row),
     )
+    # Void it now it has proved its point. The line deliberately bills a weight
+    # the piece does not have, which is exactly what the margin report reports
+    # as unattributable — leaving it behind makes every margin figure on the dev
+    # database look broken for a reason that is only ever true in this test.
+    r = client.post(f"/invoices/{d7_inv['id']}/void", headers=pwd_h)
+    check("void the deliberately mismatched D7 invoice", r.status_code == 200, f"got {r.status_code}: {r.text[:160]}")
 
     # ----- MASTER DATA (phase 2) -----
     section("Master data")
@@ -2225,11 +2231,16 @@ def main() -> int:
             "sale_type": "normal",
             "currency": "PKR",
             "bill_book_no": "BB-4471",
+            # Bill the weight the piece actually holds. A line that bills a
+            # different weight from the product it points at is legal but
+            # incoherent, and the margin report correctly reports the whole
+            # difference as unattributable — which is right, and which would
+            # make every margin figure on the dev database look broken.
             "items": [{
                 "product_id": stocked_product_id,
                 "description": "Setting Taka",
                 "quantity": 1,
-                "gold_weight_g": "10",
+                "gold_weight_g": "48.2",
                 "gold_purity": 22,
                 "sale_wastage_pct": "10",
                 "discount_ratti": "6",
@@ -2238,12 +2249,13 @@ def main() -> int:
     )
     check("create the sale → 201", sale.status_code == 201, f"got {sale.status_code}: {sale.text[:250]}")
     sale = sale.json()
-    # 10g +10% wastage = 11g, then 6 ratti off = 11 * 90/96 = 10.3125g billable.
+    # 48.2g +10% wastage = 53.02g, then 6 ratti off = 53.02 * 90/96 = 49.7063g.
+    billable = (Decimal("48.2") * Decimal("1.10") / 96 * 90).quantize(Decimal("0.0001"))
     check(
         "wastage marks up and ratti discounts down, in that order",
         Decimal(str(sale["items"][0]["gold_amount"]))
-        == (Decimal("10.3125") * Decimal("22") / Decimal("24") * day_rate).quantize(Decimal("0.01")),
-        f"got {sale['items'][0]['gold_amount']} — expected pricing on 10.3125 g",
+        == (billable * Decimal("22") / Decimal("24") * day_rate).quantize(Decimal("0.01")),
+        f"got {sale['items'][0]['gold_amount']} — expected pricing on {billable} g",
     )
     check("bill book number kept for reconciliation", sale["bill_book_no"] == "BB-4471")
 
@@ -2251,6 +2263,15 @@ def main() -> int:
     check("issue the sale → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:250]}")
     issued = r.json()
     total_due = Decimal(str(issued["total"]))
+    # Only pieces that went through the stock form were ever debited to 1150.
+    # Relieving anything else drives it negative, which is the books claiming
+    # the shop shipped stock it never held.
+    check(
+        "Finished Goods never goes negative",
+        finished_goods_g() >= 0,
+        f"1150 holds {finished_goods_g()} fine g — a negative balance means a piece was "
+        "relieved that was never stocked",
+    )
     check(
         "selling relieves Finished Goods — the shelf does not grow forever",
         finished_goods_g() < fg_after_stock,
@@ -2472,6 +2493,86 @@ def main() -> int:
         avail_after == avail_before,
         f"available went {avail_before} -> {avail_after}; a cancelled leg must not read as consumption",
     )
+
+    # ----- REPORTS (phase 7) -----
+    section("Reports")
+
+    m = client.get("/reports/margin", headers=auth, params={"date_from": "2020-01-01", "date_to": "2030-01-01"})
+    check("margin report → 200", m.status_code == 200, f"got {m.status_code}: {m.text[:200]}")
+    total = m.json()["total"]
+
+    # The decomposition must reconcile. Everything the shop earned, less
+    # everything it gave away, has to equal the gross profit — otherwise a lever
+    # is being mis-attributed and the owner is reading a story that isn't true.
+    attributed = (
+        Decimal(str(total["rate_spread"]))
+        + Decimal(str(total["wastage_charged"]))
+        + Decimal(str(total["making_charges"]))
+        + Decimal(str(total["stone_margin"]))
+        + Decimal(str(total["uncosted_metal"]))
+        - Decimal(str(total["ratti_discount"]))
+        - Decimal(str(total["cash_discount"]))
+        - Decimal(str(total["round_off"]))
+        - Decimal(str(total["making_cost"]))
+    )
+    check(
+        "the levers add up to gross profit",
+        abs(attributed - Decimal(str(total["gross_profit"]))) <= Decimal("0.05") * max(total["lines"], 1),
+        f"levers {attributed} vs gross {total['gross_profit']}",
+    )
+    check(
+        "wastage charged to customers is reported as its own lever",
+        Decimal(str(total["wastage_charged"])) > 0,
+        "the sale carried 10% wastage, so it must show as margin from wastage",
+    )
+    check(
+        "the ratti discount is reported as a giveaway, not netted away",
+        Decimal(str(total["ratti_discount"])) > 0,
+        "6 ratti was given on the sale",
+    )
+    check(
+        "metal sold with no recorded cost is named, not buried in a residual",
+        Decimal(str(total["uncosted_metal"])) > 0 and any("no matching recorded cost" in n for n in total["notes"]),
+        f"uncosted {total['uncosted_metal']}, notes {total['notes']}",
+    )
+
+    # Margin and the older profit report must agree, or two screens tell the
+    # owner two different numbers for the same month.
+    pr = client.get("/reports/profit", headers=auth).json()
+    pkr = next((c for c in pr["by_currency"] if c["currency"] == "PKR"), None)
+    check(
+        "margin and profit reports agree on the same window",
+        pkr and Decimal(str(pkr["profit"])) == Decimal(str(total["gross_profit"])),
+        f"profit {pkr and pkr['profit']} vs margin {total['gross_profit']}",
+    )
+
+    r = client.get("/reports/manufacturing-loss", headers=auth)
+    loss = r.json()
+    check(
+        "the loss report sees the routing engine, not just the retired model",
+        r.status_code == 200 and loss["legs"] > 0 and Decimal(str(loss["overall_excess_g"])) > 0,
+        f"legs={loss.get('legs')} excess={loss.get('overall_excess_g')} — it read manufacturing_jobs before",
+    )
+
+    r = client.get("/reports/worker-performance", headers=auth, params={"days": 90})
+    check("worker performance → 200", r.status_code == 200, f"got {r.status_code}")
+    zahid = next((w for w in r.json()["rows"] if w["worker_name"] == "Zahid Bhai"), None)
+    check(
+        "a worker's outstanding metal comes off the ledger",
+        zahid and Decimal(str(zahid["gold_balance_fine_g"])) > 0,
+        f"{zahid and zahid['gold_balance_fine_g']} fine g — read from journal lines, not a column",
+    )
+
+    for path in ("margin", "worker-performance", "item-performance", "department-throughput", "gold-movement"):
+        r = client.get(f"/reports/{path}", headers=auth, params={"format": "csv"})
+        check(
+            f"{path} exports CSV",
+            r.status_code == 200 and "text/csv" in r.headers.get("content-type", ""),
+            f"got {r.status_code} {r.headers.get('content-type')}",
+        )
+
+    r = client.get("/reports/margin", headers=staff_auth)
+    check("staff cannot read the margin report → 403", r.status_code == 403, f"got {r.status_code}")
 
     # ----- INTERNAL INVARIANTS -----
     section("Internal invariants")

@@ -157,10 +157,15 @@ async def post_invoice_issued(
         if item.product_id is None:
             continue
         product = await db.get(Product, item.product_id)
-        # Only pieces that were actually stocked carry a locked rate. A line
-        # against a product that never went through the stock form has nothing
-        # sitting in 1150 to relieve, so relieving it would invent a balance.
-        if product is None or product.gold_rate_at_cost is None:
+        # `stocked_at` is the gate, not `gold_rate_at_cost`. Only the stock form
+        # debits 1150, and it is the only thing that sets `stocked_at`. Pieces
+        # from the legacy manufacturing-complete path also carry a cost rate —
+        # the costing service sets one on any product it touches — but nothing
+        # ever put them into Finished Goods, so relieving them credits an
+        # account they were never in and drives it negative. A negative
+        # finished-goods balance is the books claiming the shop has shipped
+        # stock it never held.
+        if product is None or product.stocked_at is None or product.gold_rate_at_cost is None:
             continue
         fine = fine_grams(product.gold_weight_g, product.gold_purity) * (item.quantity or 1)
         if fine <= 0:
