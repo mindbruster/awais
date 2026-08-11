@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import func, select, text
+from sqlalchemy import Integer, cast, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.invoice import Invoice
@@ -20,6 +20,11 @@ async def _next_for_year(db: AsyncSession, model, column, prefix: str) -> str:
     Generates `<prefix>-<YY>-<NNNNN>`. Serialised across concurrent transactions
     via a Postgres transaction-scoped advisory lock keyed by prefix, so two
     requests can't mint the same number.
+
+    The next value comes from the highest suffix in use, not from a row count.
+    Counting breaks as soon as anything is deleted: remove P-26-00003 from five
+    products and the count is 4, so the next mint collides with the existing
+    P-26-00005 and fails the unique constraint.
     """
     lock_key = _LOCK_KEYS.get(prefix)
     if lock_key is None:
@@ -28,10 +33,19 @@ async def _next_for_year(db: AsyncSession, model, column, prefix: str) -> str:
 
     year = datetime.now(timezone.utc).strftime("%y")
     pat = f"{prefix}-{year}-%"
-    count = (
-        await db.execute(select(func.count()).select_from(model).where(column.like(pat)))
+    highest = (
+        await db.execute(
+            select(
+                func.coalesce(
+                    func.max(cast(func.substring(column, r"(\d+)$"), Integer)),
+                    0,
+                )
+            )
+            .select_from(model)
+            .where(column.like(pat))
+        )
     ).scalar_one()
-    return f"{prefix}-{year}-{count + 1:05d}"
+    return f"{prefix}-{year}-{int(highest) + 1:05d}"
 
 
 async def next_product_serial(db: AsyncSession) -> str:

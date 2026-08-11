@@ -27,6 +27,8 @@ class AssignKarigar(BaseModel):
 
 
 class ReceiveFromKarigar(BaseModel):
+    # May legitimately exceed the assigned weight — karigars add solder, alloy
+    # and findings during working, so the piece often comes back heavier.
     jewelry_received_g: Decimal = Field(gt=0)
     notes: str | None = None
 
@@ -51,8 +53,25 @@ class AssignPolish(BaseModel):
 
 
 class ReceiveFromPolish(BaseModel):
+    # Polishing normally removes metal, but rhodium/plating can add a little,
+    # so a gain is allowed here too and recorded as a negative loss.
     weight_after_polish_g: Decimal = Field(gt=0)
     notes: str | None = None
+
+
+class CancelJob(BaseModel):
+    """
+    Cancel a job and settle the material that was issued against it.
+
+    Whatever the shop physically gets back is credited to the source inventory
+    rows; the remainder is written off on the job and stays outstanding against
+    the worker. Both default to zero so that omitting them can never invent
+    stock that isn't there.
+    """
+
+    gold_recovered_g: Decimal = Field(default=Decimal("0"), ge=0)
+    stones_recovered_ct: Decimal = Field(default=Decimal("0"), ge=0)
+    reason: str = Field(min_length=1, max_length=500)
 
 
 class CompleteJob(BaseModel):
@@ -92,4 +111,9 @@ class ManufacturingJobRead(TimestampedRead):
     polish_cost: Decimal
     other_cost: Decimal
     product_id: int | None = None
+    gold_source_inventory_id: int | None = None
+    stone_source_inventory_id: int | None = None
+    gold_written_off_g: Decimal
+    stones_written_off_ct: Decimal
+    cancel_reason: str | None = None
     notes: str | None = None

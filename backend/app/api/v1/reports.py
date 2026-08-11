@@ -181,9 +181,17 @@ async def profit_report(
     range_to: datetime | None = Query(default=None),
 ) -> ProfitReport:
     """
-    Per-invoice profit = invoice.total - SUM(product.total_cost × line.quantity).
-    Excludes draft and void invoices. Material value is *not* counted as cost
-    (it's tracked via inventory and stock movements).
+    Per-invoice profit = revenue − cost of goods sold, excluding draft and void
+    invoices.
+
+    COGS is the full cost of the piece: making (`product.total_cost` — karigar,
+    stone fixing, polish and other) *plus* material (`product.material_cost` —
+    the capitalised gold and stones), weighted by line quantity. Both are
+    snapshots taken when the job completed, so this figure is stable over time.
+
+    Inventory and stock movements track the same material in *weight* terms;
+    counting it here in *value* terms is not a double count, and omitting it
+    would overstate profit by the entire value of the gold.
     """
     # Cost of goods sold per invoice = labor (product.total_cost) + material
     # (product.material_cost) summed across line items, weighted by quantity.

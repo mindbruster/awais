@@ -41,3 +41,6 @@ class ProductUpdate(BaseModel):
 
 class ProductRead(TimestampedRead, ProductBase):
     stones: list[ProductStoneRead] = Field(default_factory=list)
+    # Read-only: locked by the costing service on the first pass, never set by
+    # the caller. Exposed so the UI can show what rate a piece was costed at.
+    gold_rate_at_cost: Decimal | None = None

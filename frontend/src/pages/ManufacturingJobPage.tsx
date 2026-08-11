@@ -289,6 +289,9 @@ function ActionPanel(props: {
 }) {
   const { job, karigars, fixers, polishers, rawGold, rawStones, reload } = props;
   const [askCancel, setAskCancel] = useState(false);
+  const [cancelGold, setCancelGold] = useState("");
+  const [cancelStones, setCancelStones] = useState("");
+  const [cancelReason, setCancelReason] = useState("");
 
   const post = async (path: string, body: unknown, msg: string) => {
     try {
@@ -330,15 +333,34 @@ function ActionPanel(props: {
     });
   };
 
+  // Material issued against a job is only credited back when it completes, so
+  // cancelling has to say what came back. Anything not recovered is written off
+  // and stays outstanding against the worker.
+  const goldOutstanding = Number(job.gold_assigned_g ?? 0);
+  const stonesOutstanding =
+    Number(job.stones_assigned_ct ?? 0) - Number(job.stones_returned_ct ?? 0);
+  const writeOffGold = Math.max(0, goldOutstanding - Number(cancelGold || 0));
+  const cancelValid =
+    cancelReason.trim().length > 0 &&
+    Number(cancelGold || 0) <= goldOutstanding &&
+    Number(cancelStones || 0) <= stonesOutstanding;
+
   const confirmCancel = async (password: string) => {
     try {
       await api.post(
         `/manufacturing/${job.id}/cancel`,
-        {},
+        {
+          gold_recovered_g: cancelGold || "0",
+          stones_recovered_ct: cancelStones || "0",
+          reason: cancelReason.trim(),
+        },
         { headers: { "X-Confirm-Password": password } },
       );
       toast("success", "Job cancelled");
       setAskCancel(false);
+      setCancelGold("");
+      setCancelStones("");
+      setCancelReason("");
       reload();
     } catch (err) {
       toast("error", apiError(err, "Cancel failed"));
@@ -448,8 +470,51 @@ function ActionPanel(props: {
         open={askCancel}
         onClose={() => setAskCancel(false)}
         title={`Cancel job ${job.job_no}?`}
-        description="This is irreversible. Stock movements already posted (e.g. gold to karigar) will remain in the ledger and the loss will need a manual return entry. Confirm with your password."
+        description={
+          `This is irreversible. ${goldOutstanding} g of gold` +
+          (stonesOutstanding > 0 ? ` and ${stonesOutstanding} ct of stones` : "") +
+          " went out on this job. Enter what you are getting back — anything you don't stays outstanding against the worker."
+        }
         confirmLabel="Cancel job"
+        extraValid={cancelValid}
+        extra={
+          <div className="space-y-3">
+            <div className="grid grid-cols-2 gap-3">
+              <TextField
+                label={`Gold recovered (g) — max ${goldOutstanding}`}
+                type="number"
+                step="0.0001"
+                min="0"
+                max={goldOutstanding}
+                value={cancelGold}
+                onChange={(e) => setCancelGold(e.target.value)}
+              />
+              <TextField
+                label={`Stones recovered (ct) — max ${stonesOutstanding}`}
+                type="number"
+                step="0.0001"
+                min="0"
+                max={stonesOutstanding}
+                disabled={stonesOutstanding <= 0}
+                value={cancelStones}
+                onChange={(e) => setCancelStones(e.target.value)}
+              />
+            </div>
+            <TextField
+              label="Reason"
+              required
+              placeholder="e.g. karigar returned partial, kept 3g"
+              value={cancelReason}
+              onChange={(e) => setCancelReason(e.target.value)}
+            />
+            {writeOffGold > 0 && (
+              <p className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                {writeOffGold.toFixed(4)} g will be written off and remain outstanding
+                against this worker.
+              </p>
+            )}
+          </div>
+        }
         onConfirm={confirmCancel}
       />
       <PasswordConfirm

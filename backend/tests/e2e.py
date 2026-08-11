@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 import sys
+from datetime import date
 from decimal import Decimal
 
 import httpx
@@ -317,6 +318,14 @@ def main() -> int:
     )
     check("receive stones", r.status_code == 200 and Decimal(str(r.json()["stones_used_ct"])) == Decimal("1.8"))
 
+    # D1 — the 0.2ct handed back must return to stock. 18 + 0.2 = 18.2.
+    r = client.get(f"/inventory/{raw_stones['id']}", headers=auth)
+    check(
+        "returned stones credited back to inventory (D1)",
+        Decimal(str(r.json()["weight_ct"])) == Decimal("18.2"),
+        f"got {r.json()['weight_ct']}ct, expected 18.2",
+    )
+
     # Assign polish
     r = client.post(
         f"/manufacturing/{job['id']}/assign-polish",
@@ -374,8 +383,8 @@ def main() -> int:
     ledger = r.json()
     job_movements = [m for m in ledger if m.get("reference_type") == "manufacturing_job" and m.get("reference_id") == job["id"]]
     check(
-        "ledger has 3 entries for job (gold out, stones out, finished in)",
-        len(job_movements) == 3,
+        "ledger has 4 entries for job (gold out, stones out, stones returned, finished in)",
+        len(job_movements) == 4,
         f"got {len(job_movements)}",
     )
 
@@ -969,6 +978,233 @@ def main() -> int:
             == (Decimal(str(b["revenue"])) - Decimal(str(b["making_cost"]))).quantize(Decimal("0.01"))
             for b in pr["by_currency"]
         ),
+    )
+
+    # ----- PHASE 1 CORRECTNESS FIXES (D2-D7) -----
+    # D1 is covered inline in the manufacturing pipeline section above.
+    section("Phase 1 correctness fixes")
+
+    # --- D2: cancelling a job must not destroy the material issued to it ---
+    inv_before = Decimal(str(client.get(f"/inventory/{raw_gold['id']}", headers=auth).json()["weight_g"]))
+    cancel_job = client.post("/manufacturing", headers=auth, json={"notes": "cancel test"}).json()
+    client.post(
+        f"/manufacturing/{cancel_job['id']}/assign-karigar",
+        headers=auth,
+        json={
+            "karigar_id": karigar["id"],
+            "gold_assigned_g": "10",
+            "gold_assigned_purity": 22,
+            "gold_source_inventory_id": raw_gold["id"],
+        },
+    )
+    inv_after_assign = Decimal(str(client.get(f"/inventory/{raw_gold['id']}", headers=auth).json()["weight_g"]))
+    check("cancel test: 10g issued", inv_before - inv_after_assign == Decimal("10"))
+
+    r = client.post(f"/manufacturing/{cancel_job['id']}/cancel", headers=auth, json={"reason": "no password"})
+    check("cancel without password → 401 (D2)", r.status_code == 401, f"got {r.status_code}")
+
+    r = client.post(
+        f"/manufacturing/{cancel_job['id']}/cancel",
+        headers=pwd_h,
+        json={"gold_recovered_g": "999", "reason": "over-recovery"},
+    )
+    check("cancel recovering more than outstanding → 400 (D2)", r.status_code == 400, f"got {r.status_code}")
+
+    # Recover 7 of the 10g; the remaining 3g stays outstanding against the karigar.
+    r = client.post(
+        f"/manufacturing/{cancel_job['id']}/cancel",
+        headers=pwd_h,
+        json={"gold_recovered_g": "7", "reason": "karigar returned partial, kept 3g"},
+    )
+    check("cancel with partial recovery → 200 (D2)", r.status_code == 200, f"got {r.status_code}")
+    cancelled = r.json()
+    check("cancelled stage", cancelled["stage"] == "cancelled")
+    check(
+        "unrecovered gold written off, not vanished (D2)",
+        Decimal(str(cancelled["gold_written_off_g"])) == Decimal("3"),
+        f"got {cancelled['gold_written_off_g']}",
+    )
+    check("cancel reason recorded (D2)", cancelled["cancel_reason"] is not None)
+    inv_after_cancel = Decimal(str(client.get(f"/inventory/{raw_gold['id']}", headers=auth).json()["weight_g"]))
+    check(
+        "recovered gold returned to stock (D2)",
+        inv_after_cancel - inv_after_assign == Decimal("7"),
+        f"expected +7g, got +{inv_after_cancel - inv_after_assign}g",
+    )
+    r = client.post(f"/manufacturing/{cancel_job['id']}/cancel", headers=pwd_h, json={"reason": "again"})
+    check("re-cancel blocked → 409", r.status_code == 409, f"got {r.status_code}")
+
+    # --- D3: attaching a stone must not re-price the product's gold ---
+    d3_job = client.post("/manufacturing", headers=auth, json={"notes": "rate lock test"}).json()
+    client.post(
+        f"/manufacturing/{d3_job['id']}/assign-karigar",
+        headers=auth,
+        json={
+            "karigar_id": karigar["id"],
+            "gold_assigned_g": "10",
+            "gold_assigned_purity": 22,
+            "gold_source_inventory_id": raw_gold["id"],
+        },
+    )
+    client.post(f"/manufacturing/{d3_job['id']}/receive-karigar", headers=auth, json={"jewelry_received_g": "10"})
+    d3_prod_id = client.post(
+        f"/manufacturing/{d3_job['id']}/complete",
+        headers=pwd_h,
+        json={"product_name": "Rate Lock Ring", "category": "ring"},
+    ).json()["product_id"]
+
+    d3_before = client.get(f"/products/{d3_prod_id}", headers=auth).json()
+    locked_rate = d3_before.get("gold_rate_at_cost")
+    material_before = Decimal(str(d3_before["material_cost"]))
+    check("gold rate locked on product at completion (D3)", locked_rate is not None, str(locked_rate))
+
+    # Move the market: publish a much higher rate for today.
+    client.post(
+        "/gold-rates",
+        headers=auth,
+        json={"rate_date": date.today().isoformat(), "currency": "PKR", "rate_per_g": "99999", "purity": 24},
+    )
+    # Attaching a stone recomputes material_cost — the stone must be added, but
+    # the gold underneath must stay valued at the locked rate.
+    stone_id = client.get("/stones", headers=auth).json()[0]["id"]
+    r = client.post(
+        f"/products/{d3_prod_id}/stones",
+        headers=auth,
+        json={"stone_id": stone_id, "quantity": 1, "weight_ct": "1", "rate_per_ct": "100"},
+    )
+    check("attach stone for rate-lock test → 201", r.status_code == 201, f"got {r.status_code}")
+    d3_after = client.get(f"/products/{d3_prod_id}", headers=auth).json()
+    check(
+        "locked rate unchanged after recompute (D3)",
+        str(d3_after.get("gold_rate_at_cost")) == str(locked_rate),
+        f"{locked_rate} -> {d3_after.get('gold_rate_at_cost')}",
+    )
+    check(
+        "material_cost grew by exactly the stone value, gold not re-priced (D3)",
+        Decimal(str(d3_after["material_cost"])) - material_before == Decimal("100.00"),
+        f"delta={Decimal(str(d3_after['material_cost'])) - material_before}, expected 100.00",
+    )
+
+    # --- D5: a piece may legitimately come back heavier than the gold issued ---
+    d5_job = client.post("/manufacturing", headers=auth, json={"notes": "weight gain"}).json()
+    client.post(
+        f"/manufacturing/{d5_job['id']}/assign-karigar",
+        headers=auth,
+        json={
+            "karigar_id": karigar["id"],
+            "gold_assigned_g": "10",
+            "gold_assigned_purity": 22,
+            "gold_source_inventory_id": raw_gold["id"],
+        },
+    )
+    r = client.post(
+        f"/manufacturing/{d5_job['id']}/receive-karigar",
+        headers=auth,
+        json={"jewelry_received_g": "10.5"},
+    )
+    check("receive heavier than issued is allowed (D5)", r.status_code == 200, f"got {r.status_code}")
+    check(
+        "weight gain recorded as negative loss (D5)",
+        Decimal(str(r.json()["karigar_loss_g"])) == Decimal("-0.5"),
+        f"got {r.json()['karigar_loss_g']}",
+    )
+    client.post(
+        f"/manufacturing/{d5_job['id']}/assign-polish",
+        headers=auth,
+        json={"polish_vendor_id": polisher["id"], "weight_before_polish_g": "10.5"},
+    )
+    r = client.post(
+        f"/manufacturing/{d5_job['id']}/receive-polish",
+        headers=auth,
+        json={"weight_after_polish_g": "10.6"},
+    )
+    check("polish weight gain allowed (D5)", r.status_code == 200, f"got {r.status_code}")
+
+    # --- D6: deleting a product must not make the next serial collide ---
+    # Mint three in a row, then delete the *middle* one. A count-based generator
+    # now returns the third product's own number and dies on the unique index;
+    # a max-based one moves past it. (Reusing the number of a row that no longer
+    # exists is harmless — colliding with one that still does is the bug.)
+    serial_products = [
+        client.post(
+            "/products",
+            headers=auth,
+            json={"name": f"Serial Probe {i}", "gold_weight_g": "1", "gold_purity": 22},
+        ).json()
+        for i in range(3)
+    ]
+    live_serials = {p["serial_no"] for p in serial_products}
+    r = client.delete(f"/products/{serial_products[1]['id']}", headers=pwd_h)
+    check("delete middle product for serial test → 204", r.status_code == 204, f"got {r.status_code}")
+    live_serials.discard(serial_products[1]["serial_no"])
+
+    r = client.post(
+        "/products",
+        headers=auth,
+        json={"name": "After Middle Deletion", "gold_weight_g": "1", "gold_purity": 22},
+    )
+    check(
+        "serial mint survives a deletion mid-sequence (D6)",
+        r.status_code == 201,
+        f"got {r.status_code}: {r.text[:200]}",
+    )
+    check(
+        "new serial does not collide with a live one (D6)",
+        r.status_code == 201 and r.json()["serial_no"] not in live_serials,
+        f"{r.json().get('serial_no')} vs live {sorted(live_serials)}",
+    )
+
+    # --- D7: stock deduction follows the product, not the typed line weight ---
+    d7_job = client.post("/manufacturing", headers=auth, json={"notes": "issue weight"}).json()
+    client.post(
+        f"/manufacturing/{d7_job['id']}/assign-karigar",
+        headers=auth,
+        json={
+            "karigar_id": karigar["id"],
+            "gold_assigned_g": "8",
+            "gold_assigned_purity": 22,
+            "gold_source_inventory_id": raw_gold["id"],
+        },
+    )
+    client.post(f"/manufacturing/{d7_job['id']}/receive-karigar", headers=auth, json={"jewelry_received_g": "8"})
+    d7_prod_id = client.post(
+        f"/manufacturing/{d7_job['id']}/complete",
+        headers=pwd_h,
+        json={"product_name": "Issue Weight Ring", "category": "ring", "finished_inventory_location": "showroom"},
+    ).json()["product_id"]
+
+    # Bill a wildly different weight than the piece actually carries. Previously
+    # this either drifted the snapshot or tripped the negative-stock guard.
+    d7_inv = client.post(
+        "/invoices",
+        headers=auth,
+        json={
+            "customer_id": customer_id,
+            "sale_type": "normal",
+            "currency": "PKR",
+            "items": [{
+                "product_id": d7_prod_id,
+                "description": "Overstated weight on purpose",
+                "quantity": 1,
+                "gold_weight_g": "500",
+                "gold_purity": 22,
+            }],
+        },
+    ).json()
+    r = client.post(f"/invoices/{d7_inv['id']}/issue", headers=pwd_h)
+    check(
+        "issue succeeds despite line weight ≠ product weight (D7)",
+        r.status_code == 200,
+        f"got {r.status_code}: {r.text[:200]}",
+    )
+    finished = client.get("/inventory", headers=auth, params={"type": "finished_product"}).json()
+    d7_row = next((it for it in finished if it.get("product_id") == d7_prod_id), None)
+    check(
+        "inventory zeroed by product weight, not line weight (D7)",
+        d7_row is not None
+        and d7_row["quantity"] == 0
+        and Decimal(str(d7_row["weight_g"])) == Decimal("0"),
+        str(d7_row),
     )
 
     # ----- LOGIN RATE LIMIT (slowapi: 10/minute) -----

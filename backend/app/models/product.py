@@ -38,6 +38,12 @@ class Product(Base, TimestampMixin):
     # Recomputed when stones are attached/detached. Zero for products that
     # weren't created via the manufacturing pipeline.
     material_cost: Mapped[float] = mapped_column(Numeric(14, 2), default=0, nullable=False)
+    # The gold rate this product's metal was capitalised at, locked on the first
+    # costing pass and never revisited. Without it, recomputing material_cost
+    # later (e.g. when a stone is attached) would silently re-price the gold at
+    # the current rate and rewrite historical cost — and every profit figure
+    # derived from it.
+    gold_rate_at_cost: Mapped[float | None] = mapped_column(Numeric(14, 4))
 
     # Per-product stone breakdown — owned by the product, cascade on delete.
     stones: Mapped[list["ProductStone"]] = relationship(  # noqa: F821

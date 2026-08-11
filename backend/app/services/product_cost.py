@@ -2,7 +2,8 @@
 Compute and persist `products.material_cost`.
 
 material_cost = gold value at completion time (purity-adjusted, in PKR by
-default) + sum over product_stones of (qty × weight_ct × rate_per_ct).
+default, priced at the rate locked on `products.gold_rate_at_cost`) + sum over
+product_stones of (qty × weight_ct × rate_per_ct).
 
 We use PKR as the canonical cost currency because the gold rate master is
 typically maintained in PKR. Stones snapshot their own currency at attach time
@@ -38,10 +39,28 @@ async def recompute_material_cost(
 ) -> Decimal:
     """
     Recompute material_cost for a product and write it back. Caller commits.
-    Pass `gold_rate_pkr` to lock in a specific rate (e.g. snapshot at completion);
-    otherwise the most recent PKR rate is used.
+
+    The gold rate is locked on the first pass and reused on every later one, so
+    that recomputing (which happens whenever a stone is attached or detached)
+    only ever re-values the *stones*. Re-pricing the gold at whatever the rate
+    happens to be that day would rewrite the product's historical cost, and
+    with it every profit figure that references the product.
+
+    Pass `gold_rate_pkr` to force a specific rate — it becomes the locked rate
+    if none is set yet.
     """
-    rate = gold_rate_pkr if gold_rate_pkr is not None else await _current_gold_rate_pkr(db)
+    rate = (
+        gold_rate_pkr
+        if gold_rate_pkr is not None
+        else (
+            Decimal(str(product.gold_rate_at_cost))
+            if product.gold_rate_at_cost is not None
+            else await _current_gold_rate_pkr(db)
+        )
+    )
+    if product.gold_rate_at_cost is None:
+        product.gold_rate_at_cost = rate
+
     purity_factor = (
         Decimal(str(product.gold_purity)) / Decimal("24") if product.gold_purity else Decimal("1")
     )

@@ -209,13 +209,19 @@ async def issue_invoice(
                     status.HTTP_409_CONFLICT,
                     f"Product '{product.serial_no}' has no inventory record.",
                 )
+            # Deduct the weights recorded on the *product*, not the ones typed
+            # onto the invoice line. The inventory row was created from the
+            # product's figures at job completion; billing a slightly different
+            # weight (which is routine — wastage, rounding, negotiation) would
+            # otherwise drift the snapshot, or overshoot the negative-stock
+            # guard and abort the issue half-way through.
             await post_movement(
                 db,
                 item=inventory,
                 type=MovementType.sale_out,
                 quantity_delta=-item.quantity,
-                weight_g_delta=-Decimal(str(item.gold_weight_g or 0)) * item.quantity,
-                weight_ct_delta=-Decimal(str(item.stone_weight_ct or 0)) * item.quantity,
+                weight_g_delta=-Decimal(str(product.gold_weight_g or 0)) * item.quantity,
+                weight_ct_delta=-Decimal(str(product.stone_weight_ct or 0)) * item.quantity,
                 reference_type="invoice",
                 reference_id=invoice.id,
                 notes=f"Invoice {invoice.invoice_no} (normal sale)",
@@ -323,13 +329,16 @@ async def void_invoice(
                 inventory = (await db.execute(inv_stmt)).scalars().first()
                 if inventory is None:
                     continue
+                # Mirror of the deduction in issue_invoice — must use the same
+                # source of truth (the product) or a void won't restore stock
+                # to where it was.
                 await post_movement(
                     db,
                     item=inventory,
                     type=MovementType.sale_return_in,
                     quantity_delta=item.quantity,
-                    weight_g_delta=Decimal(str(item.gold_weight_g or 0)) * item.quantity,
-                    weight_ct_delta=Decimal(str(item.stone_weight_ct or 0)) * item.quantity,
+                    weight_g_delta=Decimal(str(product.gold_weight_g or 0)) * item.quantity,
+                    weight_ct_delta=Decimal(str(product.stone_weight_ct or 0)) * item.quantity,
                     reference_type="invoice",
                     reference_id=invoice.id,
                     notes=f"Voided invoice {invoice.invoice_no}",

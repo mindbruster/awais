@@ -15,6 +15,7 @@ from app.schemas.manufacturing import (
     AssignKarigar,
     AssignPolish,
     AssignStoneFixer,
+    CancelJob,
     CompleteJob,
     ManufacturingJobCreate,
     ManufacturingJobRead,
@@ -105,6 +106,7 @@ async def open_job(
         job.gold_assigned_g = payload.gold_assigned_g
         job.gold_assigned_purity = payload.gold_assigned_purity
         job.gold_assigned_at = datetime.now(timezone.utc)
+        job.gold_source_inventory_id = source.id
         job.stage = JobStage.karigar_assigned
 
         db.add(job)
@@ -151,6 +153,7 @@ async def assign_karigar(
     job.gold_assigned_g = payload.gold_assigned_g
     job.gold_assigned_purity = payload.gold_assigned_purity
     job.gold_assigned_at = datetime.now(timezone.utc)
+    job.gold_source_inventory_id = source.id
     job.stage = JobStage.karigar_assigned
     if payload.notes:
         job.notes = (job.notes + "\n" if job.notes else "") + payload.notes
@@ -181,11 +184,9 @@ async def receive_karigar(
 
     received = Decimal(str(payload.jewelry_received_g))
     assigned = Decimal(str(job.gold_assigned_g))
-    if received > assigned:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            "Received weight cannot exceed assigned weight.",
-        )
+    # A gain is legitimate: karigars add solder, alloy and findings while
+    # working, so the piece regularly returns heavier than the gold issued.
+    # The difference is stored signed — negative loss means weight was added.
     job.jewelry_received_g = received
     job.karigar_loss_g = assigned - received
     job.stage = JobStage.karigar_received
@@ -211,6 +212,7 @@ async def assign_stone_fixer(
 
     job.stone_fixer_id = fixer.id
     job.stones_assigned_ct = payload.stones_assigned_ct
+    job.stone_source_inventory_id = source.id
     job.stage = JobStage.stone_fixer_assigned
     if payload.notes:
         job.notes = (job.notes + "\n" if job.notes else "") + payload.notes
@@ -253,6 +255,23 @@ async def receive_stone_fixer(
     if payload.notes:
         job.notes = (job.notes + "\n" if job.notes else "") + payload.notes
 
+    # Stones handed back by the fixer must go back into stock. Without this the
+    # carats deducted at assign time are only ever partly accounted for (the
+    # used portion lands on the product) and the returned portion vanishes,
+    # walking stone inventory down on every single job.
+    if returned > 0 and job.stone_source_inventory_id is not None:
+        source = await _get_inventory(db, job.stone_source_inventory_id)
+        await post_movement(
+            db,
+            item=source,
+            type=MovementType.manufacturing_in,
+            weight_ct_delta=returned,
+            reference_type="manufacturing_job",
+            reference_id=job.id,
+            notes=f"Stones returned unused from fixer (job {job.job_no})",
+            user_id=current.id,
+        )
+
     await db.commit()
     await db.refresh(job)
     return job
@@ -291,11 +310,8 @@ async def receive_polish(
 
     after = Decimal(str(payload.weight_after_polish_g))
     before = Decimal(str(job.weight_before_polish_g))
-    if after > before:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            "Polished weight cannot exceed pre-polish weight.",
-        )
+    # Polishing usually removes metal, but rhodium and plating add a little,
+    # so a gain is allowed and recorded as a negative loss.
     job.weight_after_polish_g = after
     job.polish_loss_g = before - after
     job.stage = JobStage.polish_received
@@ -418,24 +434,98 @@ async def complete_job(
 @router.post("/{job_id}/cancel", response_model=ManufacturingJobRead, dependencies=[write])
 async def cancel_job(
     job_id: int,
+    payload: CancelJob,
     db: DbSession,
     # Once a job has assigned material, cancelling it is destructive (costs/loss
     # left in the books, materials already moved). Require password confirmation
     # except for jobs still in draft.
     current: User = Depends(require_password_confirm),
 ) -> ManufacturingJob:
+    """
+    Cancel a job and settle its outstanding material.
+
+    Gold and stones issued against the job were deducted from stock and are
+    only credited back when the job completes. Cancelling therefore has to say
+    what happened to them: whatever the shop physically recovers is returned to
+    the source inventory rows, and the rest is written off on the job so it can
+    be raised against the worker rather than quietly disappearing from stock.
+    """
     job = await db.get(ManufacturingJob, job_id)
     if job is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Job not found")
     if job.stage in (JobStage.completed, JobStage.cancelled):
         raise HTTPException(status.HTTP_409_CONFLICT, "Job already finalised")
+
+    # Outstanding = issued minus anything already credited back. Stones handed
+    # back at receive-stone-fixer time have already returned to stock.
+    gold_outstanding = Decimal(str(job.gold_assigned_g))
+    stones_outstanding = Decimal(str(job.stones_assigned_ct)) - Decimal(str(job.stones_returned_ct))
+
+    gold_recovered = Decimal(str(payload.gold_recovered_g))
+    stones_recovered = Decimal(str(payload.stones_recovered_ct))
+
+    if gold_recovered > gold_outstanding:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Cannot recover {gold_recovered}g — only {gold_outstanding}g is outstanding on this job.",
+        )
+    if stones_recovered > stones_outstanding:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Cannot recover {stones_recovered}ct — only {stones_outstanding}ct is outstanding on this job.",
+        )
+
+    if gold_recovered > 0:
+        if job.gold_source_inventory_id is None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "This job has no recorded gold source, so recovered gold cannot be returned to stock.",
+            )
+        await post_movement(
+            db,
+            item=await _get_inventory(db, job.gold_source_inventory_id),
+            type=MovementType.manufacturing_in,
+            weight_g_delta=gold_recovered,
+            reference_type="manufacturing_job",
+            reference_id=job.id,
+            notes=f"Gold recovered on cancellation of job {job.job_no}",
+            user_id=current.id,
+        )
+    if stones_recovered > 0:
+        if job.stone_source_inventory_id is None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "This job has no recorded stone source, so recovered stones cannot be returned to stock.",
+            )
+        await post_movement(
+            db,
+            item=await _get_inventory(db, job.stone_source_inventory_id),
+            type=MovementType.manufacturing_in,
+            weight_ct_delta=stones_recovered,
+            reference_type="manufacturing_job",
+            reference_id=job.id,
+            notes=f"Stones recovered on cancellation of job {job.job_no}",
+            user_id=current.id,
+        )
+
     prev_stage = job.stage
+    job.gold_written_off_g = gold_outstanding - gold_recovered
+    job.stones_written_off_ct = stones_outstanding - stones_recovered
+    job.cancel_reason = payload.reason
     job.stage = JobStage.cancelled
+
     await log_action(
         db, user=current,
         action="manufacturing.cancel",
         resource_type="manufacturing_job", resource_id=job.id,
-        details={"previous_stage": prev_stage.value},
+        details={
+            "previous_stage": prev_stage.value,
+            "reason": payload.reason,
+            "gold_recovered_g": str(gold_recovered),
+            "stones_recovered_ct": str(stones_recovered),
+            "gold_written_off_g": str(job.gold_written_off_g),
+            "stones_written_off_ct": str(job.stones_written_off_ct),
+        },
     )
     await db.commit()
     await db.refresh(job)

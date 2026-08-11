@@ -131,8 +131,18 @@ npm run dev                            # frontend
 
 ## Default credentials
 
-`admin@jewelryerp.com` / `admin123` — change on first login.
+**Development only.** `admin@jewelryerp.com` / `admin123`.
 pgAdmin (dev): `admin@jewelryerp.com` / `admin` at <http://localhost:5050>.
+
+These are convenience defaults for local work. Any deployment whose
+`ENVIRONMENT` is not `development`, `test` or `ci` refuses to start while
+`JWT_SECRET` is a placeholder or under 32 characters, `SEED_ADMIN_PASSWORD` is
+still `admin123`, or `DEBUG` is on — see `require_production_secrets` in
+`backend/app/core/config.py`.
+
+`DATABASE_URL` is normalised on load, so the `postgres://` / `postgresql://`
+URLs handed out by Railway, Render and Heroku are rewritten to the
+`postgresql+asyncpg://` form the async engine needs.
 
 ## Tests
 
