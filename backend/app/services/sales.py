@@ -23,6 +23,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import Integer, case, cast, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import lock_keys
 from app.models.account import SystemAccount
 from app.models.currency import Currency
 from app.models.customer import Customer
@@ -48,7 +49,7 @@ _PKR = Decimal("0.01")
 
 # Distinct from the keys serial.py and routing.py already hold, so minting a
 # payment number never serialises against minting an invoice number.
-_PAYMENT_LOCK_KEY = 7_300_007
+_PAYMENT_LOCK_KEY = lock_keys.PAYMENT_NO
 
 
 async def next_payment_no(db: AsyncSession) -> str:

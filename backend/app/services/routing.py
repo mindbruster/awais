@@ -16,6 +16,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import Integer, cast, desc, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import lock_keys
 from app.models.account import SystemAccount
 from app.models.currency import Currency
 from app.models.design import Design, JobLeg, LabourBasis, WastageBasis
@@ -36,8 +37,8 @@ _PKR = Decimal("0.01")
 # Design numbers are per-item counters, so the lock has to be per item too —
 # minting a TK and an RG at the same moment must not serialise against each
 # other. Tags are one global sequence and get their own key.
-_DESIGN_LOCK_BASE = 7_400_000
-_TAG_LOCK_KEY = 7_300_005
+_DESIGN_LOCK_BASE = lock_keys.DESIGN_NO_BASE
+_TAG_LOCK_KEY = lock_keys.TAG_NO
 
 
 async def next_design_no(db: AsyncSession, item: Item) -> str:

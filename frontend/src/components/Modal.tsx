@@ -36,10 +36,13 @@ export function Modal({ open, onClose, title, children, widthClass = "max-w-lg" 
         onClick={onClose}
         aria-hidden="true"
       />
+      {/* Flex column with a capped max-height so the body scrolls when the
+          content is taller than the viewport. The header stays sticky at
+          the top; the body owns the overflow. */}
       <div
-        className={`relative w-full ${widthClass} rounded-2xl bg-white shadow-xl ring-1 ring-slate-900/5`}
+        className={`relative flex w-full ${widthClass} max-h-[90vh] flex-col rounded-2xl bg-white shadow-xl ring-1 ring-slate-900/5`}
       >
-        <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3">
+        <div className="flex flex-none items-center justify-between border-b border-slate-200 px-5 py-3">
           <h2 id="modal-title" className="text-base font-semibold text-slate-900">
             {title}
           </h2>
@@ -62,7 +65,7 @@ export function Modal({ open, onClose, title, children, widthClass = "max-w-lg" 
             </svg>
           </button>
         </div>
-        <div className="p-5">{children}</div>
+        <div className="flex-1 overflow-y-auto p-5">{children}</div>
       </div>
     </div>
   );

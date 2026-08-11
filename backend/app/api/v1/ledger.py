@@ -15,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import CurrentUser, DbSession, require_password_confirm, require_perm
+from app.core import lock_keys
 from app.models.account import Account, AccountType, SystemAccount
 from app.models.bank import BankAccount
 from app.models.currency import Currency
@@ -697,7 +698,7 @@ async def post_opening_balances(db: DbSession, current: CurrentUser) -> OpeningB
     nothing posted and both post, which is the exact failure the skip exists to
     prevent, and it would need hand-written reversals to undo.
     """
-    await db.execute(text("SELECT pg_advisory_xact_lock(:k)").bindparams(k=7_300_006))
+    await db.execute(text("SELECT pg_advisory_xact_lock(:k)").bindparams(k=lock_keys.OPENING_BALANCES))
     rate_row = await rate_in_force(db, currency=Currency.PKR, purity=24)
     if rate_row is None:
         raise HTTPException(

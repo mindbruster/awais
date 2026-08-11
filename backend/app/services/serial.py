@@ -3,15 +3,16 @@ from datetime import datetime, timezone
 from sqlalchemy import Integer, cast, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import lock_keys
 from app.models.invoice import Invoice
 from app.models.manufacturing import ManufacturingJob
 from app.models.product import Product
 
 # Stable bigint keys for pg_advisory_xact_lock — must be int8 range and deterministic.
 _LOCK_KEYS = {
-    "P": 7_300_001,
-    "MJ": 7_300_002,
-    "INV": 7_300_003,
+    "P": lock_keys.PRODUCT_SERIAL,
+    "MJ": lock_keys.MANUFACTURING_JOB_NO,
+    "INV": lock_keys.INVOICE_NO,
 }
 
 

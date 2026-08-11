@@ -18,6 +18,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import Integer, cast, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import lock_keys
 from app.models.account import SystemAccount
 from app.models.design import JobLeg, LegStatus, LegStone
 from app.models.inventory import InventoryItem, InventoryType
@@ -38,12 +39,12 @@ _CT = Decimal("0.0001")
 
 # Advisory-lock keys, in the same 7_3xx_xxx block the rest of the app uses so
 # nothing here can collide with a serial mint or the opening-balance run.
-_OLD_GOLD_NO_LOCK = 7_300_010
-_STONE_PURCHASE_NO_LOCK = 7_300_011
-_RAW_STONE_ITEM_LOCK = 7_300_012
+_OLD_GOLD_NO_LOCK = lock_keys.OLD_GOLD_PURCHASE_NO
+_STONE_PURCHASE_NO_LOCK = lock_keys.STONE_PURCHASE_NO
+_RAW_STONE_ITEM_LOCK = lock_keys.RAW_STONE_ITEM
 # Melt pots are per purity, so the lock is too — buying 22k must not serialise
 # against someone buying 21k at the next counter.
-_RAW_GOLD_ITEM_LOCK_BASE = 7_420_000
+_RAW_GOLD_ITEM_LOCK_BASE = lock_keys.RAW_GOLD_ITEM_BASE
 
 
 # --------------------------------------------------------------------------

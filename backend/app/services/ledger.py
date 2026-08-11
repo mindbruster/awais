@@ -22,6 +22,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import Integer, cast, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import lock_keys
 from app.models.account import Account, SystemAccount
 from app.models.journal import Commodity, JournalEntry, JournalLine, PartyType
 
@@ -105,7 +106,7 @@ async def _account_by_code(db: AsyncSession, code: str) -> Account:
 async def next_entry_no(db: AsyncSession) -> str:
     """`JE-YY-NNNNN`, serialised by advisory lock and derived from the highest
     suffix in use so a deleted row can never cause a collision."""
-    await db.execute(text("SELECT pg_advisory_xact_lock(:k)").bindparams(k=7_300_004))
+    await db.execute(text("SELECT pg_advisory_xact_lock(:k)").bindparams(k=lock_keys.JOURNAL_ENTRY_NO))
     year = datetime.now(timezone.utc).strftime("%y")
     highest = (
         await db.execute(

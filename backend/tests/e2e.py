@@ -2473,6 +2473,20 @@ def main() -> int:
         f"available went {avail_before} -> {avail_after}; a cancelled leg must not read as consumption",
     )
 
+    # ----- INTERNAL INVARIANTS -----
+    section("Internal invariants")
+    # Colliding advisory-lock keys don't error, they just make unrelated
+    # operations queue behind each other under load with nothing to explain it.
+    # The registry reserves 7_300_004..006 for the Dev branch's serials; this
+    # fails if anything reclaims them. See docs/BRANCH_DIVERGENCE.md.
+    from app.core import lock_keys
+
+    try:
+        lock_keys.assert_unique()
+        check("advisory lock keys are unique and the Dev block is reserved", True)
+    except AssertionError as exc:
+        check("advisory lock keys are unique and the Dev block is reserved", False, str(exc))
+
     # ----- LOGIN RATE LIMIT (slowapi: 10/minute) -----
     section("Login rate limit")
     for _ in range(10):
