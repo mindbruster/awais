@@ -21,8 +21,9 @@
     "//-- database --": "",
     "db:up": "docker compose up -d --wait postgres",
     "db:down": "docker compose down",
-    "db:reset": "docker compose down -v && npm run db:up && npm run migrate && npm run seed",
-    "db:psql": "docker exec -it jewelry_erp_postgres psql -U jewelry -d jewelry_erp",
+    "db:fresh": "node scripts/python.js -m tools.db_fresh && npm run migrate && npm run seed",
+    "db:reset": "npm run db:fresh",
+    "db:psql": "node scripts/python.js -m tools.db_psql",
 
     "//-- backend tasks --": "",
     "migrate": "node scripts/python.js -m alembic upgrade head",

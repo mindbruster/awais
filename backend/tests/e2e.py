@@ -31,6 +31,35 @@ def section(title: str) -> None:
     print(f"\n=== {title} ===")
 
 
+def preflight(client: httpx.Client, auth: dict[str, str]) -> str | None:
+    """
+    Refuse to run against a database that has already been used.
+
+    This suite mints serial numbers, asserts on running balances and creates
+    master data by a fixed name, so a second run against the same database
+    fails in ways that look like product bugs and are not: a 409 on a
+    department that already exists, a balance that includes the previous run's
+    invoices. The first such failure then usually takes the whole run down with
+    a KeyError, because the assertion after it reads a field off an error body.
+
+    Cheaper to say so up front. Returns the reason, or None if the database
+    looks freshly seeded.
+    """
+    for path, label in (
+        ("/ledger/journal", "journal entries"),
+        ("/designs", "designs"),
+        ("/invoices", "invoices"),
+    ):
+        r = client.get(path, headers=auth, params={"limit": 1})
+        if r.status_code != 200:
+            continue
+        body = r.json()
+        rows = body.get("items", body) if isinstance(body, dict) else body
+        if isinstance(rows, list) and rows:
+            return f"the database already has {label} in it"
+    return None
+
+
 def main() -> int:
     client = httpx.Client(base_url=API, timeout=30)
 
@@ -41,6 +70,17 @@ def main() -> int:
     token = r.json().get("access_token")
     check("login returns token", bool(token))
     auth = {"Authorization": f"Bearer {token}"}
+
+    dirty = preflight(client, auth) if token else None
+    if dirty:
+        print(
+            f"\n  This suite needs a freshly seeded database, and {dirty}.\n"
+            "  Rebuild it, then run again:\n\n"
+            "      npm run db:fresh\n\n"
+            "  (That drops and recreates whichever database DATABASE_URL points at,\n"
+            "  re-runs the migrations and re-seeds the admin user.)\n"
+        )
+        return 2
 
     r = client.post("/auth/login", json={"email": "admin@jewelryerp.com", "password": "wrong"})
     check("bad password → 401", r.status_code == 401)
