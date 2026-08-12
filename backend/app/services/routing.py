@@ -290,7 +290,14 @@ async def post_leg_receive(
             memo=f"Relieved on leg #{leg.sequence}",
         )
     )
-    if fine_excess:
+    # Re-charging the excess only makes sense when somebody agreed to an
+    # allowance in the first place. On an in-house leg there is no such
+    # agreement and nobody to bill, so the metal simply stays where the line
+    # above put it — Wastage Expense, the shop's own cost of production.
+    # Posting the re-charge anyway would credit Wastage Recovered, booking
+    # income against a debt owed by no one, and leave a balance sitting in the
+    # worker control account with no party to attribute it to.
+    if fine_excess and leg.worker_id:
         draft.add(
             _gold(
                 SystemAccount.GOLD_WITH_WORKERS,

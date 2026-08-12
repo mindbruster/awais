@@ -967,7 +967,7 @@ function IssuePanel({ designId, reload }: { designId: number; reload: () => void
     try {
       await api.post(`/designs/${designId}/legs`, {
         department_id: Number(deptId),
-        worker_id: Number(workerId),
+        worker_id: workerId ? Number(workerId) : null,
         gold_issued_g: gold || "0",
         gold_issued_purity: purity ? parseInt(purity, 10) : null,
         gold_source_inventory_id: Number(goldSrc),
@@ -1012,20 +1012,33 @@ function IssuePanel({ designId, reload }: { designId: number; reload: () => void
         onChange={(e) => setDeptId(e.target.value)}
         options={departments.map((d) => ({ value: d.id, label: d.name }))}
       />
+      {/* Not required. Several stages — cleaning, burning, rhodium, finish —
+          are done on the shop's own bench, where there is no outside karigar
+          holding the metal and nobody to charge a shortfall to. Leaving this
+          blank tracks the metal through the leg without inventing a worker. */}
       <SelectField
         label="Worker"
-        required
         value={workerId}
         onChange={(e) => setWorkerId(e.target.value)}
-        options={eligible.map((w) => ({ value: w.id, label: w.name }))}
+        options={[
+          { value: "", label: "In-house — no outside worker" },
+          ...eligible.map((w) => ({ value: w.id, label: w.name })),
+        ]}
         hint={
-          eligible.length === 0
-            ? `No active worker belongs to ${dept?.name ?? "this department"}.`
+          !workerId
+            ? "In-house: the metal stays the shop's, and any shortfall is its own cost."
             : `Wastage allowance frozen onto this leg: ${Number(
                 worker?.effective_wastage_pct ?? 0,
               )}%`
         }
       />
+      {eligible.length === 0 && (
+        <p className="text-xs text-slate-500">
+          No worker is assigned to {dept?.name ?? "this department"}. That is fine for a
+          stage the shop does itself — otherwise add one under Workers and set their
+          department.
+        </p>
+      )}
       <SelectField
         label="Gold from"
         required

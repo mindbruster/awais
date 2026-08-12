@@ -326,15 +326,24 @@ async def issue_leg(
     department = await db.get(Department, payload.department_id)
     if department is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Department not found")
-    worker = await db.get(Vendor, payload.worker_id)
-    if worker is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Worker not found")
-    if worker.department_id != department.id:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            f"{worker.name} works in "
-            f"{worker.department_name or 'no department'}, not {department.name}.",
-        )
+    # No worker means the shop's own bench — cleaning, burning, rhodium, finish.
+    # The leg still records every gram; it just has no ledger party, because
+    # there is nobody holding the metal and nobody to bill a shortfall to.
+    worker = None
+    if payload.worker_id is not None:
+        worker = await db.get(Vendor, payload.worker_id)
+        if worker is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Worker not found")
+        if worker.department_id != department.id:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"{worker.name} works in "
+                f"{worker.department_name or 'no department'}, not {department.name}.",
+            )
+    # Every message and movement note below names whoever holds the metal. On an
+    # in-house leg that is the shop itself.
+    who = worker.name if worker else "the shop's own bench"
+
     if payload.stones and payload.stone_source_inventory_id is None:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
@@ -367,7 +376,7 @@ async def issue_leg(
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
                 f"{department.name} allows wastage per 100 pieces, so this leg needs a piece "
-                f"count. Send piece_count — with none, {worker.name} would be allowed nothing "
+                f"count. Send piece_count — with none, {who} would be allowed nothing "
                 "and charged for the whole loss.",
             )
         if per_100 is None:
@@ -385,7 +394,7 @@ async def issue_leg(
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             f"Labour on this leg is charged per piece, so it needs a piece count. "
-            f"Send piece_count — with none, {worker.name} would be paid nothing.",
+            f"Send piece_count — with none, {who} would be paid nothing.",
         )
 
     rate = await current_gold_rate(db)
@@ -448,7 +457,7 @@ async def issue_leg(
         weight_g_delta=-d(payload.gold_issued_g),
         reference_type="job_leg",
         reference_id=leg.id,
-        notes=f"{design.design_no} issued to {worker.name} ({department.name})",
+        notes=f"{design.design_no} issued to {who} ({department.name})",
         user_id=current.id,
     )
     if stones_ct > 0:
@@ -459,7 +468,7 @@ async def issue_leg(
             weight_ct_delta=-stones_ct,
             reference_type="job_leg",
             reference_id=leg.id,
-            notes=f"{design.design_no} stones to {worker.name}",
+            notes=f"{design.design_no} stones to {who}",
             user_id=current.id,
         )
 
@@ -473,7 +482,7 @@ async def issue_leg(
         details={
             "design_no": design.design_no,
             "department": department.name,
-            "worker": worker.name,
+            "worker": worker.name if worker else None,
             "gold_issued_g": str(d(leg.gold_issued_g)),
             "stones_issued_ct": str(stones_ct),
             "piece_count": pieces,

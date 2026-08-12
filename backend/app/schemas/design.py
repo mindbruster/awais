@@ -40,7 +40,13 @@ class LegIssue(BaseModel):
     """
 
     department_id: int
-    worker_id: int
+    # Optional, because several stages are done in-house: cleaning, burning,
+    # rhodium, finish. There is no outside karigar holding the metal and nobody
+    # to owe it back, and forcing a name here would mean inventing a worker
+    # record for the shop's own bench — which then appears in the wastage
+    # reports as a party who is losing you metal. Leave it unset for in-house
+    # work; the leg still tracks the metal, it just carries no ledger party.
+    worker_id: int | None = None
     gold_issued_g: Decimal = Field(gt=0)
     gold_issued_purity: int | None = Field(default=None, ge=1, le=24)
     gold_source_inventory_id: int

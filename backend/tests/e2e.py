@@ -1651,6 +1651,53 @@ def main() -> int:
     r = client.post(f"/designs/legs/{leg['id']}/receive", headers=auth, json={"gold_received_g": "94"})
     check("receiving a leg twice refused → 409", r.status_code == 409, f"got {r.status_code}")
 
+    # --- an in-house stage has no worker, and no one to charge a shortfall to ---
+    # Cleaning, burning, rhodium and finish are done on the shop's own bench.
+    # Requiring a worker there would mean inventing a record for the shop
+    # itself, which then shows up in the wastage reports as a party losing you
+    # metal. The leg still tracks the gram; it just carries no ledger party.
+    fin_dept_id = next(d_["id"] for d_ in depts if d_["code"] == "FIN")
+    inhouse_design = client.post("/designs", headers=auth, json={"item_id": taka_id}).json()
+    r = client.post(
+        f"/designs/{inhouse_design['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": fin_dept_id, "gold_issued_g": "10",
+            "gold_issued_purity": 22, "gold_source_inventory_id": raw_gold["id"],
+        },
+    )
+    check(
+        "issue to an in-house stage with no worker → 201",
+        r.status_code == 201,
+        f"got {r.status_code}: {r.text[:220]} — five of eleven departments have no worker",
+    )
+    inhouse_leg = r.json()
+    check("the leg carries no worker", inhouse_leg.get("worker_id") is None, str(inhouse_leg.get("worker_id")))
+
+    def recovered_g() -> Decimal:
+        st = client.get(
+            "/ledger/statement", headers=auth, params={"account_code": "4200", "commodity": "GOLD"}
+        ).json()
+        return Decimal(str(st["closing_balance"]))
+
+    rec_before = recovered_g()
+    # Lose 2g against a zero allowance: on a worker's leg this would be charged
+    # back to him. Here there is nobody to charge.
+    r = client.post(
+        f"/designs/legs/{inhouse_leg['id']}/receive", headers=auth, json={"gold_received_g": "8"}
+    )
+    check("receive an in-house leg → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:200]}")
+    check(
+        "an in-house shortfall is the shop's own cost, not income from nobody",
+        recovered_g() == rec_before,
+        f"4200 moved by {recovered_g() - rec_before} fine g — booking wastage recovered "
+        "with no party credits income against a debt owed by no one",
+    )
+    check(
+        "books balance after an in-house leg",
+        client.get("/ledger/trial-balance", headers=auth).json()["balanced"] is True,
+    )
+
     # --- a heavier return is legitimate, not an error ---
     # The polisher was created before departments existed on workers, so give
     # him one — the routing engine refuses a worker from the wrong department.
