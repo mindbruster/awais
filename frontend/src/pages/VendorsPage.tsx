@@ -125,7 +125,17 @@ export function VendorsPage() {
                       </span>
                     )}
                   </td>
-                  <td className="px-4 py-3">{v.department_name ?? "—"}</td>
+                  {/* A worker with no department cannot be issued material —
+                      he simply never appears in the dropdown on a design. Said
+                      plainly here, because the symptom otherwise shows up two
+                      screens away as an empty list. */}
+                  <td className="px-4 py-3">
+                    {v.department_name ?? (
+                      <span className="text-amber-700" title="Set a department before this worker can be given work">
+                        none — cannot be given work
+                      </span>
+                    )}
+                  </td>
                   <td className="px-4 py-3">
                     <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs">{v.type}</span>
                   </td>
@@ -281,22 +291,27 @@ function VendorForm({
       <form onSubmit={submit} className="space-y-4">
         <TextField label="Name" required value={name} onChange={(e) => setName(e.target.value)} />
         <div className="grid grid-cols-2 gap-3">
-          <SelectField
-            label="Type"
-            required
-            options={VENDOR_TYPES}
-            value={type}
-            onChange={(e) => setType(e.target.value)}
-          />
+          {/* Department first, and required: it is what decides whether this
+              worker can be picked on a job at all. The worker dropdown on a
+              design is filtered by department, so one saved without a
+              department is invisible on every screen that matters. */}
           <SelectField
             label="Department"
+            required
             hint="Which stage this worker handles"
             options={[
-              { value: "", label: "—" },
+              { value: "", label: "Select a department…" },
               ...departments.map((d) => ({ value: d.id, label: d.name })),
             ]}
             value={departmentId}
             onChange={(e) => setDepartmentId(e.target.value)}
+          />
+          <SelectField
+            label="Type"
+            hint="Legacy grouping, kept for old reports"
+            options={VENDOR_TYPES}
+            value={type}
+            onChange={(e) => setType(e.target.value)}
           />
           <TextField label="Phone" value={phone} onChange={(e) => setPhone(e.target.value)} />
           <TextField

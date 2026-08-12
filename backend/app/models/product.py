@@ -43,13 +43,17 @@ class Product(Base, TimestampMixin):
         ForeignKey("designs.id", ondelete="SET NULL"), index=True
     )
 
-    # Phase 7 — total making cost rolled up from manufacturing job (labor + polish
-    # + stone fixing + other). Material value is tracked separately on
-    # `material_cost` so that profit = revenue − (material + labor).
+    # Making cost: the labour of every leg the piece went through, plus any
+    # other charges, rolled up by the stock form when the design is stocked.
+    # Material is tracked separately on `material_cost` so that
+    # profit = revenue − (material + making); collapsing the two would hide
+    # which of the shop's two levers actually earned the money.
     total_cost: Mapped[float] = mapped_column(Numeric(14, 2), default=0, nullable=False)
-    # Capitalised material value: gold value at completion + sum of stones.
-    # Recomputed when stones are attached/detached. Zero for products that
-    # weren't created via the manufacturing pipeline.
+    # Capitalised material value: gold value when the piece was costed, plus the
+    # stones. Recomputed when stones are attached or detached. Zero for a piece
+    # that never went through the stock form — one bought in finished, or
+    # already in the safe at go-live — which is what shows up on the margin
+    # report as uncosted metal.
     material_cost: Mapped[float] = mapped_column(Numeric(14, 2), default=0, nullable=False)
     # The gold rate this product's metal was capitalised at, locked on the first
     # costing pass and never revisited. Without it, recomputing material_cost

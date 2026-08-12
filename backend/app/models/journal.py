@@ -55,9 +55,12 @@ class JournalEntry(Base, TimestampMixin):
     entry_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
     memo: Mapped[str | None] = mapped_column(Text)
 
-    # What caused this entry — 'manufacturing_leg', 'invoice', 'voucher',
-    # 'opening_balance'. Lets any business record show its accounting effect,
-    # and lets a reversal find everything a cancelled document posted.
+    # What caused this entry — 'job_leg', 'design_stock', 'invoice', 'payment',
+    # 'old_gold_purchase', 'stone_purchase', 'manual', 'opening_balance'. Lets
+    # any business record show its accounting effect, and lets a reversal find
+    # everything a cancelled document posted. Keep this list and the journal
+    # screen's filter honest: a value that appears in one and not the other is a
+    # filter that quietly returns nothing.
     source_type: Mapped[str | None] = mapped_column(String(50), index=True)
     source_id: Mapped[int | None] = mapped_column(Integer, index=True)
 

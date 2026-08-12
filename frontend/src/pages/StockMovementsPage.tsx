@@ -63,8 +63,8 @@ export function StockMovementsPage() {
     <div>
       <h1 className="text-2xl font-semibold text-slate-900">Stock ledger</h1>
       <p className="mt-1 text-sm text-slate-500">
-        Immutable audit trail of every stock change. Linked to invoices,
-        manufacturing jobs and adjustments.
+        Immutable audit trail of every stock change. Linked to designs on the
+        floor, invoices and adjustments.
       </p>
       <Toolbar>
         <FilterSelect value={type} onChange={setType} options={MOVEMENT_TYPES} allLabel="All types" />
@@ -75,8 +75,8 @@ export function StockMovementsPage() {
         {error && <div className="p-6 text-sm text-red-600">{error}</div>}
         {!loading && !error && items.length === 0 && (
           <div className="p-6 text-sm text-slate-500">
-            No movements yet. They are created automatically by manufacturing
-            and sales actions, or directly via POST /api/v1/stock-movements.
+            No movements yet. They are created automatically when material is
+            issued to or received from a department, and when a piece is sold.
           </div>
         )}
         {items.length > 0 && (

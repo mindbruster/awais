@@ -10,14 +10,22 @@ class VendorBase(BaseModel):
     """
     A worker the shop issues material to.
 
-    `type` is the original three-role enum and `department_id` is what replaces
-    it. Both are accepted while the manufacturing module still routes on the
-    enum; new records should set the department.
+    `department_id` is the routing key and is required on new records. A worker
+    without one cannot be picked on a job leg — the worker dropdown is filtered
+    by department, deliberately, so casting work cannot be sent to a polisher —
+    which means creating one without a department produces a worker who is
+    invisible everywhere and looks like a bug in the design screen.
+
+    `type` is the original three-role enum, from when the retired manufacturing
+    module routed on it. Only the legacy loss report still reads it, so it
+    carries a default now rather than being the field you must fill in.
     """
 
     name: str = Field(min_length=1, max_length=150)
-    type: VendorType
-    department_id: int | None = None
+    type: VendorType = VendorType.other
+    # Optional on the model (historical rows predate departments) but required
+    # here, so nothing new can be created unusable.
+    department_id: int = Field(description="Which department this worker belongs to.")
     phone: str | None = Field(default=None, max_length=30)
     cnic: str | None = Field(default=None, max_length=20)
     address: str | None = None
@@ -52,6 +60,11 @@ class VendorUpdate(BaseModel):
 
 
 class VendorRead(TimestampedRead, VendorBase):
+    # Reading is looser than writing on purpose: workers created before
+    # departments existed have none, and they have to stay visible so somebody
+    # can go and fix them. Requiring it here would make the list endpoint fail
+    # on exactly the records that need attention.
+    department_id: int | None = None
     department_name: str | None = None
     # The wastage percentage actually in force: this worker's own figure, or
     # the department's if he has none. Resolved server-side so the UI and the

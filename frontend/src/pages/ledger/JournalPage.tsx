@@ -53,11 +53,19 @@ interface JournalEntry {
   lines: JournalLine[];
 }
 
+// These must match the `source_type` values the services actually write. The
+// list previously offered "manufacturing_leg", which nothing has ever written —
+// the routing engine writes "job_leg" — so that filter silently returned an
+// empty journal, and four real sources were missing from it entirely.
 const SOURCE_TYPES = [
+  { value: "job_leg", label: "Workshop leg" },
+  { value: "design_stock", label: "Stocked piece" },
+  { value: "invoice", label: "Invoice" },
+  { value: "payment", label: "Payment" },
+  { value: "old_gold_purchase", label: "Old gold bought" },
+  { value: "stone_purchase", label: "Stone purchase" },
   { value: "manual", label: "Manual voucher" },
   { value: "opening_balance", label: "Opening balance" },
-  { value: "manufacturing_leg", label: "Manufacturing" },
-  { value: "invoice", label: "Invoice" },
 ];
 
 const COMMODITIES = [

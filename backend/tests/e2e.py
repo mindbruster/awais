@@ -166,16 +166,39 @@ def main() -> int:
 
     # ----- VENDORS -----
     section("Vendors")
+    # Every worker belongs to a department. That is what the worker dropdown on
+    # a design filters by, so one saved without a department can never be given
+    # work — he is simply absent from every screen that matters.
+    depts_by_code = {d["code"]: d["id"] for d in client.get("/departments", headers=auth).json()}
     karigar = client.post(
-        "/vendors", headers=auth, json={"name": "Ravi Karigar", "type": "karigar"}
+        "/vendors", headers=auth,
+        json={"name": "Ravi Karigar", "type": "karigar", "department_id": depts_by_code["CAST"]},
     ).json()
     fixer = client.post(
-        "/vendors", headers=auth, json={"name": "Stone Master", "type": "stone_fixer"}
+        "/vendors", headers=auth,
+        json={"name": "Stone Master", "type": "stone_fixer", "department_id": depts_by_code["SET"]},
     ).json()
     polisher = client.post(
-        "/vendors", headers=auth, json={"name": "Glow Polish", "type": "polish"}
+        "/vendors", headers=auth,
+        json={"name": "Glow Polish", "type": "polish", "department_id": depts_by_code["POL"]},
     ).json()
     check("create karigar / fixer / polisher", all(v.get("id") for v in (karigar, fixer, polisher)))
+
+    r = client.post("/vendors", headers=auth, json={"name": "Nobody's Worker", "type": "karigar"})
+    check(
+        "a worker without a department is refused → 422",
+        r.status_code == 422,
+        f"got {r.status_code} — one saved this way can never be picked on a design",
+    )
+    r = client.post(
+        "/vendors", headers=auth,
+        json={"name": "Untyped Worker", "department_id": depts_by_code["POL"]},
+    )
+    check(
+        "the legacy type is optional now → 201",
+        r.status_code == 201 and r.json()["type"] == "other",
+        f"got {r.status_code}: {r.json().get('type')} — the department is the routing key, not the type",
+    )
 
     r = client.get("/vendors", headers=auth, params={"type": "karigar"})
     check("filter vendors by type", r.status_code == 200 and all(v["type"] == "karigar" for v in r.json()))
@@ -665,7 +688,9 @@ def main() -> int:
     r = client.delete(f"/customers/{cust['id']}", headers=auth)
     check("delete customer (no FK) → 204", r.status_code == 204)
 
-    vend = client.post("/vendors", headers=auth, json={"name": "ToDelete Vend", "type": "other"}).json()
+    vend = client.post("/vendors", headers=auth, json={
+        "name": "ToDelete Vend", "type": "other", "department_id": depts_by_code["POL"],
+    }).json()
     r = client.delete(f"/vendors/{vend['id']}", headers=auth)
     check("delete vendor → 204", r.status_code == 204)
 
