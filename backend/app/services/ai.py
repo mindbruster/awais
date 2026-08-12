@@ -682,3 +682,204 @@ async def answer_from_rows(
     except Exception as exc:
         log.warning("ai.answer_from_rows unavailable (%s: %s)", type(exc).__name__, exc)
         return None
+
+
+# --------------------------------------------------------------------------
+# Conversation
+# --------------------------------------------------------------------------
+# What the shop's own screens do, in the words the counter uses. The model is
+# given this so that "how do I give gold to Zahid" is answered with this app's
+# actual workflow instead of a plausible-sounding invention, which is the
+# failure mode that matters: a confident wrong instruction sends somebody
+# looking for a button that does not exist, or worse, into the wrong one.
+#
+# Kept as prose rather than pulled from the routes, deliberately. A route list
+# describes the API; a shop assistant has to describe the work.
+WORKFLOW_GUIDE = """\
+How this system is used, screen by screen:
+
+MAKING A PIECE (Designs)
+- Every piece is a Design, created on the Designs screen. It gets a number
+  (TK-00001) the moment work starts, before anything is finished.
+- Work is recorded as legs: one visit to one department. Open the design and
+  use "Issue to department" — pick the department, the worker, the gold source
+  and the weight. That is what takes metal out of the safe.
+- Leave the worker as "In-house" for stages the shop does itself (cleaning,
+  burning, rhodium, finish). Then nobody is holding the metal and no shortfall
+  is charged to anyone.
+- When the work comes back, press Receive on that leg and enter the weight
+  returned. The system works out the wastage: what was allowed, what actually
+  went, and what ran past the allowance. Only the excess is charged back.
+- A piece may come back heavier than it went out. That is normal — solder and
+  findings add weight — and it is recorded as a gain, not a shortfall.
+- Cancelling a leg needs a password and asks how much metal was recovered.
+  Whatever was not recovered stays owed by that worker.
+- When the piece is finished, use the stock form to turn the design into a
+  Product. That rolls up every leg's labour into the piece's making cost.
+
+WORKERS
+- Workers live under Workers. Each belongs to a department, and that is what
+  decides where they can be given work — a worker with no department cannot be
+  picked on a design at all.
+- Each worker carries the wastage percentage agreed with him. If he has none,
+  the department's default applies.
+
+BUYING
+- Old gold: metal bought back over the counter, at a rate below the day's rate.
+- Stone purchases: supplier bills, entered by graded lot (quality, cut, colour,
+  clarity), so stone stock can be counted by grade rather than in total.
+
+SELLING (Invoices)
+- An invoice starts as a draft, is Issued (which is when stock moves and the
+  books are posted), and is then paid. On-approval sales do not deduct stock.
+- Each line can carry: wastage charged to the customer (a percentage or flat
+  grams), a ratti discount, and a line discount.
+- The ratti discount is quoted against a base of 96: six ratti bills 90/96 of
+  the gold weight. It reduces the metal billed, not the money.
+- Payments are taken against the invoice. Cash, bank, gold exchange or advance.
+  A payment can be reversed; it is never deleted.
+
+THE BOOKS
+- Position: cash, metal, and who owes whom, as of this morning.
+- Journal: every balanced entry, newest first. Nothing is ever edited — a
+  mistake is corrected by posting its reversal.
+- Statements: a running account for one head, optionally for one party.
+
+REPORTS
+- Overview: stock, what was billed, what the bench lost.
+- Margin: the profit split by which lever produced it — rate spread, wastage
+  charged, making charges, stone margin — less what was given away.
+- Workers: what each worker was allowed, what he actually lost, and what he is
+  holding right now.
+- Operations: department throughput and item performance.
+"""
+
+_CHAT_ROUTER_RULES = """\
+You are the assistant inside a jewellery shop's ERP. Decide what the latest
+message needs, and rewrite it as one standalone question.
+
+kind:
+- "data"   the answer is in the shop's records — figures, balances, who owes
+           what, which worker lost most, how many of something there are.
+- "howto"  the person is asking how to use the system, or what something in it
+           means.
+- "chat"   greetings, thanks, or anything neither of the above.
+
+question: the latest message rewritten so it stands alone, with any pronoun or
+ellipsis resolved from the conversation. "And last month?" after a question
+about wastage becomes "What was the wastage last month?". Keep the language the
+person used (English, Urdu or Roman-Urdu).
+"""
+
+
+@dataclass
+class ChatTurn:
+    reply: str
+    kind: str
+    sql: str | None = None
+    columns: list[str] | None = None
+    rows: list[dict[str, Any]] | None = None
+    notes: str | None = None
+    model: str | None = None
+
+
+def _history_text(messages: list[dict[str, str]]) -> str:
+    """The conversation as plain text for the router. Trimmed to the recent
+    turns: resolving a pronoun needs the last few exchanges, not the hour."""
+    recent = messages[-12:]
+    return "\n".join(f"{m.get('role', 'user')}: {m.get('content', '')}" for m in recent)
+
+
+async def _route(messages: list[dict[str, str]]) -> tuple[str, str]:
+    cfg = require_provider()
+    schema = {
+        "type": "object",
+        "properties": {
+            "kind": {"type": "string", "enum": ["data", "howto", "chat"]},
+            "question": {"type": "string"},
+        },
+        "required": ["kind", "question"],
+        "additionalProperties": False,
+    }
+    client = _client(cfg, _NARRATION_TIMEOUT_S)
+    message = await client.messages.create(
+        model=cfg.model,
+        max_tokens=2000,
+        system=_CHAT_ROUTER_RULES,
+        output_config={"effort": "low", "format": {"type": "json_schema", "schema": schema}},
+        messages=[{"role": "user", "content": _history_text(messages)}],
+    )
+    data = json.loads(_text_of(message))
+    latest = next(
+        (m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), ""
+    )
+    return data.get("kind", "chat"), (data.get("question") or latest).strip()
+
+
+async def _answer_howto(question: str, messages: list[dict[str, str]]) -> str:
+    cfg = require_provider()
+    client = _client(cfg, _NARRATION_TIMEOUT_S)
+    message = await client.messages.create(
+        model=cfg.model,
+        max_tokens=4000,
+        system=(
+            "You are the assistant inside a jewellery shop's ERP. Explain how to "
+            "do things using ONLY the guide below — it describes this system, and "
+            "screens or buttons outside it do not exist. If the guide does not "
+            "cover something, say so plainly rather than guessing. Answer in the "
+            "language the person used (English, Urdu or Roman-Urdu), in a few "
+            "short sentences or steps.\n\n" + WORKFLOW_GUIDE
+        ),
+        output_config={"effort": "low"},
+        messages=[{"role": "user", "content": f"{_history_text(messages)}\n\nAnswer: {question}"}],
+    )
+    return _text_of(message) or "I could not answer that."
+
+
+async def chat(db: AsyncSession, messages: list[dict[str, str]]) -> ChatTurn:
+    """
+    One conversational turn. Read-only by construction.
+
+    A data question goes through exactly the same path as `/ask` — generated
+    SELECT, validated, planner-checked against the table allowlist, run in a
+    read-only transaction — so the conversation cannot reach anything the
+    single-shot endpoint could not, and cannot write at all. The SQL comes back
+    with the answer for the same reason it does there: it is the only way the
+    owner can tell a right answer from a confidently wrong one.
+    """
+    kind, question = await _route(messages)
+
+    if kind == "data":
+        generated = await generate_sql(question)
+        columns, rows = await run_select(db, generated.sql)
+        answer = await answer_from_rows(
+            question=question, sql=generated.sql, columns=columns, rows=rows
+        )
+        return ChatTurn(
+            reply=answer or "The query ran; the rows are below.",
+            kind=kind,
+            sql=generated.sql,
+            columns=columns,
+            rows=rows,
+            notes=generated.notes,
+            model=generated.model,
+        )
+
+    if kind == "howto":
+        return ChatTurn(reply=await _answer_howto(question, messages), kind=kind)
+
+    cfg = require_provider()
+    client = _client(cfg, _NARRATION_TIMEOUT_S)
+    message = await client.messages.create(
+        model=cfg.model,
+        max_tokens=1000,
+        system=(
+            "You are the assistant inside a jewellery shop's ERP. Be brief and "
+            "practical. You can answer questions about the shop's own records "
+            "and explain how to use the system — say so if it helps. Reply in "
+            "the language the person used."
+        ),
+        output_config={"effort": "low"},
+        messages=[{"role": "user", "content": _history_text(messages)}],
+    )
+    return ChatTurn(reply=_text_of(message) or "…", kind=kind)

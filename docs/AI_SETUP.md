@@ -92,6 +92,8 @@ AI_APP_NAME=Jewelry ERP
 | `/insights/wastage-anomalies` | Full figures and flags; `narrative` omitted |
 | `/insights/margin-watch` | Full figures and flags; `narrative` omitted |
 | `/insights/ask` | 503 with these setup instructions |
+| `/insights/chat` | 503 with these setup instructions |
+| `/products/{id}/image/generate` | 503 naming the image settings |
 
 The Insights screen shows a calm "not configured" panel naming the variables
 rather than an error.
@@ -107,3 +109,57 @@ rather than an error.
   computed in SQL and passed to the model, which is asked only to explain it.
 - **The generated SQL is returned with the answer** so it can be checked.
 - Ask is gated on the money permission, so counter staff cannot reach it.
+
+
+## The Assistant
+
+`/insights/chat` is `/ask` with a memory and a manual. The conversation is sent
+with each request rather than stored — a chat is not a business record, and
+keeping threads server-side would mean deciding when they expire and who else in
+the shop may read them.
+
+Each turn is routed first: a question about the records takes exactly the `/ask`
+path (generated SELECT, validated, `EXPLAIN`-checked against the allowlist, run
+read-only), a question about using the system is answered from a written guide
+to the app's own screens, and anything else gets a short reply. The routing step
+also rewrites the message so it stands alone, which is what makes "and last
+month?" work.
+
+It can read anything in the curated schema and write nothing. Same permission as
+Ask, so counter staff cannot reach it.
+
+The workflow guide lives in `WORKFLOW_GUIDE` in `app/services/ai.py`, as prose
+rather than generated from the routes: a route list describes the API, and a
+shop assistant has to describe the work. **Edit it when a screen changes** —
+otherwise the assistant will confidently describe a button that has moved.
+
+## Generated images
+
+For showing a customer a piece before any gold is cut, optionally guided by
+photographs of others in the tray.
+
+```bash
+AI_PROVIDER=openrouter
+OPENROUTER_API_KEY=sk-or-...
+AI_IMAGE_MODEL=google/gemini-2.5-flash-image-preview   # optional; this is the default
+```
+
+OpenRouter only — Anthropic's models do not draw, and a shop configured for
+Anthropic is told exactly that rather than getting a failed call to decode.
+
+Three things to know:
+
+- **It costs money per call.** Cents, not the fractions of a cent the text
+  models cost. Nothing generates an image except a person pressing the button:
+  there is no generate-on-save, on-view, or on-schedule anywhere.
+- **Its own permission, `ai:image`.** Counter staff hold `product:write` because
+  they photograph finished pieces all day; commissioning a drawing is a
+  different act and bills the shop, so it sits with admins and accountants.
+- **Attaching is a separate step.** A generated picture is stored and shown
+  first, and becomes the product's image only when somebody chooses it. The
+  image on a finished product may be a photograph of the actual article, and an
+  illustration must never quietly replace one.
+
+The prompt is kept in the audit log. An image that misrepresents a piece to a
+customer is a real dispute and the first question is what was asked for.
+Reference photographs are not stored — only how many were used.

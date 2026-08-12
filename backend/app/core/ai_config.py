@@ -42,6 +42,15 @@ DEFAULT_MODELS = {
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
+# Drawing a piece is a different job from writing a sentence about one, and no
+# text model can do it. Kept as its own setting so switching the narrator to a
+# cheaper model cannot silently break image generation, and so a shop that wants
+# the prose but not the pictures simply leaves it unset.
+#
+# Images cost real money per call — cents, not the fractions of a cent the text
+# models cost — so nothing generates one without somebody asking for it.
+DEFAULT_IMAGE_MODEL = "google/gemini-2.5-flash-image-preview"
+
 SETUP_INSTRUCTIONS = (
     "AI features are not configured. Either set AI_PROVIDER=openrouter with "
     "OPENROUTER_API_KEY (optionally AI_MODEL, default "
@@ -89,6 +98,7 @@ class AISettings:
     # their dashboard. Optional and cosmetic; requests work without them.
     app_url: str | None
     app_name: str
+    image_model: str
 
     @property
     def api_key(self) -> str | None:
@@ -102,6 +112,15 @@ class AISettings:
     def configured(self) -> bool:
         """True only when a call could actually be made."""
         return self.provider in ("anthropic", "openrouter") and bool(self.api_key)
+
+    @property
+    def images_configured(self) -> bool:
+        """
+        Image generation goes through OpenRouter only. Anthropic's models do not
+        draw, so a shop configured for Anthropic gets a clear "not available
+        on this provider" rather than a failed call it has to interpret.
+        """
+        return self.provider == "openrouter" and bool(self.api_key)
 
     @property
     def unconfigured_reason(self) -> str | None:
@@ -129,4 +148,5 @@ def get_ai_settings() -> AISettings:
         model=_env("AI_MODEL") or DEFAULT_MODELS.get(provider, DEFAULT_MODELS["openrouter"]),
         app_url=_env("AI_APP_URL"),
         app_name=_env("AI_APP_NAME") or "Jewelry ERP",
+        image_model=_env("AI_IMAGE_MODEL") or DEFAULT_IMAGE_MODEL,
     )

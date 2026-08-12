@@ -8,6 +8,7 @@ import { toast } from "@/components/Toast";
 import { apiError } from "@/lib/api-error";
 import { Currency, fmtMoney } from "@/lib/money";
 import { staticUrl } from "@/lib/url";
+import { ImageStudio } from "@/components/ImageStudio";
 
 interface Stone {
   id: number;
@@ -54,6 +55,7 @@ export function ProductDetailPage() {
   const [error, setError] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
   const [removing, setRemoving] = useState<ProductStone | null>(null);
+  const [drawing, setDrawing] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -118,6 +120,16 @@ export function ProductDetailPage() {
               No image
             </div>
           )}
+          <button className="btn-ghost mt-3 w-full text-sm" onClick={() => setDrawing(true)}>
+            {product.image_url ? "Draw a proposal" : "Draw a proposal from a description"}
+          </button>
+          <ImageStudio
+            productId={product.id}
+            productName={product.name}
+            open={drawing}
+            onClose={() => setDrawing(false)}
+            onAttached={load}
+          />
         </section>
 
         <section className="card lg:col-span-2">

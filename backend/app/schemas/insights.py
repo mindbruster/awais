@@ -6,7 +6,7 @@ is the contract the frontend is built against: figures always, prose sometimes.
 """
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -140,3 +140,34 @@ class AskResponse(BaseModel):
     row_count: int
     truncated: bool
     answer: str | None
+
+
+class ChatMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=4000)
+
+
+class ChatRequest(BaseModel):
+    """
+    The whole conversation, sent each turn.
+
+    Stateless on purpose: nothing about a chat belongs in the shop's database,
+    and holding threads server-side would mean deciding when they expire and
+    who else may read them. The client owns the transcript; the server owns the
+    read-only guarantee.
+    """
+
+    messages: list[ChatMessage] = Field(min_length=1, max_length=40)
+
+
+class ChatResponse(BaseModel):
+    reply: str
+    # Which path answered: "data" went to the books, "howto" to the workflow
+    # guide, "chat" to neither. Surfaced so the UI can show the query behind a
+    # figure and say nothing at all when there wasn't one.
+    kind: str
+    sql: str | None = None
+    columns: list[str] | None = None
+    rows: list[dict[str, Any]] | None = None
+    notes: str | None = None
+    model: str | None = None

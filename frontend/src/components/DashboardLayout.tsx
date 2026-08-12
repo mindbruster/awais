@@ -26,6 +26,9 @@ const NAV: NavItem[] = [
   { to: "/reports", label: "Reports" },
   // Owner-level analysis; staff already cannot see the money reports it reads.
   { to: "/insights", label: "Insights", roles: ["admin", "accountant"] },
+  // Same gate as Insights: a data question here generates a query that can
+  // read customer balances and margins, so it is exactly as sensitive.
+  { to: "/assistant", label: "Assistant", roles: ["admin", "accountant"] },
 ];
 
 // Buying: metal back over the counter, and stones from suppliers. Counter staff

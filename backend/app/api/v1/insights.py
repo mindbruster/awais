@@ -24,6 +24,8 @@ from app.models.vendor import Vendor
 from app.schemas.insights import (
     AskRequest,
     AskResponse,
+    ChatRequest,
+    ChatResponse,
     CustomerDiscountRow,
     MarginRow,
     MarginWatchReport,
@@ -562,4 +564,32 @@ async def ask(payload: AskRequest, db: DbSession) -> AskResponse:
         row_count=len(rows),
         truncated=len(rows) >= ai.MAX_ROWS,
         answer=answer,
+    )
+
+
+@router.post("/chat", response_model=ChatResponse, dependencies=[profit])
+async def chat(payload: ChatRequest, db: DbSession) -> ChatResponse:
+    """
+    A conversation with the shop's own records, and with its manual.
+
+    Owner-level for the same reason `/ask` is: a data question here takes
+    exactly that path — generated SELECT, validated, planner-checked against the
+    table allowlist, executed read-only — so this endpoint is as sensitive as
+    the most sensitive table that path can reach. It can read anything in the
+    curated schema and it can write nothing.
+
+    The transcript arrives with each request rather than being held here. A chat
+    is not a business record, and storing threads would mean answering who else
+    may read them — a question the shop has not asked and should not have
+    imposed on it.
+    """
+    turn = await ai.chat(db, [m.model_dump() for m in payload.messages])
+    return ChatResponse(
+        reply=turn.reply,
+        kind=turn.kind,
+        sql=turn.sql,
+        columns=turn.columns,
+        rows=turn.rows,
+        notes=turn.notes,
+        model=turn.model,
     )

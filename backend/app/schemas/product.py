@@ -52,3 +52,18 @@ class ProductRead(TimestampedRead, ProductBase):
     gross_weight_g: Decimal | None = None
     other_charges: Decimal = Decimal("0")
     stocked_at: datetime | None = None
+
+
+class GeneratedImageRead(BaseModel):
+    """
+    What came back from a drawing request.
+
+    `attached` is echoed rather than assumed: the caller asked for a proposal or
+    for the product's image, and the difference decides whether the operator is
+    looking at a suggestion or at what the catalogue now shows.
+    """
+
+    image_url: str
+    model: str
+    attached: bool
+    references_used: int

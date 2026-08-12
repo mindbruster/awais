@@ -15,6 +15,7 @@ import { InvoiceDetailPage } from "@/pages/InvoiceDetailPage";
 import { CustomerDetailPage } from "@/pages/CustomerDetailPage";
 import { StockMovementsPage } from "@/pages/StockMovementsPage";
 import { ReportsPage } from "@/pages/ReportsPage";
+import { AssistantPage } from "@/pages/AssistantPage";
 import { DepartmentsPage } from "@/pages/settings/DepartmentsPage";
 import { ItemsPage } from "@/pages/settings/ItemsPage";
 import { AttributeOptionsPage } from "@/pages/settings/AttributeOptionsPage";
@@ -84,6 +85,7 @@ export const router = createBrowserRouter([
           { path: "/ledger/journal", element: <JournalPage /> },
           { path: "/ledger/accounts", element: <ChartOfAccountsPage /> },
           { path: "/insights", element: <InsightsPage /> },
+          { path: "/assistant", element: <AssistantPage /> },
         ],
       },
     ],

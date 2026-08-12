@@ -15,6 +15,10 @@ PERMISSIONS: dict[str, set[str]] = {
     "accountant": {
         "customer:read", "customer:write", "customer:delete",
         "product:read", "product_stone:write",
+        # Drawing a proposal costs real money per call, so it is its own
+        # permission rather than riding on product:write — which counter staff
+        # hold, because they upload photographs of finished pieces all day.
+        "ai:image",
         "inventory:read",
         "stock_movement:read",
         "vendor:read",

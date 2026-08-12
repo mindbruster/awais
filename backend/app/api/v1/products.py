@@ -1,14 +1,20 @@
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy import or_, select
 from starlette.concurrency import run_in_threadpool
 from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import CurrentUser, DbSession, require_password_confirm, require_perm
 from app.models.product import Product
-from app.schemas.product import ProductCreate, ProductRead, ProductUpdate
+from app.schemas.product import (
+    GeneratedImageRead,
+    ProductCreate,
+    ProductRead,
+    ProductUpdate,
+)
+from app.services import image_gen
 from app.services.audit import log_action
 from app.services.serial import next_product_serial
 from app.services.storage import StorageError, get_storage
@@ -170,3 +176,104 @@ async def upload_image(
         await run_in_threadpool(storage.delete, previous_url)
 
     return product
+
+
+@router.post(
+    "/{product_id}/image/generate",
+    response_model=GeneratedImageRead,
+    # Not `write`: uploading a photograph and commissioning a drawing are
+    # different acts. The first is free and part of counter work; the second
+    # bills the shop per call.
+    dependencies=[Depends(require_perm("ai:image"))],
+)
+async def generate_product_image(
+    product_id: int,
+    db: DbSession,
+    current: CurrentUser,
+    prompt: str = Form(..., min_length=3, max_length=2000),
+    attach: bool = Form(default=False),
+    references: list[UploadFile] = File(default=[]),
+) -> GeneratedImageRead:
+    """
+    Draw a proposal for this piece, optionally guided by photographs.
+
+    `attach=false` by default, and that default is the point: the picture is
+    stored and handed back so somebody can look at it, and only becomes the
+    product's image when they say so. Drawing straight over a photograph of the
+    real finished article — which is what an attach-by-default would do on the
+    second attempt — replaces a record with an illustration.
+
+    Costs money per call, so nothing reaches here except by someone pressing the
+    button. There is no generate-on-save anywhere.
+    """
+    product = await db.get(Product, product_id)
+    if product is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Product not found")
+
+    refs: list[tuple[bytes, str]] = []
+    for upload in references[: image_gen.MAX_REFERENCES]:
+        media_type = (upload.content_type or "").lower()
+        if media_type not in image_gen.ALLOWED_REFERENCE_TYPES:
+            raise HTTPException(
+                status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                f"Reference images must be one of "
+                f"{', '.join(sorted(image_gen.ALLOWED_REFERENCE_TYPES))}; got "
+                f"{media_type or 'unknown'}.",
+            )
+        # Same chunked read as the upload endpoint, for the same reason: measure
+        # as it arrives rather than allocating the whole body to find its size.
+        chunks: list[bytes] = []
+        total = 0
+        while chunk := await upload.read(64 * 1024):
+            total += len(chunk)
+            if total > image_gen.MAX_REFERENCE_BYTES:
+                raise HTTPException(
+                    status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    f"Reference images are limited to "
+                    f"{image_gen.MAX_REFERENCE_BYTES // (1024 * 1024)}MB each.",
+                )
+            chunks.append(chunk)
+        if chunks:
+            refs.append((b"".join(chunks), media_type))
+
+    generated = await image_gen.generate(prompt, references=refs)
+
+    storage = get_storage()
+    fname = f"product_{product_id}_gen_{uuid.uuid4().hex}{generated.extension}"
+    try:
+        url = await run_in_threadpool(storage.save, generated.data, filename=fname)
+    except StorageError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+
+    previous_url = product.image_url
+    if attach:
+        product.image_url = url
+        await db.commit()
+        await db.refresh(product)
+
+    await log_action(
+        db,
+        user_id=current.id,
+        action="product.image_generate",
+        resource_type="product",
+        resource_id=product_id,
+        # The prompt is kept because an image that misrepresents a piece to a
+        # customer is a real dispute, and the first question is what was asked
+        # for. The reference photographs are not stored — only how many.
+        details={
+            "prompt": prompt[:500],
+            "references": len(refs),
+            "model": generated.model,
+            "attached": attach,
+        },
+    )
+    await db.commit()
+
+    # Only sweep the old file once the row is committed away from it, and never
+    # when it was a real photograph the operator did not ask to replace.
+    if attach and previous_url and previous_url != url:
+        await run_in_threadpool(storage.delete, previous_url)
+
+    return GeneratedImageRead(
+        image_url=url, model=generated.model, attached=attach, references_used=len(refs)
+    )

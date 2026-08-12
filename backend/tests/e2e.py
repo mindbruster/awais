@@ -2075,6 +2075,72 @@ def main() -> int:
     r = client.get("/insights/wastage-anomalies", headers=staff_auth, params={"days": 90})
     check("staff cannot read the wastage analysis → 403", r.status_code == 403, f"got {r.status_code}")
 
+    # --- the assistant ---
+    # A data question here takes exactly the /ask path, so it is exactly as
+    # sensitive and fails exactly as cleanly.
+    r = client.post("/insights/chat", headers=auth, json={
+        "messages": [{"role": "user", "content": "kitna sona Zahid ke paas hai"}],
+    })
+    check(
+        "the assistant returns a clean 503 when no model is configured",
+        r.status_code == 503,
+        f"got {r.status_code}: {r.text[:200]} — an unconfigured model must not 500",
+    )
+    check(
+        "and the 503 says how to configure it",
+        "AI_PROVIDER" in r.text,
+        "a 503 nobody can act on is the same as a crash",
+    )
+    r = client.post("/insights/chat", headers=staff_auth, json={
+        "messages": [{"role": "user", "content": "what is the margin"}],
+    })
+    check(
+        "staff cannot use the assistant → 403",
+        r.status_code == 403,
+        f"got {r.status_code} — it can read customer balances and margins",
+    )
+    r = client.post("/insights/chat", headers=auth, json={"messages": []})
+    check("an empty conversation is rejected → 422", r.status_code == 422, f"got {r.status_code}")
+
+    # --- generated images ---
+    r = client.post(
+        f"/products/{finished_product_id}/image/generate",
+        headers=auth,
+        data={"prompt": "a 22k gold taka pendant with a floral border", "attach": "false"},
+    )
+    check(
+        "image generation returns a clean 503 when unconfigured",
+        r.status_code == 503,
+        f"got {r.status_code}: {r.text[:200]}",
+    )
+    r = client.post(
+        "/products/999999/image/generate", headers=auth, data={"prompt": "anything at all"}
+    )
+    check(
+        "generating for a product that does not exist → 404",
+        r.status_code == 404,
+        f"got {r.status_code} — the piece is checked before the provider is called, so a "
+        "typo cannot spend money",
+    )
+    r = client.post(f"/products/{finished_product_id}/image/generate", headers=auth, data={"prompt": "x"})
+    check("too short a prompt is refused → 422", r.status_code == 422, f"got {r.status_code}")
+    r = client.post(
+        f"/products/{finished_product_id}/image/generate",
+        headers=staff_auth,
+        data={"prompt": "a 22k gold taka pendant"},
+    )
+    check(
+        "staff cannot spend money on generated images → 403",
+        r.status_code == 403,
+        f"got {r.status_code}",
+    )
+    after = client.get(f"/products/{finished_product_id}", headers=auth).json()
+    check(
+        "a failed generation leaves the piece's image alone",
+        after.get("image_url") is None,
+        f"image_url={after.get('image_url')}",
+    )
+
     # ----- THE MONEY PATH: stock a piece, sell it, settle it, buy metal back -----
     section("Stock, settle, purchase")
 
