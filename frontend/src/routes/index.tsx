@@ -10,8 +10,6 @@ import { StonesPage } from "@/pages/StonesPage";
 import { CustomersPage } from "@/pages/CustomersPage";
 import { InventoryPage } from "@/pages/InventoryPage";
 import { VendorsPage } from "@/pages/VendorsPage";
-import { ManufacturingPage } from "@/pages/ManufacturingPage";
-import { ManufacturingJobPage } from "@/pages/ManufacturingJobPage";
 import { InvoicesPage } from "@/pages/InvoicesPage";
 import { InvoiceDetailPage } from "@/pages/InvoiceDetailPage";
 import { CustomerDetailPage } from "@/pages/CustomerDetailPage";
@@ -65,8 +63,6 @@ export const router = createBrowserRouter([
           { path: "/inventory", element: <InventoryPage /> },
           { path: "/stock-movements", element: <StockMovementsPage /> },
           { path: "/vendors", element: <VendorsPage /> },
-          { path: "/manufacturing", element: <ManufacturingPage /> },
-          { path: "/manufacturing/:id", element: <ManufacturingJobPage /> },
           { path: "/invoices", element: <InvoicesPage /> },
           { path: "/invoices/:id", element: <InvoiceDetailPage /> },
           { path: "/reports", element: <ReportsPage /> },

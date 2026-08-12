@@ -13,9 +13,9 @@ const GROUPS = [
   {
     title: "On the floor",
     tiles: [
-      { label: "Designs", to: "/designs", hint: "Every piece being made, and who is holding it" },
-      { label: "Manufacturing", to: "/manufacturing", hint: "Casting → setting → polish → finish" },
-      { label: "Products", to: "/products", hint: "Catalogue, serials, images" },
+      { label: "Designs", to: "/designs", hint: "Casting → setting → polish → finish, and who holds it" },
+      { label: "Products", to: "/products", hint: "Finished pieces: catalogue, serials, images" },
+      { label: "Workers", to: "/vendors", hint: "Karigars and their agreed wastage" },
     ],
   },
   {

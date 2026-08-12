@@ -10,7 +10,6 @@ from app.api.v1 import (
     inventory,
     invoices,
     ledger,
-    manufacturing,
     masters,
     payments,
     purchasing,
@@ -33,7 +32,6 @@ api_router.include_router(customers.router, prefix="/customers", tags=["customer
 api_router.include_router(inventory.router, prefix="/inventory", tags=["inventory"])
 api_router.include_router(stock_movements.router, prefix="/stock-movements", tags=["stock-movements"])
 api_router.include_router(vendors.router, prefix="/vendors", tags=["vendors"])
-api_router.include_router(manufacturing.router, prefix="/manufacturing", tags=["manufacturing"])
 api_router.include_router(invoices.router, prefix="/invoices", tags=["invoices"])
 api_router.include_router(reports.router, prefix="/reports", tags=["reports"])
 api_router.include_router(gold_rates.router, prefix="/gold-rates", tags=["gold-rates"])

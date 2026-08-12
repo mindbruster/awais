@@ -5,7 +5,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import lock_keys
 from app.models.invoice import Invoice
-from app.models.manufacturing import ManufacturingJob
 from app.models.product import Product
 
 # Stable bigint keys for pg_advisory_xact_lock — must be int8 range and deterministic.
@@ -51,10 +50,6 @@ async def _next_for_year(db: AsyncSession, model, column, prefix: str) -> str:
 
 async def next_product_serial(db: AsyncSession) -> str:
     return await _next_for_year(db, Product, Product.serial_no, "P")
-
-
-async def next_job_no(db: AsyncSession) -> str:
-    return await _next_for_year(db, ManufacturingJob, ManufacturingJob.job_no, "MJ")
 
 
 async def next_invoice_no(db: AsyncSession) -> str:

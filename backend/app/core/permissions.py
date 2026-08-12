@@ -18,7 +18,6 @@ PERMISSIONS: dict[str, set[str]] = {
         "inventory:read",
         "stock_movement:read",
         "vendor:read",
-        "manufacturing:read",
         "invoice:read", "invoice:write", "invoice:delete",
         "invoice:issue", "invoice:mark_paid", "invoice:void",
         "report:stock", "report:sales", "report:loss", "report:profit",
@@ -40,7 +39,6 @@ PERMISSIONS: dict[str, set[str]] = {
         "inventory:read", "inventory:write", "inventory:delete",
         "stock_movement:read", "stock_movement:write",
         "vendor:read", "vendor:write", "vendor:delete",
-        "manufacturing:read", "manufacturing:write",
         "invoice:read",
         # Staff sees stock + loss but NOT sales / profit (money-sensitive)
         "report:stock", "report:loss",

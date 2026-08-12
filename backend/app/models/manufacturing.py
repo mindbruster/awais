@@ -23,6 +23,24 @@ class JobStage(str, enum.Enum):
 
 
 class ManufacturingJob(Base, TimestampMixin):
+    """
+    RETIRED. Historical rows only — nothing writes here.
+
+    This was the first production model: three fixed stages held as columns on
+    one row, a single `loss` figure per stage, and no ledger posting at all, so
+    metal moved through it without ever reaching the books. The routing engine
+    (`designs` → `job_legs`) replaced it with editable departments, any number
+    of stages in any order, wastage split into allowed/actual/excess, and a
+    journal entry behind every issue and receive.
+
+    The table survives because the rows in it are real history: the loss report
+    still reads them and tags them `legacy`, so a shop that used the old module
+    can still see what those jobs cost. The API, the schemas, the serial
+    generator and the two screens are gone — a module that cannot post to the
+    ledger must not be reachable, or stock quietly leaves the gold account's
+    view. Read from it; do not write to it.
+    """
+
     __tablename__ = "manufacturing_jobs"
 
     id: Mapped[int] = mapped_column(primary_key=True)
