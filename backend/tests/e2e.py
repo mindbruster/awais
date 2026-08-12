@@ -1865,6 +1865,31 @@ def main() -> int:
         gold_amount_for("10") == expected_10,
         f"got {gold_amount_for('10')}, expected {expected_10}",
     )
+
+    # --- a line has to say which piece it is, not only what it cost ---
+    # `description` is typed at the counter and is routinely just "ring". The
+    # product is eager-joined on the row already, so naming it costs nothing and
+    # is what lets a bill be checked against the object in the box.
+    idline = client.post("/invoices", headers=auth, json={
+        "customer_id": customer_id, "sale_type": "normal", "currency": "PKR",
+        "gold_rate_per_g": "6500",
+        "items": [{
+            "product_id": finished_product_id, "description": "ring",
+            "quantity": 1, "gold_weight_g": "5", "gold_purity": 22,
+        }],
+    }).json()["items"][0]
+    check(
+        "an invoice line names the piece it is billing",
+        idline.get("product_name") and idline.get("product_serial_no"),
+        f"name={idline.get('product_name')} serial={idline.get('product_serial_no')} — "
+        "a line carrying only a typed description cannot identify anything",
+    )
+    check(
+        "and carries its photograph field for the printed bill",
+        "product_image_url" in idline,
+        "the customer's copy shows the article, so the field has to reach the client",
+    )
+
     r = client.post(
         "/invoices",
         headers=auth,

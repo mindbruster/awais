@@ -31,6 +31,12 @@ interface InvoiceItem {
   charged_gold_weight_g: string;
   billable_gold_weight_g: string;
   line_total: string;
+  // The piece itself. `description` is typed at the counter and is often just
+  // "ring"; these identify the physical object the customer is holding.
+  product_id: number | null;
+  product_name: string | null;
+  product_serial_no: string | null;
+  product_image_url: string | null;
 }
 
 interface Payment {
@@ -295,73 +301,154 @@ export function InvoiceDetailPage() {
           </div>
         </section>
 
-        <table className="mt-6 w-full text-sm">
-          <thead className="border-b border-slate-200 text-left text-xs uppercase text-slate-500">
-            <tr>
-              <th className="py-2">Description</th>
-              <th className="py-2 text-right">Qty</th>
-              <th className="py-2 text-right">Gold (g)</th>
-              <th className="py-2 text-right">Stone (ct)</th>
-              <th className="py-2 text-right">Labor</th>
-              <th className="py-2 text-right">Discount</th>
-              <th className="py-2 text-right">Line total</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-slate-100">
-            {invoice.items.map((it) => {
-              const ratti = Number(it.discount_ratti) > 0;
-              const wastage =
-                Number(it.sale_wastage_pct) > 0 || Number(it.sale_wastage_g) > 0;
-              const adjusted = ratti || wastage;
-              return (
-              <tr key={it.id}>
-                <td className="py-2">
-                  {it.description}
-                  {it.gold_purity ? (
-                    <div className="text-xs text-slate-500">
-                      {it.gold_purity}k @ {fmtMoney(it.gold_rate_per_g, invoice.currency)}/g · gold {fmtMoney(it.gold_amount, invoice.currency)} · stone {fmtMoney(it.stone_amount, invoice.currency)}
-                    </div>
-                  ) : null}
-                  {/* Spelled out on the customer's copy: the gold amount above
-                      is charged on less metal than the piece contains, and the
-                      document has to say so on its own. */}
-                  {wastage && (
-                    <div className="text-xs text-amber-700">
-                      Wastage{" "}
-                      {Number(it.sale_wastage_pct) > 0 ? `${it.sale_wastage_pct}%` : ""}
-                      {Number(it.sale_wastage_g) > 0 ? ` +${it.sale_wastage_g} g` : ""} — charged
-                      on {it.charged_gold_weight_g} g of {it.gold_weight_g} g
-                    </div>
-                  )}
-                  {ratti && (
-                    <div className="text-xs text-amber-700">
-                      Ratti discount {it.discount_ratti} / {it.ratti_base} — billed on{" "}
-                      {it.billable_gold_weight_g} g of {it.charged_gold_weight_g} g
-                    </div>
-                  )}
-                </td>
-                <td className="py-2 text-right">{it.quantity}</td>
-                <td className="py-2 text-right">
-                  {adjusted ? (
-                    <>
-                      <span className="text-slate-400 line-through">{it.gold_weight_g}</span>{" "}
-                      <span className="font-medium">{it.billable_gold_weight_g}</span>
-                    </>
-                  ) : (
-                    it.gold_weight_g
-                  )}
-                </td>
-                <td className="py-2 text-right">{it.stone_weight_ct}</td>
-                <td className="py-2 text-right">{fmtMoney(it.labor_amount, invoice.currency)}</td>
-                <td className="py-2 text-right text-red-600">
-                  {Number(it.line_discount) > 0 ? `-${fmtMoney(it.line_discount, invoice.currency)}` : "—"}
-                </td>
-                <td className="py-2 text-right font-medium">{fmtMoney(it.line_total, invoice.currency)}</td>
+        {/* The weight maths gets a column each rather than a sentence under the
+            description. A jeweller checking a bill reads down one number at a
+            time — net, what was added for wastage, what the ratti discount took
+            off, what was actually billed — and prose forces them to re-derive
+            it. Wide by nature, so it scrolls inside its own box and never makes
+            the page scroll sideways. */}
+        <div className="mt-6 overflow-x-auto">
+          <table className="w-full min-w-[64rem] text-sm tabular-nums">
+            <thead className="border-b border-slate-200 text-left text-xs uppercase text-slate-500">
+              <tr>
+                <th className="py-2 pr-3 font-medium">Piece</th>
+                <th className="py-2 px-2 text-right font-medium">Qty</th>
+                <th className="py-2 px-2 text-right font-medium">Purity</th>
+                <th className="py-2 px-2 text-right font-medium">Net g</th>
+                <th className="py-2 px-2 text-right font-medium">+ Wastage</th>
+                <th className="py-2 px-2 text-right font-medium">− Ratti</th>
+                <th className="py-2 px-2 text-right font-medium">Billed g</th>
+                <th className="py-2 px-2 text-right font-medium">Rate/g</th>
+                <th className="py-2 px-2 text-right font-medium">Gold</th>
+                <th className="py-2 px-2 text-right font-medium">Stone</th>
+                <th className="py-2 px-2 text-right font-medium">Making</th>
+                <th className="py-2 px-2 text-right font-medium">Disc</th>
+                <th className="py-2 pl-2 text-right font-medium">Total</th>
               </tr>
-              );
-            })}
-          </tbody>
-        </table>
+            </thead>
+            <tbody className="divide-y divide-slate-100 align-top">
+              {invoice.items.map((it) => {
+                const net = Number(it.gold_weight_g);
+                const charged = Number(it.charged_gold_weight_g);
+                const billable = Number(it.billable_gold_weight_g);
+                // Derived by subtraction from the server's own figures rather
+                // than recomputed from the percentage, so the printed document
+                // can only ever agree with what was billed.
+                const addedByWastage = charged - net;
+                const takenByRatti = charged - billable;
+                const ct = Number(it.stone_weight_ct);
+                return (
+                  <tr key={it.id}>
+                    <td className="py-3 pr-3">
+                      <div className="flex items-start gap-3">
+                        {it.product_image_url ? (
+                          <img
+                            src={it.product_image_url}
+                            alt={it.product_name ?? it.description}
+                            className="h-12 w-12 flex-none rounded object-cover ring-1 ring-slate-200"
+                          />
+                        ) : (
+                          <div
+                            className="flex h-12 w-12 flex-none items-center justify-center rounded bg-slate-100 text-[10px] text-slate-400 ring-1 ring-slate-200"
+                            title="No photograph on this piece"
+                          >
+                            no photo
+                          </div>
+                        )}
+                        <div className="min-w-0">
+                          <div className="font-medium text-slate-900">{it.description}</div>
+                          {it.product_serial_no && (
+                            <div className="font-mono text-xs text-slate-500">
+                              {it.product_id ? (
+                                <Link className="hover:underline" to={`/products/${it.product_id}`}>
+                                  {it.product_serial_no}
+                                </Link>
+                              ) : (
+                                it.product_serial_no
+                              )}
+                            </div>
+                          )}
+                          {it.product_name && it.product_name !== it.description && (
+                            <div className="text-xs text-slate-500">{it.product_name}</div>
+                          )}
+                        </div>
+                      </div>
+                    </td>
+                    <td className="py-3 px-2 text-right">{it.quantity}</td>
+                    <td className="py-3 px-2 text-right">
+                      {it.gold_purity ? `${it.gold_purity}k` : "—"}
+                    </td>
+                    <td className="py-3 px-2 text-right">{net ? net.toFixed(3) : "—"}</td>
+                    {/* Wastage is money the shop earns and the ratti discount is
+                        money it gives away. Coloured against each other so the
+                        customer can see both halves of the negotiation. */}
+                    <td className="py-3 px-2 text-right">
+                      {addedByWastage > 0 ? (
+                        <span className="text-amber-700">
+                          +{addedByWastage.toFixed(3)}
+                          <span className="block text-[10px] text-slate-400">
+                            {Number(it.sale_wastage_pct) > 0 ? `${Number(it.sale_wastage_pct)}%` : ""}
+                            {Number(it.sale_wastage_g) > 0 ? ` +${Number(it.sale_wastage_g)}g` : ""}
+                          </span>
+                        </span>
+                      ) : (
+                        "—"
+                      )}
+                    </td>
+                    <td className="py-3 px-2 text-right">
+                      {takenByRatti > 0 ? (
+                        <span className="text-emerald-700">
+                          −{takenByRatti.toFixed(3)}
+                          <span className="block text-[10px] text-slate-400">
+                            {Number(it.discount_ratti)} of {it.ratti_base} ratti
+                          </span>
+                        </span>
+                      ) : (
+                        "—"
+                      )}
+                    </td>
+                    <td className="py-3 px-2 text-right font-medium text-slate-900">
+                      {billable ? billable.toFixed(3) : "—"}
+                    </td>
+                    <td className="py-3 px-2 text-right">
+                      {Number(it.gold_rate_per_g)
+                        ? fmtMoney(it.gold_rate_per_g, invoice.currency)
+                        : "—"}
+                    </td>
+                    <td className="py-3 px-2 text-right">
+                      {fmtMoney(it.gold_amount, invoice.currency)}
+                    </td>
+                    <td className="py-3 px-2 text-right">
+                      {ct > 0 ? (
+                        <>
+                          {fmtMoney(it.stone_amount, invoice.currency)}
+                          <span className="block text-[10px] text-slate-400">
+                            {ct.toFixed(2)} ct @ {fmtMoney(it.stone_rate_per_ct, invoice.currency)}
+                          </span>
+                        </>
+                      ) : (
+                        "—"
+                      )}
+                    </td>
+                    <td className="py-3 px-2 text-right">
+                      {Number(it.labor_amount)
+                        ? fmtMoney(it.labor_amount, invoice.currency)
+                        : "—"}
+                    </td>
+                    <td className="py-3 px-2 text-right text-red-600">
+                      {Number(it.line_discount) > 0
+                        ? `−${fmtMoney(it.line_discount, invoice.currency)}`
+                        : "—"}
+                    </td>
+                    <td className="py-3 pl-2 text-right font-medium text-slate-900">
+                      {fmtMoney(it.line_total, invoice.currency)}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
 
         <section className="mt-4 ml-auto w-full max-w-xs space-y-1 border-t border-slate-200 pt-3 text-sm">
           <Row label="Subtotal">{fmtMoney(invoice.subtotal, invoice.currency)}</Row>

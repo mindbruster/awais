@@ -130,3 +130,21 @@ class InvoiceItem(Base, TimestampMixin):
     sale_wastage_pct: Mapped[float] = mapped_column(Numeric(6, 3), default=0, nullable=False)
     sale_wastage_g: Mapped[float] = mapped_column(Numeric(14, 4), default=0, nullable=False)
     line_total: Mapped[float] = mapped_column(Numeric(14, 2), default=0, nullable=False)
+
+    # Read through to the piece, so a bill can say which one it is rather than
+    # only what it cost. Read live rather than snapshotted on purpose: a
+    # photograph and a serial identify a physical object that still exists, and
+    # if the shop replaces a bad photo the old bill should show the good one.
+    # The money columns above are the opposite — those are snapshots and must
+    # never move. `product` is eager-joined, so none of these cost a query.
+    @property
+    def product_name(self) -> str | None:
+        return self.product.name if self.product else None
+
+    @property
+    def product_serial_no(self) -> str | None:
+        return self.product.serial_no if self.product else None
+
+    @property
+    def product_image_url(self) -> str | None:
+        return self.product.image_url if self.product else None

@@ -52,6 +52,15 @@ class InvoiceItemRead(TimestampedRead, InvoiceItemCreate):
     stone_amount: Decimal
     line_total: Decimal
 
+    # Who the piece is, not just what it cost. `description` is free text typed
+    # at the counter and is often just "ring" — it cannot identify anything.
+    # These come off the product already eager-joined on the row, so they cost
+    # no extra query. Without them a bill cannot be checked against the piece in
+    # the box, and a returned item cannot be traced to what it was made from.
+    product_name: str | None = None
+    product_serial_no: str | None = None
+    product_image_url: str | None = None
+
     @computed_field  # type: ignore[prop-decorator]
     @property
     def charged_gold_weight_g(self) -> Decimal:
