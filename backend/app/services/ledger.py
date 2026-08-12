@@ -287,6 +287,47 @@ async def balance(
     return d((await db.execute(stmt)).scalar_one())
 
 
+async def balance_pkr(
+    db: AsyncSession,
+    *,
+    account_code: str | None = None,
+    party_type: PartyType | None = None,
+    party_id: int | None = None,
+    up_to: date | None = None,
+) -> Decimal:
+    """
+    Signed balance in rupees, across every commodity on the account.
+
+    `balance` answers "how many of this unit", which is the only sensible
+    question for metal — grams and dollars cannot be added. A headline money
+    figure is the other question, and asking it through `balance` is a trap: a
+    dollar bill settled in rupees posts the debit as USD and the credit as PKR,
+    so summing one commodity keeps the payment and drops the invoice. The
+    account then reads as a large negative — the shop appears to owe its
+    customers a million rupees — while the ledger underneath is perfectly
+    correct and balanced.
+
+    Every line already carries `value_pkr`, converted at the rate in force when
+    it was written. Summing that is what turns a mixed-currency account back
+    into one number, and it stays stable afterwards because those rates were
+    snapshotted rather than re-read.
+    """
+    stmt = select(func.coalesce(func.sum(JournalLine.value_pkr), 0))
+    if account_code:
+        stmt = stmt.join(Account, Account.id == JournalLine.account_id).where(
+            Account.code == account_code
+        )
+    if party_type is not None:
+        stmt = stmt.where(JournalLine.party_type == party_type)
+    if party_id is not None:
+        stmt = stmt.where(JournalLine.party_id == party_id)
+    if up_to is not None:
+        stmt = stmt.join(
+            JournalEntry, JournalEntry.id == JournalLine.entry_id
+        ).where(JournalEntry.entry_date <= up_to)
+    return d((await db.execute(stmt)).scalar_one())
+
+
 async def worker_gold_balance(db: AsyncSession, worker_id: int) -> Decimal:
     """Fine grams of shop metal this worker is holding or owes."""
     return await balance(
@@ -299,11 +340,16 @@ async def worker_gold_balance(db: AsyncSession, worker_id: int) -> Decimal:
 
 
 async def customer_balance(db: AsyncSession, customer_id: int) -> Decimal:
-    """Rupees this customer owes the shop. Negative means they're in credit."""
-    return await balance(
+    """
+    Rupees this customer owes the shop. Negative means they're in credit.
+
+    Valued rather than per-commodity: a customer billed in dollars and paying
+    in rupees has legs on both sides of the account, and counting only the
+    rupee ones shows a paid-up customer as heavily in credit.
+    """
+    return await balance_pkr(
         db,
         account_code=SystemAccount.CUSTOMERS.value,
-        commodity=Commodity.PKR,
         party_type=PartyType.customer,
         party_id=customer_id,
     )

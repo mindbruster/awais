@@ -171,14 +171,20 @@ export function dateParams(r: DateRange): Record<string, string> {
 }
 
 /**
- * Instants — what the older /sales and /profit take. The whole-day widening is
- * deliberate: the reader picked days, not moments, and an invoice issued at
- * 18:00 on the closing date belongs inside the range.
+ * Plain dates under the `range_*` names, which is what /sales and /profit take.
+ *
+ * These two used to be sent as instants, widened here to `T23:59:59Z` so an
+ * invoice issued at 18:00 on the closing date stayed inside the range. That
+ * widening now happens on the server, where it belongs — every report shares
+ * one window helper, so the same requested month can no longer give a
+ * different answer depending on which report you opened. Sending an instant to
+ * them is now rejected outright, so the only difference left from
+ * `dateParams` is the parameter names.
  */
 export function rangeParams(r: DateRange): Record<string, string> {
   const p: Record<string, string> = {};
-  if (r.from) p.range_from = `${r.from}T00:00:00Z`;
-  if (r.to) p.range_to = `${r.to}T23:59:59Z`;
+  if (r.from) p.range_from = r.from;
+  if (r.to) p.range_to = r.to;
   return p;
 }
 

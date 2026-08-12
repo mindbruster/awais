@@ -651,17 +651,25 @@ async def trial_balance(
 
 @router.get("/position", response_model=PositionReport, dependencies=[read])
 async def position(db: DbSession) -> PositionReport:
-    """What the shop is worth this morning: cash, metal, and who owes whom."""
-    cash = await ledger.balance(db, account_code=SystemAccount.CASH_IN_HAND.value)
+    """
+    What the shop is worth this morning: cash, metal, and who owes whom.
+
+    The metal figures are grams and the money figures are rupees, so they are
+    asked for differently: `balance` for a single commodity's own unit,
+    `balance_pkr` for the value of an account whose lines may be in more than
+    one currency. Reading the money heads per-commodity would drop the invoice
+    side of any bill raised in dollars and settled in rupees.
+    """
+    cash = await ledger.balance_pkr(db, account_code=SystemAccount.CASH_IN_HAND.value)
     gold = await ledger.balance(
         db, account_code=SystemAccount.GOLD_IN_HAND.value, commodity=Commodity.GOLD
     )
     with_workers = await ledger.balance(
         db, account_code=SystemAccount.GOLD_WITH_WORKERS.value, commodity=Commodity.GOLD
     )
-    receivable = await ledger.balance(db, account_code=SystemAccount.CUSTOMERS.value)
-    suppliers = await ledger.balance(db, account_code=SystemAccount.SUPPLIERS.value)
-    workers = await ledger.balance(db, account_code=SystemAccount.WORKERS_PAYABLE.value)
+    receivable = await ledger.balance_pkr(db, account_code=SystemAccount.CUSTOMERS.value)
+    suppliers = await ledger.balance_pkr(db, account_code=SystemAccount.SUPPLIERS.value)
+    workers = await ledger.balance_pkr(db, account_code=SystemAccount.WORKERS_PAYABLE.value)
 
     return PositionReport(
         as_of=datetime.now(timezone.utc).date(),

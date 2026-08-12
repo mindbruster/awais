@@ -589,6 +589,21 @@ def main() -> int:
     sb = r.json()
     check("stock report buckets present", isinstance(sb.get("by_type"), list) and len(sb["by_type"]) >= 1)
 
+    # These two take dates and widen the closing day server-side. They used to
+    # take instants, and the caller did the widening — so this pins the shape
+    # the UI has to send. Getting it wrong is a 422 on a panel that then renders
+    # an error where a number should be, which no API-level assertion about
+    # totals would ever notice.
+    for path in ("/reports/sales", "/reports/profit"):
+        r = client.get(f"{path}?range_from=2025-09-01&range_to=2026-12-31", headers=auth)
+        check(f"{path} takes plain dates → 200", r.status_code == 200, f"got {r.status_code}")
+        r = client.get(f"{path}?range_to=2026-12-31T23:59:59Z", headers=auth)
+        check(
+            f"{path} refuses an instant → 422",
+            r.status_code == 422,
+            f"got {r.status_code} — if this ever passes again, the UI may be sending instants",
+        )
+
     r = client.get("/reports/sales", headers=auth)
     check("sales report 200", r.status_code == 200)
     sales = r.json()
@@ -2656,6 +2671,35 @@ def main() -> int:
     check("the bill reads paid", after["status"] == "paid", after["status"])
     check("books balance after a cross-currency settlement",
           client.get("/ledger/trial-balance", headers=auth).json()["balanced"] is True)
+
+    # --- the headline money figures must survive a mixed-currency account ---
+    # The dollar bill above debited the receivable in USD and its settlement
+    # credited it in PKR. Reading that account one commodity at a time keeps the
+    # payment and drops the invoice, so a paid-up book reports the shop owing
+    # its customers a seven-figure sum. The trial balance stays perfectly
+    # balanced throughout, which is exactly why this needs its own assertion.
+    pos = client.get("/ledger/position", headers=auth).json()
+    recv = Decimal(str(pos["customer_receivable"]))
+    check(
+        "the receivable is valued across currencies, not read in one of them",
+        recv >= 0,
+        f"customer_receivable {recv} — a large negative means the USD leg was dropped",
+    )
+    cust_pkr = Decimal(str(client.get(
+        f"/ledger/statement?account_code=1210&commodity=PKR", headers=auth
+    ).json().get("closing_balance", 0)))
+    check(
+        "and it differs from the PKR-only reading, which is the whole point",
+        recv != cust_pkr,
+        f"valued {recv} vs PKR-only {cust_pkr}",
+    )
+    inv_view = client.get(f"/invoices/{usd_inv['id']}", headers=auth).json()
+    check(
+        "a customer's balance on an invoice is valued the same way",
+        Decimal(str(inv_view["customer_balance"])) >= 0,
+        f"customer_balance {inv_view['customer_balance']} — a settled dollar bill "
+        "must not leave its customer looking heavily in credit",
+    )
 
     # --- a stone priced in dollars must be capitalised in rupees ---
     usd_stone = client.post("/stones", headers=auth, json={

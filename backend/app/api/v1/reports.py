@@ -882,10 +882,9 @@ async def worker_performance_report(
         # 2120 is a liability, so what the shop owes sits there as a credit —
         # negative. Flipped here so the column reads as money out.
         payable = (
-            -await ledger.balance(
+            -await ledger.balance_pkr(
                 db,
                 account_code=SystemAccount.WORKERS_PAYABLE.value,
-                commodity=Commodity.PKR,
                 party_type=PartyType.worker,
                 party_id=worker_id,
             )
