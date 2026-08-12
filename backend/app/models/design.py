@@ -13,6 +13,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
+from app.models.currency import Currency
 from app.models.customer import Customer
 from app.models.department import Department
 from app.models.item import Item
@@ -249,6 +250,14 @@ class LegStone(Base, TimestampMixin):
     quantity_returned: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     weight_returned_ct: Mapped[float] = mapped_column(Numeric(14, 4), nullable=False, default=0)
     rate_per_ct: Mapped[float] = mapped_column(Numeric(14, 4), nullable=False, default=0)
+    # A rate without its currency is a number, not a price. Both are snapshotted
+    # here rather than read back off the stone master, which can be edited — and
+    # editing it would otherwise retroactively change what this row meant.
+    currency: Mapped[Currency] = mapped_column(
+        Enum(Currency, name="currency"), nullable=False, default=Currency.PKR
+    )
+    # Rupees per unit of `currency` when this row was written. 1 for PKR.
+    fx_rate_to_pkr: Mapped[float] = mapped_column(Numeric(18, 6), nullable=False, default=1)
 
     notes: Mapped[str | None] = mapped_column(Text)
 

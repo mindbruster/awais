@@ -2657,6 +2657,33 @@ def main() -> int:
     check("books balance after a cross-currency settlement",
           client.get("/ledger/trial-balance", headers=auth).json()["balanced"] is True)
 
+    # --- a stone priced in dollars must be capitalised in rupees ---
+    usd_stone = client.post("/stones", headers=auth, json={
+        "name": "Imported Emerald", "kind": "emerald", "category": "stone",
+        "default_rate_per_ct": "100", "currency": "USD",
+    }).json()
+    fx_prod = client.post("/products", headers=auth, json={
+        "name": "FX cost probe", "gold_weight_g": "0", "gold_purity": 22,
+    }).json()
+    before_cost = Decimal(str(fx_prod["material_cost"]))
+    r = client.post(f"/products/{fx_prod['id']}/stones", headers=auth, json={
+        "stone_id": usd_stone["id"], "quantity": 1, "weight_ct": "2", "rate_per_ct": "100",
+    })
+    check("attach a USD-priced stone → 201", r.status_code == 201, f"got {r.status_code}: {r.text[:200]}")
+    check(
+        "the row records the currency it was priced in",
+        r.json().get("currency") == "USD",
+        f"got {r.json().get('currency')} — a rate without its currency is a number, not a price",
+    )
+    after = client.get(f"/products/{fx_prod['id']}", headers=auth).json()
+    # 2ct at $100 = $200, at 280 = PKR 56,000. Unconverted it would read 200.
+    check(
+        "a dollar-priced stone is capitalised in rupees, not at its face number",
+        Decimal(str(after["material_cost"])) - before_cost == Decimal("56000.00"),
+        f"material_cost moved {Decimal(str(after['material_cost'])) - before_cost}, expected 56000.00 "
+        "(2ct x $100 x 280) — 200.00 would mean the FX was dropped",
+    )
+
     # ----- INTERNAL INVARIANTS -----
     section("Internal invariants")
     # Colliding advisory-lock keys don't error, they just make unrelated

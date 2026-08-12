@@ -47,6 +47,7 @@ from app.schemas.design import (
     TraceStone,
     TraceTotals,
 )
+from app.services import fx
 from app.services.audit import log_action
 from app.services.inventory import post_movement
 from app.services.ledger import d
@@ -422,12 +423,16 @@ async def issue_leg(
         stone = await db.get(Stone, line.stone_id)
         if stone is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"Stone #{line.stone_id} not found")
+        # Per line, because a leg can carry lots priced in different currencies.
+        leg_currency, leg_fx = await fx.snapshot_for_stone(db, stone)
         db.add(
             LegStone(
                 leg_id=leg.id,
                 stone_id=stone.id,
                 quantity_issued=line.quantity_issued,
                 weight_issued_ct=line.weight_issued_ct,
+                currency=leg_currency,
+                fx_rate_to_pkr=leg_fx,
                 rate_per_ct=line.rate_per_ct or d(stone.default_rate_per_ct),
             )
         )

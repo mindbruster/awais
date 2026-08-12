@@ -3,12 +3,14 @@ Compute and persist `products.material_cost`.
 
 material_cost = gold value at completion time (purity-adjusted, in PKR by
 default, priced at the rate locked on `products.gold_rate_at_cost`) + sum over
-product_stones of (qty × weight_ct × rate_per_ct).
+product_stones of (qty × weight_ct × rate_per_ct × fx_rate_to_pkr) — the last
+factor is what makes a dollar-priced stone land in the books as rupees.
 
-We use PKR as the canonical cost currency because the gold rate master is
-typically maintained in PKR. Stones snapshot their own currency at attach time
-but the per-product material_cost is summed without FX conversion — fine for a
-single-shop deployment, would need normalisation for multi-currency books.
+PKR is the canonical cost currency, for the same reason it is the book
+currency: a cost that cannot be added to another cost is not a cost. Stones
+snapshot the currency they were priced in *and* the rate that converted it, so
+a lot bought in dollars is capitalised in rupees at the rate on the day it was
+attached — and stays there when the rupee moves.
 """
 from __future__ import annotations
 
@@ -76,8 +78,17 @@ async def recompute_material_cost(
     ).scalars().all()
     stone_value = Decimal("0")
     for s in stones:
+        # Converted at the rate snapshotted on the row, not at today's. A stone
+        # bought in dollars contributes dollars unless something multiplies it
+        # out, and `material_cost` is a rupee figure that everything downstream
+        # — profit, margin, cost of goods — reads as rupees. Rows written before
+        # this existed carry 1, which is what they were: nothing could price a
+        # stone in another currency because nothing could convert it.
         stone_value += (
-            Decimal(str(s.weight_ct)) * Decimal(str(s.rate_per_ct)) * Decimal(str(s.quantity))
+            Decimal(str(s.weight_ct))
+            * Decimal(str(s.rate_per_ct))
+            * Decimal(str(s.quantity))
+            * Decimal(str(s.fx_rate_to_pkr or 1))
         )
     stone_value = stone_value.quantize(Decimal("0.01"))
 

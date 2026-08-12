@@ -8,6 +8,7 @@ from app.models.product import Product
 from app.models.product_stone import ProductStone
 from app.models.stone import Stone
 from app.schemas.product_stone import ProductStoneCreate, ProductStoneRead
+from app.services import fx
 from app.services.product_cost import recompute_material_cost
 
 router = APIRouter()
@@ -52,12 +53,18 @@ async def attach_stone(
         else (Decimal(str(stone.default_rate_per_ct or 0)))
     )
 
+    # The stone master carries the currency its default rate is quoted in; the
+    # row records both that and the conversion, so the cost is a rupee figure
+    # from the moment it is written.
+    currency, fx_rate = await fx.snapshot_for_stone(db, stone)
     ps = ProductStone(
         product_id=product_id,
         stone_id=stone.id,
         quantity=payload.quantity,
         weight_ct=payload.weight_ct,
         rate_per_ct=rate,
+        currency=currency,
+        fx_rate_to_pkr=fx_rate,
         notes=payload.notes,
     )
     db.add(ps)

@@ -43,7 +43,7 @@ from app.schemas.purchase import (
     SupplierRead,
     SupplierUpdate,
 )
-from app.services import purchasing
+from app.services import fx, purchasing
 from app.services.audit import log_action
 from app.services.gold_rate import rate_in_force
 from app.services.inventory import post_movement
@@ -474,7 +474,14 @@ async def create_stone_purchase(
         cut = line.cut or stone.cut
         color = line.color or stone.color
         clarity = line.clarity or stone.clarity
-        amount = purchasing.stone_line_amount(line.weight_ct, line.rate_per_ct)
+        # Converted before anything accumulates it. The supplier quotes in their
+        # own currency and the books are kept in rupees, so the line value, the
+        # bill subtotal, the stock value and the journal entry all have to be
+        # the same number — not three that happen to look similar.
+        line_currency, line_fx = await fx.snapshot_for_stone(db, stone)
+        amount = (
+            purchasing.stone_line_amount(line.weight_ct, line.rate_per_ct) * line_fx
+        ).quantize(Decimal("0.01"))
         subtotal += amount
 
         item = await purchasing.raw_stone_item(
@@ -486,6 +493,12 @@ async def create_stone_purchase(
             quantity=line.quantity,
             weight_ct=d(line.weight_ct),
             rate_per_ct=d(line.rate_per_ct),
+            currency=line_currency,
+            fx_rate_to_pkr=line_fx,
+            # Held in rupees, like every other money column in the system. The
+            # supplier quoted in their own currency; converting here means the
+            # bill total, the stock value and the ledger entry are the same
+            # number rather than three that happen to look similar.
             amount=amount,
             quality=quality,
             cut=cut,

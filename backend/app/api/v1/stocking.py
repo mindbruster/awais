@@ -35,7 +35,7 @@ from app.schemas.stocking import (
     StoneUseRead,
     WeightsRead,
 )
-from app.services import stocking
+from app.services import fx, stocking
 from app.services.audit import log_action
 from app.services.inventory import post_movement
 from app.services.ledger import d
@@ -322,6 +322,11 @@ async def stock_design(
     await db.flush()
 
     for row in resolved:
+        # Snapshotted per row: the stone master says what currency its rate is
+        # quoted in, and the conversion is locked now so the piece's cost stays
+        # what it was when it was stocked.
+        stone_row = await db.get(Stone, row.stone_id)
+        currency, fx_rate = await fx.snapshot_for_stone(db, stone_row)
         db.add(
             ProductStone(
                 product_id=product.id,
@@ -329,6 +334,8 @@ async def stock_design(
                 quantity=row.quantity,
                 weight_ct=row.each_ct,
                 rate_per_ct=row.rate_per_ct,
+                currency=currency,
+                fx_rate_to_pkr=fx_rate,
                 notes=row.notes,
             )
         )

@@ -89,3 +89,21 @@ def to_pkr(amount: Decimal, rate: Decimal) -> Decimal:
     """Convert at a rate already resolved, so the caller has to have thought
     about which date's rate it is using."""
     return (d(amount) * d(rate)).quantize(_PKR)
+
+
+async def snapshot_for_stone(db: AsyncSession, stone) -> tuple[Currency, Decimal]:
+    """
+    The currency a stone is priced in, and what converts it to rupees today.
+
+    Called wherever a stone rate is written down — a product's breakdown, a
+    setting leg, a supplier's bill. The pair is stored together on purpose: the
+    rate alone is a number, and reading the currency back off the stone master
+    later would let an edit to that master retroactively change what an old row
+    meant.
+
+    A stone master priced in a currency with no rate on record is refused
+    rather than silently treated as rupees, which would understate the cost by
+    the whole exchange rate and show the piece as far more profitable than it is.
+    """
+    currency = getattr(stone, "currency", None) or Currency.PKR
+    return currency, await require_rate(db, currency)
