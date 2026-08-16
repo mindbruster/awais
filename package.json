@@ -29,7 +29,7 @@
     "migrate": "node scripts/python.js -m alembic upgrade head",
     "seed": "node scripts/python.js -m app.seed",
     "test": "node scripts/python.js -m tests.e2e",
-    "test:smoke": "npm run test:smoke:branches && npm run test:smoke:orders && npm run test:smoke:risk && npm run test:smoke:notify && npm run test:smoke:approvals && npm run test:smoke:goldbuy && npm run test:smoke:partymetal && npm run test:smoke:trade",
+    "test:smoke": "npm run test:smoke:branches && npm run test:smoke:orders && npm run test:smoke:risk && npm run test:smoke:notify && npm run test:smoke:approvals && npm run test:smoke:goldbuy && npm run test:smoke:partymetal && npm run test:smoke:trade && npm run test:smoke:maker",
     "test:smoke:branches": "node scripts/python.js -m tests.smoke_branches",
     "test:smoke:orders": "node scripts/python.js -m tests.smoke_orders",
     "test:smoke:risk": "node scripts/python.js -m tests.smoke_karigar_risk",
@@ -38,6 +38,7 @@
     "test:smoke:goldbuy": "node scripts/python.js -m tests.smoke_gold_purchase",
     "test:smoke:partymetal": "node scripts/python.js -m tests.smoke_party_metal",
     "test:smoke:trade": "node scripts/python.js -m tests.smoke_trade_billing",
+    "test:smoke:maker": "node scripts/python.js -m tests.smoke_maker_leg",
 
     "//-- build / production --": "",
     "build": "npm --prefix frontend run build",

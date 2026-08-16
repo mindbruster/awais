@@ -568,6 +568,20 @@ function LegCard({
               allowed={Number(leg.wastage_allowed_g)}
               actual={Number(leg.wastage_actual_g)}
               excess={excess}
+              // The stored reckoning, on the legs that have one and where the
+              // purities actually differed. Legs closed before the fine columns
+              // existed have nothing here and read exactly as they always did.
+              fine={
+                leg.wastage_allowed_fine_g !== null &&
+                leg.gold_received_purity !== null &&
+                leg.gold_received_purity !== leg.gold_issued_purity
+                  ? {
+                      allowed: Number(leg.wastage_allowed_fine_g),
+                      actual: Number(leg.wastage_actual_fine_g),
+                      excess: Number(leg.wastage_excess_fine_g),
+                    }
+                  : undefined
+              }
               terms={terms}
               worker={leg.worker_name}
             />
@@ -671,6 +685,9 @@ function ReceivePanel({
   reload: () => void;
 }) {
   const [received, setReceived] = useState("");
+  // Blank means "the same metal came back", which is the ordinary case and the
+  // one the server reads a null as. Only the maker's leg fills this in.
+  const [receivedPurity, setReceivedPurity] = useState("");
   const [returns, setReturns] = useState<Record<number, { qty: string; ct: string }>>({});
   const [notes, setNotes] = useState("");
   const [busy, setBusy] = useState(false);
@@ -683,7 +700,8 @@ function ReceivePanel({
   const terms: Terms = termsOf(leg);
   // Typed weight, not the committed one: this is what makes the settlement
   // visible before the operator signs off on it.
-  const preview = settle(issued, Number(received || 0), terms);
+  const backPurity = receivedPurity === "" ? null : Number(receivedPurity);
+  const preview = settle(issued, Number(received || 0), terms, backPurity);
   const labour = labourOn(leg, Number(received || 0));
   const holder = leg.worker_name ?? "the bench";
 
@@ -696,6 +714,7 @@ function ReceivePanel({
     try {
       await api.post(`/designs/legs/${leg.id}/receive`, {
         gold_received_g: received || "0",
+        gold_received_purity: backPurity,
         stones: leg.stones.map((s) => ({
           leg_stone_id: s.id,
           quantity_returned: Number(returns[s.id]?.qty || 0),
@@ -756,6 +775,24 @@ function ReceivePanel({
           hint="Heavier than issued is fine — solder and findings add weight"
         />
 
+        {/* Pure metal goes out to the maker and 21k jewellery comes back. Left
+            blank the piece is taken to be the same metal that was issued,
+            which is what every other stage returns. */}
+        <TextField
+          label="Purity back (k)"
+          type="number"
+          step="1"
+          min={1}
+          max={24}
+          value={receivedPurity}
+          onChange={(e) => setReceivedPurity(e.target.value)}
+          hint={
+            leg.gold_issued_purity
+              ? `Blank means it came back at ${leg.gold_issued_purity}k, as issued`
+              : "Blank means it came back as issued"
+          }
+        />
+
         {received === "" ? (
           <p className="rounded-xl border border-dashed border-slate-300 px-3 py-4 text-center text-xs leading-relaxed text-slate-500">
             Weigh the piece and enter it above — the wastage settlement appears here before you
@@ -767,6 +804,18 @@ function ReceivePanel({
               allowed={preview.allowed}
               actual={preview.actual}
               excess={preview.excess}
+              // Only once the two ends differ — on an ordinary leg the two
+              // readings are the same number and showing both would suggest a
+              // distinction the operator does not have to think about.
+              fine={
+                preview.mixed
+                  ? {
+                      allowed: preview.allowedFine,
+                      actual: preview.actualFine,
+                      excess: preview.excessFine,
+                    }
+                  : undefined
+              }
               terms={terms}
               worker={leg.worker_name}
             />

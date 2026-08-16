@@ -99,6 +99,35 @@ def _fine_sql(weight, purity):
     return weight * func.coalesce(purity, 24) / Decimal("24")
 
 
+def _leg_received_fine_sql():
+    """
+    What a leg gave back, in fine grams, at the purity it actually came back at.
+
+    Scaling the returned weight by the *issued* purity is the reading this
+    release exists to correct: the maker is given pure metal and hands back
+    21k, so that arithmetic credits a job with about fourteen percent more
+    metal than arrived. Legs that said nothing about the return fall through to
+    the issued purity, which for them is the truth — the same metal came back.
+    """
+    return _fine_sql(
+        JobLeg.gold_received_g,
+        func.coalesce(JobLeg.gold_received_purity, JobLeg.gold_issued_purity),
+    )
+
+
+def _leg_wastage_fine_sql(stored, raw):
+    """
+    A wastage figure in fine grams, preferring the one the settlement wrote.
+
+    The stored column is the reckoning the worker was actually charged on, and
+    it knows things this expression cannot: which end of the job the allowance
+    was measured against, and the decimal tunch where a karat band would round.
+    Only legs settled before that column existed fall back to scaling the raw
+    figure, and for those the fallback is exactly what they were charged.
+    """
+    return func.coalesce(stored, _fine_sql(raw, JobLeg.gold_issued_purity))
+
+
 def _stamp(date_from: date | None, date_to: date | None) -> str:
     return f"{date_from or 'open'}_{date_to or clock.today()}"
 
@@ -294,6 +323,13 @@ async def manufacturing_loss_report(
     the worker's gold account is for. Rows off the retired table are still
     included and tagged `source: legacy`, so a shop that ran both models does
     not lose the first half of its history.
+
+    Every weight in the leg half of this report is in **fine grams**. It has to
+    be: the shop issues pure metal to the maker and takes back 21k, and summing
+    those as they were weighed adds two different assets together. The figures
+    move for a shop that reads this report on a single purity — 22k grams
+    become their 24k equivalent — but they become comparable, which they were
+    not before. The legacy half is left exactly as it was recorded.
     """
     start, end = _window(date_from, date_to)
 
@@ -305,11 +341,35 @@ async def manufacturing_loss_report(
             JobLeg.department_id,
             Department.name,
             func.count(JobLeg.id),
-            func.coalesce(func.sum(JobLeg.gold_issued_g), 0),
-            func.coalesce(func.sum(JobLeg.gold_received_g), 0),
-            func.coalesce(func.sum(JobLeg.wastage_allowed_g), 0),
-            func.coalesce(func.sum(JobLeg.wastage_actual_g), 0),
-            func.coalesce(func.sum(JobLeg.wastage_excess_g), 0),
+            # Every figure here is in *fine* grams, and has to be. A report that
+            # adds a leg's 24k issue to another's 21k return is adding two
+            # different assets and calling the sum grams. It survived only while
+            # the shop worked one purity end to end; the maker's leg — pure out,
+            # 21k back — makes the raw sum say a job came back heavier than it
+            # went, and a loss report built on that reads as the shop winning
+            # metal off its own karigars.
+            func.coalesce(
+                func.sum(_fine_sql(JobLeg.gold_issued_g, JobLeg.gold_issued_purity)), 0
+            ),
+            func.coalesce(func.sum(_leg_received_fine_sql()), 0),
+            func.coalesce(
+                func.sum(
+                    _leg_wastage_fine_sql(JobLeg.wastage_allowed_fine_g, JobLeg.wastage_allowed_g)
+                ),
+                0,
+            ),
+            func.coalesce(
+                func.sum(
+                    _leg_wastage_fine_sql(JobLeg.wastage_actual_fine_g, JobLeg.wastage_actual_g)
+                ),
+                0,
+            ),
+            func.coalesce(
+                func.sum(
+                    _leg_wastage_fine_sql(JobLeg.wastage_excess_fine_g, JobLeg.wastage_excess_g)
+                ),
+                0,
+            ),
         )
         .join(Department, Department.id == JobLeg.department_id)
         .join(Vendor, Vendor.id == JobLeg.worker_id, isouter=True)
@@ -837,6 +897,12 @@ async def worker_performance_report(
     owe him" are positions, not period totals, and an owner deciding whether to
     keep a worker needs both halves on one line.
 
+    The metal position runs both ways and a negative figure is not an error: a
+    maker who makes a piece on his own gold has the shop holding *his* metal
+    until it is handed back. One account swinging in both directions is how the
+    bazaar keeps this, and splitting it into two would leave a man's metal
+    position as two numbers that have to be read together to mean anything.
+
     Wastage as a percentage of issued is the column that ranks people. Raw grams
     just ranks whoever handles the most metal, which is usually the best worker
     in the shop.
@@ -1308,14 +1374,22 @@ async def gold_movement_report(
     # come off one pass over the legs that closed in the window.
     recv_q = bounded(
         select(
+            func.coalesce(func.sum(_leg_received_fine_sql()), 0),
             func.coalesce(
-                func.sum(_fine_sql(JobLeg.gold_received_g, JobLeg.gold_issued_purity)), 0
+                func.sum(
+                    _leg_wastage_fine_sql(
+                        JobLeg.wastage_actual_fine_g, JobLeg.wastage_actual_g
+                    )
+                ),
+                0,
             ),
             func.coalesce(
-                func.sum(_fine_sql(JobLeg.wastage_actual_g, JobLeg.gold_issued_purity)), 0
-            ),
-            func.coalesce(
-                func.sum(_fine_sql(JobLeg.wastage_excess_g, JobLeg.gold_issued_purity)), 0
+                func.sum(
+                    _leg_wastage_fine_sql(
+                        JobLeg.wastage_excess_fine_g, JobLeg.wastage_excess_g
+                    )
+                ),
+                0,
             ),
         ).where(JobLeg.status == LegStatus.received, JobLeg.received_at.is_not(None)),
         JobLeg.received_at,

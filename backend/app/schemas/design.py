@@ -1,10 +1,12 @@
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.models.design import DesignStatus, LabourBasis, LegStatus, WastageBasis
+from app.models.metal import Metal
 from app.schemas.common import ORMModel, TimestampedRead
+from app.services.pricing import DEFAULT_RATTI_BASE
 
 
 class DesignCreate(BaseModel):
@@ -47,18 +49,76 @@ class LegIssue(BaseModel):
     # reports as a party who is losing you metal. Leave it unset for in-house
     # work; the leg still tracks the metal, it just carries no ledger party.
     worker_id: int | None = None
-    gold_issued_g: Decimal = Field(gt=0)
+    metal: Metal = Metal.gold
+    # Zero is legal, and only on a leg the worker is supplying the metal for.
+    # The router refuses a nothing-issued leg that is not marked that way, so
+    # this stays a weight rather than becoming a second flag.
+    gold_issued_g: Decimal = Field(default=Decimal("0"), ge=0)
     gold_issued_purity: int | None = Field(default=None, ge=1, le=24)
-    gold_source_inventory_id: int
+    # Fineness as the trade quotes it — 99.9, 91.6, 87.5 — and preferred over
+    # the karat band above wherever both are sent. Silver is quoted this way
+    # only, which is the other reason it exists.
+    gold_issued_tunch_pct: Decimal | None = Field(default=None, gt=0, le=100)
+    # Not required when nothing is being issued: there is no shelf to take metal
+    # off. Required the moment a gram moves, and the router enforces that.
+    gold_source_inventory_id: int | None = None
     stones: list[LegStoneIssue] = Field(default_factory=list)
     stone_source_inventory_id: int | None = None
     # Pieces this leg covers — stones to be set, items to be lacquered.
     piece_count: int | None = Field(default=None, ge=0)
     wastage_basis: WastageBasis | None = None
     wastage_per_100_pcs_g: Decimal | None = Field(default=None, ge=0)
+    # The percentage deal, stated per job rather than read off the worker.
+    # Terms are struck job by job — the same maker works one piece on wastage
+    # and the next on a flat per-gram — so the counter has to be able to say so
+    # here. Left unset it still falls back to the worker's standing rate, which
+    # is what the shop retypes least.
+    wastage_allowed_pct: Decimal | None = Field(default=None, ge=0)
+    # The maker's deal: ratti of the weight he returns, against a base of 96.
+    wastage_ratti: Decimal | None = Field(default=None, ge=0)
+    wastage_ratti_base: int = Field(default=DEFAULT_RATTI_BASE, ge=1)
     labour_basis: LabourBasis = LabourBasis.per_gram
     labour_rate: Decimal | None = Field(default=None, ge=0)
+    # The piece is being made on the worker's own gold, which the shop will owe
+    # back. Separate from a zero issue weight because the shop sometimes issues
+    # *part* of the metal and the worker tops the rest up from his own.
+    metal_on_credit: bool = False
+    metal_due_date: date | None = None
     notes: str | None = None
+
+    @model_validator(mode="after")
+    def _deal_is_stated(self) -> "LegIssue":
+        """
+        A ratti figure and a ratti basis have to arrive together.
+
+        Either half alone settles silently and wrongly. A basis with no figure
+        allows the maker nothing and charges him the whole difference between
+        24k out and 21k back — which is most of the piece. A figure with no
+        basis is read against whatever convention the department defaults to
+        and is quietly ignored, so the shop believes it granted an allowance it
+        did not.
+        """
+        if self.wastage_basis is WastageBasis.ratti_of_received and self.wastage_ratti is None:
+            raise ValueError(
+                "This leg settles wastage in ratti, so it needs a ratti figure. "
+                "Send wastage_ratti — with none the worker is allowed nothing and "
+                "charged for the whole difference between what went out and what came back."
+            )
+        if self.wastage_ratti is not None and self.wastage_basis not in (
+            None,
+            WastageBasis.ratti_of_received,
+        ):
+            raise ValueError(
+                f"wastage_ratti was sent on a leg settling by {self.wastage_basis.value}, "
+                "where it means nothing. Send wastage_basis=ratti_of_received, or drop the ratti."
+            )
+        if self.wastage_ratti is not None and self.wastage_ratti > self.wastage_ratti_base:
+            raise ValueError(
+                f"wastage_ratti ({self.wastage_ratti}) cannot exceed wastage_ratti_base "
+                f"({self.wastage_ratti_base}) — the worker would be allowed to keep "
+                "everything he returned."
+            )
+        return self
 
 
 class LegStoneReturn(BaseModel):
@@ -68,10 +128,27 @@ class LegStoneReturn(BaseModel):
 
 
 class LegReceive(BaseModel):
+    """
+    What came back, and what it was.
+
+    The purity fields are the correction this release turns on. Pure metal goes
+    out to the maker and 21k jewellery comes back; left unstated, the return is
+    read as the same metal that went out and is credited as though it were
+    pure. Send whichever the scale and the touchstone gave you — they are read
+    as a pair, and stating either one means "this is what came back".
+    """
+
     # May exceed what was issued. Solder, alloy and findings are added while the
     # piece is being worked, so a heavier return is routine and rejecting it
     # would push the shop into falsifying the weight to get the leg closed.
     gold_received_g: Decimal = Field(ge=0)
+    gold_received_purity: int | None = Field(default=None, ge=1, le=24)
+    gold_received_tunch_pct: Decimal | None = Field(default=None, gt=0, le=100)
+    # Where the metal lands, for the one leg that has no shelf of its own to go
+    # back to: the worker supplied the gold, so nothing was ever taken out of
+    # stock and there is no source to return it to. Ignored on every other leg,
+    # which puts the metal back where it came from.
+    gold_destination_inventory_id: int | None = None
     stones: list[LegStoneReturn] = Field(default_factory=list)
     notes: str | None = None
 
@@ -111,14 +188,20 @@ class JobLegRead(TimestampedRead):
     worker_id: int | None = None
     worker_name: str | None = None
     status: LegStatus
+    metal: Metal
     issued_at: datetime | None = None
     gold_issued_g: Decimal
     gold_issued_purity: int | None = None
+    gold_issued_tunch_pct: Decimal | None = None
     stones_issued_ct: Decimal
     gold_source_inventory_id: int | None = None
     stone_source_inventory_id: int | None = None
     received_at: datetime | None = None
     gold_received_g: Decimal
+    gold_received_purity: int | None = None
+    gold_received_tunch_pct: Decimal | None = None
+    metal_on_credit: bool = False
+    metal_due_date: date | None = None
     stones_used_ct: Decimal
     stones_returned_ct: Decimal
     piece_count: int
@@ -128,9 +211,17 @@ class JobLegRead(TimestampedRead):
     wastage_basis: WastageBasis
     wastage_per_100_pcs_g: Decimal | None = None
     wastage_allowed_pct: Decimal | None = None
+    wastage_ratti: Decimal | None = None
+    wastage_ratti_base: int = DEFAULT_RATTI_BASE
     wastage_allowed_g: Decimal
     wastage_actual_g: Decimal
     wastage_excess_g: Decimal
+    # The same three in fine grams, which is where the liability is actually
+    # settled once the two ends of the job are different purities. Null on legs
+    # closed before that reckoning existed.
+    wastage_allowed_fine_g: Decimal | None = None
+    wastage_actual_fine_g: Decimal | None = None
+    wastage_excess_fine_g: Decimal | None = None
     labour_basis: LabourBasis
     labour_rate: Decimal
     labour_amount: Decimal

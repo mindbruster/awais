@@ -2309,6 +2309,122 @@ def main() -> int:
         f"got {r.status_code}: {r.text[:160]}",
     )
 
+    # --- the maker's hisaab: 100g of 24k out, 107.560g of 21k back, 6 ratti ---
+    # The shop's own worked example, and the one the old reckoning got wrong.
+    # His wastage is a share of the weight he *returns*, not of what he was
+    # issued: 107.560 / 96 * 6 = 6.7225g, added to what he is credited with, and
+    # the job comes back square. Valuing that 21k return at the issued purity —
+    # which the system used to do — credits him with fourteen percent more metal
+    # than he delivered and reports a settled job while the metal is short.
+    maker_design = client.post("/designs", headers=auth, json={"item_id": taka_id}).json()
+    r = client.post(
+        f"/designs/{maker_design['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": maker_id, "worker_id": w["id"],
+            "gold_issued_g": "100", "gold_issued_purity": 24,
+            "gold_source_inventory_id": raw_gold["id"],
+            "wastage_basis": "ratti_of_received", "wastage_ratti": "6",
+            "labour_basis": "per_gram", "labour_rate": "0",
+        },
+    )
+    check("issue 100g of 24k on a ratti deal → 201", r.status_code == 201, r.text[:200])
+    maker_leg = r.json()
+
+    # A basis with no figure allows him nothing and charges him the whole
+    # difference between 24k out and 21k back — most of a sixth of the piece.
+    r = client.post(
+        f"/designs/{client.post('/designs', headers=auth, json={'item_id': taka_id}).json()['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": maker_id, "worker_id": w["id"], "gold_issued_g": "10",
+            "gold_source_inventory_id": raw_gold["id"], "wastage_basis": "ratti_of_received",
+        },
+    )
+    check(
+        "a ratti deal with no ratti figure is refused → 422",
+        r.status_code == 422,
+        f"got {r.status_code}: {r.text[:160]}",
+    )
+
+    r = client.post(
+        f"/designs/legs/{maker_leg['id']}/receive",
+        headers=auth,
+        json={"gold_received_g": "107.560", "gold_received_purity": 21},
+    )
+    check("receive 107.560g of 21k → 200", r.status_code == 200, r.text[:200])
+    settled = r.json()
+    check(
+        "the allowance is 6.7225g, worked on the weight he returned",
+        Decimal(str(settled["wastage_allowed_g"])) == Decimal("6.7225"),
+        f"got {settled['wastage_allowed_g']}",
+    )
+    check(
+        "and 5.8822 fine, converted at the 21k it was measured against",
+        Decimal(str(settled["wastage_allowed_fine_g"])) == Decimal("5.8822"),
+        f"got {settled['wastage_allowed_fine_g']}",
+    )
+    check(
+        "the job settles square — nothing beyond a few milligrams is his",
+        Decimal(str(settled["wastage_excess_fine_g"])) < Decimal("0.01"),
+        f"got {settled['wastage_excess_fine_g']} — the old reading charged him ~14g",
+    )
+    check(
+        "the raw columns still say what the scale said",
+        Decimal(str(settled["wastage_actual_g"])) == Decimal("-7.5600"),
+        f"got {settled['wastage_actual_g']}",
+    )
+
+    # --- a piece made on the maker's own gold ---
+    # Nothing leaves the safe. What arrives is his, and the shop owes it back —
+    # a credit to his metal account, not free alloy the shop has gained.
+    before_credit = worker_gold(w["id"])
+    r = client.post(
+        f"/designs/{maker_design['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": maker_id, "worker_id": w["id"], "gold_issued_g": "0",
+            "metal_on_credit": True, "metal_due_date": str(date.today() + timedelta(days=30)),
+            "labour_basis": "per_gram", "labour_rate": "0",
+        },
+    )
+    check("issue a leg on the maker's own gold → 201", r.status_code == 201, r.text[:200])
+    credit_leg = r.json()
+    check(
+        "the leg records the debt and the date it falls due",
+        credit_leg["metal_on_credit"] is True and credit_leg["metal_due_date"] is not None,
+        f"{credit_leg['metal_on_credit']} / {credit_leg['metal_due_date']}",
+    )
+    r = client.post(
+        f"/designs/legs/{credit_leg['id']}/receive",
+        headers=auth,
+        json={
+            "gold_received_g": "100", "gold_received_purity": 21,
+            "gold_destination_inventory_id": raw_gold["id"],
+        },
+    )
+    check("receive his own metal into stock → 200", r.status_code == 200, r.text[:200])
+    check(
+        "his metal account swings by the 87.5 fine grams he supplied",
+        abs((before_credit - worker_gold(w["id"])) - Decimal("87.5")) <= Decimal("0.0002"),
+        f"moved {before_credit - worker_gold(w['id'])}, expected 87.5",
+    )
+    r = client.get("/ledger/trial-balance", headers=auth)
+    check("books still balance after a leg made on credit", r.json()["balanced"] is True)
+
+    # A leg issuing nothing that nobody marked as credit is a counter slip, not
+    # a deal — far more likely a missed weight than a piece made on his gold.
+    r = client.post(
+        f"/designs/{maker_design['id']}/legs",
+        headers=auth,
+        json={"department_id": maker_id, "worker_id": w["id"], "gold_issued_g": "0"},
+    )
+    check(
+        "a nothing-issued leg nobody marked is refused → 400",
+        r.status_code == 400,
+        f"got {r.status_code}: {r.text[:160]}",
+    )
+
     # ----- AI INSIGHTS (degrade-without-a-provider contract) -----
     section("AI insights")
     r = ai_client.get("/insights/wastage-anomalies", headers=auth, params={"days": 90})
@@ -2871,9 +2987,12 @@ def main() -> int:
     r = client.get("/reports/worker-performance", headers=auth, params={"days": 90})
     check("worker performance → 200", r.status_code == 200, f"got {r.status_code}")
     zahid = next((w for w in r.json()["rows"] if w["worker_name"] == "Zahid Bhai"), None)
+    # Non-zero, not positive. The figure is a position and it runs both ways:
+    # this worker has made a piece on his own gold above, so the shop is holding
+    # more of his metal than he is holding of the shop's.
     check(
         "a worker's outstanding metal comes off the ledger",
-        zahid and Decimal(str(zahid["gold_balance_fine_g"])) > 0,
+        zahid and Decimal(str(zahid["gold_balance_fine_g"])) != 0,
         f"{zahid and zahid['gold_balance_fine_g']} fine g — read from journal lines, not a column",
     )
 

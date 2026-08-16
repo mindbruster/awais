@@ -51,6 +51,7 @@ from app.services import fx
 from app.services.audit import log_action
 from app.services.inventory import post_movement
 from app.services.ledger import d
+from app.services.pricing import DEFAULT_RATTI_BASE
 from app.services.routing import (
     compute_labour,
     current_gold_rate,
@@ -98,14 +99,24 @@ def _leg_read(leg: JobLeg) -> JobLegRead:
         worker_id=leg.worker_id,
         worker_name=leg.worker.name if leg.worker else None,
         status=leg.status,
+        metal=leg.metal,
         issued_at=leg.issued_at,
         gold_issued_g=d(leg.gold_issued_g),
         gold_issued_purity=leg.gold_issued_purity,
+        gold_issued_tunch_pct=(
+            d(leg.gold_issued_tunch_pct) if leg.gold_issued_tunch_pct is not None else None
+        ),
         stones_issued_ct=d(leg.stones_issued_ct),
         gold_source_inventory_id=leg.gold_source_inventory_id,
         stone_source_inventory_id=leg.stone_source_inventory_id,
         received_at=leg.received_at,
         gold_received_g=d(leg.gold_received_g),
+        gold_received_purity=leg.gold_received_purity,
+        gold_received_tunch_pct=(
+            d(leg.gold_received_tunch_pct) if leg.gold_received_tunch_pct is not None else None
+        ),
+        metal_on_credit=leg.metal_on_credit,
+        metal_due_date=leg.metal_due_date,
         stones_used_ct=d(leg.stones_used_ct),
         stones_returned_ct=d(leg.stones_returned_ct),
         piece_count=leg.piece_count,
@@ -116,9 +127,20 @@ def _leg_read(leg: JobLeg) -> JobLegRead:
         wastage_allowed_pct=(
             d(leg.wastage_allowed_pct) if leg.wastage_allowed_pct is not None else None
         ),
+        wastage_ratti=d(leg.wastage_ratti) if leg.wastage_ratti is not None else None,
+        wastage_ratti_base=int(leg.wastage_ratti_base or DEFAULT_RATTI_BASE),
         wastage_allowed_g=d(leg.wastage_allowed_g),
         wastage_actual_g=d(leg.wastage_actual_g),
         wastage_excess_g=d(leg.wastage_excess_g),
+        wastage_allowed_fine_g=(
+            d(leg.wastage_allowed_fine_g) if leg.wastage_allowed_fine_g is not None else None
+        ),
+        wastage_actual_fine_g=(
+            d(leg.wastage_actual_fine_g) if leg.wastage_actual_fine_g is not None else None
+        ),
+        wastage_excess_fine_g=(
+            d(leg.wastage_excess_fine_g) if leg.wastage_excess_fine_g is not None else None
+        ),
         labour_basis=leg.labour_basis,
         labour_rate=d(leg.labour_rate),
         labour_amount=d(leg.labour_amount),
@@ -350,6 +372,32 @@ async def issue_leg(
             "stone_source_inventory_id is required when issuing stones.",
         )
 
+    # Metal moving off a shelf has to say which shelf. The only leg that may
+    # skip it is one where no metal moves at all — the worker is bringing his
+    # own — and that one has to say so, because a zero-gram issue that nobody
+    # marked is far more likely to be a counter slip than a deal.
+    if d(payload.gold_issued_g) > 0 and payload.gold_source_inventory_id is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "gold_source_inventory_id is required when issuing metal.",
+        )
+    if d(payload.gold_issued_g) <= 0 and not payload.metal_on_credit:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"This leg issues no metal. If {who} is working it on his own gold, send "
+            "metal_on_credit=true so the shop's debt to him is recorded — otherwise "
+            "state the weight going out.",
+        )
+    # Credit needs somebody to owe. On an in-house leg the metal would be
+    # credited to a control account with no party attached to it, and no
+    # statement could ever show whose gold the shop is holding.
+    if payload.metal_on_credit and payload.worker_id is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "A leg made on credit needs the worker whose metal it is — the shop cannot "
+            "owe gold back to its own bench.",
+        )
+
     # The department's standing terms fill in whatever the counter didn't state.
     # Resolved here and frozen onto the leg below, never re-read at receive:
     # setting's rate gets renegotiated and an old leg must settle on the deal
@@ -359,6 +407,15 @@ async def issue_leg(
     if per_100 is None and department.default_wastage_per_100_pcs_g is not None:
         per_100 = d(department.default_wastage_per_100_pcs_g)
     pieces = payload.piece_count if payload.piece_count is not None else 0
+    # Stated per job, and only falling back to the worker's standing rate when
+    # the counter said nothing. The deal is struck job by job — the same maker
+    # works one piece on wastage and the next on a flat per-gram — so an
+    # explicit figure here has to beat whatever is filed against his name.
+    allowed_pct = (
+        d(payload.wastage_allowed_pct)
+        if payload.wastage_allowed_pct is not None
+        else agreed_wastage_pct(worker)
+    )
     labour_rate = payload.labour_rate
     if labour_rate is None:
         labour_rate = (
@@ -386,6 +443,20 @@ async def issue_leg(
                 "is set. Send wastage_per_100_pcs_g, or configure the department's default.",
             )
 
+    # The same trap on the maker's basis, and it bites hardest here: his leg is
+    # the one where 24k goes out and 21k comes back, so a missing allowance
+    # charges him the whole difference between the two purities — most of a
+    # sixth of the piece — as though he had lost it. The schema catches this
+    # when the counter names the basis; this catches it when the basis came
+    # from the department's default and the ratti figure never followed.
+    if basis is WastageBasis.ratti_of_received and payload.wastage_ratti is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"{department.name} settles wastage in ratti, so this leg needs a ratti figure. "
+            f"Send wastage_ratti — with none, {who} is allowed nothing and charged for the "
+            "whole difference between what went out and what came back.",
+        )
+
     # The same silent-zero trap on the pay side: per-piece labour multiplies the
     # rate by the count, so a missing count settles the worker's earnings at
     # nothing. Guarded here rather than at receive, when the metal is already
@@ -398,7 +469,14 @@ async def issue_leg(
         )
 
     rate = await current_gold_rate(db)
-    gold_source = await _get_inventory(db, payload.gold_source_inventory_id)
+    # None on a leg the worker supplies the metal for: nothing leaves the shelf,
+    # so there is no shelf to name. Guarded above, so this is None only when the
+    # issue weight is zero.
+    gold_source = (
+        await _get_inventory(db, payload.gold_source_inventory_id)
+        if payload.gold_source_inventory_id is not None
+        else None
+    )
 
     leg = JobLeg(
         design_id=design.id,
@@ -409,17 +487,23 @@ async def issue_leg(
         worker=worker,
         status=LegStatus.issued,
         issued_at=datetime.now(timezone.utc),
+        metal=payload.metal,
         gold_issued_g=payload.gold_issued_g,
         gold_issued_purity=payload.gold_issued_purity,
-        gold_source_inventory_id=gold_source.id,
+        gold_issued_tunch_pct=payload.gold_issued_tunch_pct,
+        gold_source_inventory_id=gold_source.id if gold_source else None,
+        metal_on_credit=payload.metal_on_credit,
+        metal_due_date=payload.metal_due_date,
         # The allowance in force today, frozen onto the leg. Terms get
         # renegotiated and the leg must be judged against the deal that was in
         # force when the metal left the safe.
         # Frozen now, never re-read. See settle_wastage.
-        wastage_allowed_pct=agreed_wastage_pct(worker),
+        wastage_allowed_pct=allowed_pct,
         piece_count=pieces,
         wastage_basis=basis,
         wastage_per_100_pcs_g=per_100,
+        wastage_ratti=payload.wastage_ratti,
+        wastage_ratti_base=payload.wastage_ratti_base,
         labour_basis=payload.labour_basis,
         labour_rate=labour_rate,
         notes=payload.notes,
@@ -450,16 +534,19 @@ async def issue_leg(
     if payload.stone_source_inventory_id is not None:
         leg.stone_source_inventory_id = payload.stone_source_inventory_id
 
-    await post_movement(
-        db,
-        item=gold_source,
-        type=MovementType.manufacturing_out,
-        weight_g_delta=-d(payload.gold_issued_g),
-        reference_type="job_leg",
-        reference_id=leg.id,
-        notes=f"{design.design_no} issued to {who} ({department.name})",
-        user_id=current.id,
-    )
+    # Nothing off the shelf on a credit leg, so no movement: writing a zero one
+    # would put a line in the stock ledger saying metal moved when none did.
+    if gold_source is not None and d(payload.gold_issued_g) > 0:
+        await post_movement(
+            db,
+            item=gold_source,
+            type=MovementType.manufacturing_out,
+            weight_g_delta=-d(payload.gold_issued_g),
+            reference_type="job_leg",
+            reference_id=leg.id,
+            notes=f"{design.design_no} issued to {who} ({department.name})",
+            user_id=current.id,
+        )
     if stones_ct > 0:
         await post_movement(
             db,
@@ -483,12 +570,25 @@ async def issue_leg(
             "design_no": design.design_no,
             "department": department.name,
             "worker": worker.name if worker else None,
+            "metal": leg.metal.value,
             "gold_issued_g": str(d(leg.gold_issued_g)),
+            "gold_issued_purity": leg.gold_issued_purity,
+            "gold_issued_tunch_pct": (
+                str(d(leg.gold_issued_tunch_pct))
+                if leg.gold_issued_tunch_pct is not None
+                else None
+            ),
+            "metal_on_credit": leg.metal_on_credit,
+            "metal_due_date": str(leg.metal_due_date) if leg.metal_due_date else None,
             "stones_issued_ct": str(stones_ct),
             "piece_count": pieces,
             "wastage_basis": basis.value,
             "wastage_per_100_pcs_g": str(per_100) if per_100 is not None else None,
             "wastage_allowed_pct": str(d(leg.wastage_allowed_pct)),
+            "wastage_ratti": (
+                str(d(leg.wastage_ratti)) if leg.wastage_ratti is not None else None
+            ),
+            "wastage_ratti_base": int(leg.wastage_ratti_base or DEFAULT_RATTI_BASE),
             "labour_basis": payload.labour_basis.value,
             "labour_rate": str(d(labour_rate)),
         },
@@ -555,6 +655,10 @@ async def receive_leg(
         returned_ct += d(ret.weight_returned_ct)
 
     leg.gold_received_g = payload.gold_received_g
+    # What came back, at its own purity. Left unstated it stays NULL and the
+    # settlement reads it as the metal that went out — see `received_metal`.
+    leg.gold_received_purity = payload.gold_received_purity
+    leg.gold_received_tunch_pct = payload.gold_received_tunch_pct
     leg.stones_returned_ct = returned_ct
     leg.stones_used_ct = d(leg.stones_issued_ct) - returned_ct
     settle_wastage(leg)
@@ -567,11 +671,17 @@ async def receive_leg(
     # move too or the two go out of step. Cancel refuses in this situation for
     # the same reason; silently skipping here would leave the books saying the
     # metal is back while the shelf says it never returned.
-    if d(payload.gold_received_g) > 0 and leg.gold_source_inventory_id is None:
+    # Where the metal goes. Ordinarily back to the shelf it left, which is what
+    # keeps stock and the ledger in step. A leg made on the worker's own gold
+    # never left a shelf, so the counter has to say where it lands — the metal
+    # is real and arriving either way.
+    gold_stock_id = leg.gold_source_inventory_id or payload.gold_destination_inventory_id
+    if d(payload.gold_received_g) > 0 and gold_stock_id is None:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             "This leg has no recorded gold source, so the returned metal cannot be "
-            "put back into stock. Restore the inventory item before receiving.",
+            "put back into stock. Send gold_destination_inventory_id if the worker "
+            "supplied the metal, or restore the inventory item before receiving.",
         )
     if returned_ct > 0 and leg.stone_source_inventory_id is None:
         raise HTTPException(
@@ -580,10 +690,10 @@ async def receive_leg(
             "put back into stock. Restore the inventory item before receiving.",
         )
 
-    if d(payload.gold_received_g) > 0 and leg.gold_source_inventory_id is not None:
+    if d(payload.gold_received_g) > 0 and gold_stock_id is not None:
         await post_movement(
             db,
-            item=await _get_inventory(db, leg.gold_source_inventory_id),
+            item=await _get_inventory(db, gold_stock_id),
             type=MovementType.manufacturing_in,
             weight_g_delta=d(payload.gold_received_g),
             reference_type="job_leg",
@@ -620,9 +730,20 @@ async def receive_leg(
             "design_no": design.design_no,
             "gold_issued_g": str(d(leg.gold_issued_g)),
             "gold_received_g": str(d(leg.gold_received_g)),
+            "gold_received_purity": leg.gold_received_purity,
+            "gold_received_tunch_pct": (
+                str(d(leg.gold_received_tunch_pct))
+                if leg.gold_received_tunch_pct is not None
+                else None
+            ),
             "wastage_actual_g": str(d(leg.wastage_actual_g)),
             "wastage_allowed_g": str(d(leg.wastage_allowed_g)),
             "wastage_excess_g": str(d(leg.wastage_excess_g)),
+            # The figures the charge is actually made on, once the two ends of
+            # the job are different purities.
+            "wastage_actual_fine_g": str(d(leg.wastage_actual_fine_g)),
+            "wastage_allowed_fine_g": str(d(leg.wastage_allowed_fine_g)),
+            "wastage_excess_fine_g": str(d(leg.wastage_excess_fine_g)),
             "labour_amount": str(d(leg.labour_amount)),
         },
     )

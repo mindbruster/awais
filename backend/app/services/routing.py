@@ -26,6 +26,7 @@ from app.models.journal import Commodity, JournalEntry, PartyType
 from app.models.vendor import Vendor
 from app.services.gold_rate import rate_in_force
 from app.services.ledger import EntryDraft, Posting, d, fine_grams, post_entry, reverse_entry
+from app.services.pricing import DEFAULT_RATTI_BASE, ratti_allowance
 
 # Entries a leg posts are found again by this pair, which is how a cancel
 # knows what to reverse.
@@ -111,6 +112,43 @@ def agreed_wastage_pct(worker: Vendor | None) -> Decimal:
     return d(worker.effective_wastage_pct) if worker is not None else Decimal("0")
 
 
+def received_metal(leg: JobLeg) -> tuple[int | None, Decimal | None]:
+    """
+    What the metal that came *back* was, as a (karat, tunch) pair.
+
+    A different question from what went out, and the system used to assume it
+    was the same one. Pure 24k goes to the maker and 21k jewellery comes back;
+    valuing that return at the *issued* purity credited the piece as though it
+    were pure and overstated what he had delivered by about fourteen percent.
+    The shop would read a job as settled while the metal was still short.
+
+    The two columns are read as a pair. Filling in either one means "this is
+    what came back", and the other half is then deliberately not borrowed from
+    the issue side — a leg that says 21 karat must not also inherit a tunch of
+    99.9, which wins over the karat in `fine_grams` and would undo the very
+    correction the caller was making.
+
+    Both empty means nothing was said, which is the ordinary case and the
+    honest reading of it: the same metal came back as went out. Those legs
+    compute exactly as they did before this column existed, so nothing already
+    settled moves.
+    """
+    if leg.gold_received_purity is None and leg.gold_received_tunch_pct is None:
+        return leg.gold_issued_purity, leg.gold_issued_tunch_pct
+    return leg.gold_received_purity, leg.gold_received_tunch_pct
+
+
+def fine_issued_g(leg: JobLeg) -> Decimal:
+    """The metal that left the safe, in fine grams."""
+    return fine_grams(leg.gold_issued_g, leg.gold_issued_purity, leg.gold_issued_tunch_pct)
+
+
+def fine_received_g(leg: JobLeg) -> Decimal:
+    """The metal that came back, in fine grams — at *its own* purity."""
+    purity, tunch = received_metal(leg)
+    return fine_grams(leg.gold_received_g, purity, tunch)
+
+
 def settle_wastage(leg: JobLeg) -> None:
     """
     Work out what the worker is actually liable for, and write it on the leg.
@@ -128,20 +166,41 @@ def settle_wastage(leg: JobLeg) -> None:
     filled in afterwards would make a worker who was never on terms liable for
     the lot.
 
-    Two ways of agreeing the allowance, and they are not interchangeable:
+    Three ways of agreeing the allowance, and none converts into another:
 
-    * percent_of_issued — allowed = issued * pct/100. What casting and
+    * percent_of_issued  — allowed = issued * pct/100. What casting and
       goldsmithing work on.
-    * per_100_pieces    — allowed = per_100 / 100 * pieces. What setting works
+    * per_100_pieces     — allowed = per_100 / 100 * pieces. What setting works
       on: 0.400g per hundred stones over 350 stones allows 1.400g. A setter's
       loss follows how many stones he handles, not how heavy the piece is, so
       charging him a percentage would under-charge a light piece carrying many
       stones and over-charge a heavy one carrying few.
+    * ratti_of_received  — allowed = returned / 96 * ratti. What the maker works
+      on, and the odd one out: it is measured against the weight he *hands
+      back*, not the weight he was issued, so until the job is finished the
+      allowance is not a knowable number.
+
+    Everything is written twice — once as the scale read it, once in fine grams.
+
+    The raw columns compare grams to grams, which means something only while
+    both ends of the job are the same purity. The maker's leg is not: 24k goes
+    out and 21k comes back, and 107.560 raw grams against 100 raw grams issued
+    reads as the piece coming back *heavier* when in fact the metal is square.
+    Subtracting one from the other is subtracting different assets. So the
+    liability is settled on the fine columns, and the raw ones are kept as what
+    the scale actually said — which is what the worker will argue from.
     """
     issued = d(leg.gold_issued_g)
-    actual = (issued - d(leg.gold_received_g)).quantize(_G)
+    received = d(leg.gold_received_g)
+    actual = (issued - received).quantize(_G)
 
-    if leg.wastage_basis is WastageBasis.per_100_pieces:
+    if leg.wastage_basis is WastageBasis.ratti_of_received:
+        allowed = ratti_allowance(
+            received,
+            d(leg.wastage_ratti),
+            int(leg.wastage_ratti_base or DEFAULT_RATTI_BASE),
+        )
+    elif leg.wastage_basis is WastageBasis.per_100_pieces:
         per_100 = d(leg.wastage_per_100_pcs_g)
         allowed = (per_100 * Decimal(leg.piece_count or 0) / Decimal("100")).quantize(_G)
     else:
@@ -152,6 +211,58 @@ def settle_wastage(leg: JobLeg) -> None:
     leg.wastage_allowed_g = allowed
     leg.wastage_actual_g = actual
     leg.wastage_excess_g = max(actual - allowed, Decimal("0"))
+
+    # The allowance is converted at the purity of the metal it was measured
+    # against, which is the whole reason the basis has to be known here. A ratti
+    # allowance is a slice of the jewellery the maker hands back, so it is 21k
+    # metal; a percentage or a per-100 figure is carved out of what he was
+    # issued, so it is 24k. Converting either at the wrong end would quietly
+    # move the allowance by the difference between the two purities.
+    fine_issued = fine_issued_g(leg)
+    fine_received = fine_received_g(leg)
+    if leg.wastage_basis is WastageBasis.ratti_of_received:
+        purity, tunch = received_metal(leg)
+        fine_allowed = fine_grams(allowed, purity, tunch)
+    else:
+        fine_allowed = fine_grams(allowed, leg.gold_issued_purity, leg.gold_issued_tunch_pct)
+
+    # Metal the worker put in himself is not metal the job lost, so it comes
+    # out of the reckoning before anything is called wastage. Without this a
+    # piece made on his own gold reports a hundred-gram *gain* against a job
+    # that consumed nothing, and every loss report it lands in reads that as
+    # the shop having won metal back off its karigars.
+    #
+    # The same netting the ledger does when it posts the leg, kept here so the
+    # column and the entry cannot drift apart.
+    fine_supplied = (
+        max(fine_received - fine_issued, Decimal("0"))
+        if leg.metal_on_credit and leg.worker_id
+        else Decimal("0")
+    )
+    fine_actual = (fine_issued - fine_received + fine_supplied).quantize(_G)
+    leg.wastage_allowed_fine_g = fine_allowed
+    leg.wastage_actual_fine_g = fine_actual
+    leg.wastage_excess_fine_g = max(fine_actual - fine_allowed, Decimal("0"))
+
+
+def agreed_terms(leg: JobLeg) -> str:
+    """
+    The allowance in the words it was agreed in, for the memo on the charge.
+
+    A worker reads "beyond 2% agreed" and knows which deal is being invoked.
+    Printing the percentage on every leg regardless of basis — which is what
+    this used to do — told a setter he had exceeded a percentage nobody had
+    ever quoted him, and told a maker the same about a figure that was zero on
+    his leg because his deal is not written in percent.
+    """
+    if leg.wastage_basis is WastageBasis.ratti_of_received:
+        return (
+            f"{d(leg.wastage_ratti)} ratti of {int(leg.wastage_ratti_base or DEFAULT_RATTI_BASE)} "
+            "on the weight returned"
+        )
+    if leg.wastage_basis is WastageBasis.per_100_pieces:
+        return f"{d(leg.wastage_per_100_pcs_g)}g per 100 pieces agreed"
+    return f"{d(leg.wastage_allowed_pct)}% agreed"
 
 
 def compute_labour(leg: JobLeg) -> Decimal:
@@ -180,6 +291,7 @@ def _gold(
     worker_id: int | None = None,
     native_g: Decimal | None = None,
     purity: int | None = None,
+    tunch: Decimal | None = None,
     memo: str | None = None,
 ) -> Posting:
     return Posting(
@@ -191,6 +303,7 @@ def _gold(
         party_id=worker_id,
         native_weight_g=native_g,
         native_purity=purity,
+        native_tunch_pct=tunch,
         memo=memo,
     )
 
@@ -203,9 +316,19 @@ async def post_leg_issue(
     worker: Vendor | None,
     rate: Decimal,
     user_id: int | None = None,
-) -> JournalEntry:
-    """Metal leaves the safe and becomes a claim on the worker holding it."""
-    fine = fine_grams(leg.gold_issued_g, leg.gold_issued_purity)
+) -> JournalEntry | None:
+    """
+    Metal leaves the safe and becomes a claim on the worker holding it.
+
+    None when no metal leaves, which is a real leg: the worker is making the
+    piece on his own gold. There is nothing to claim off him and nothing to
+    relieve the safe of, and posting the pair of zeroes anyway would leave the
+    ledger carrying an entry that says nothing happened — findable by anyone
+    later auditing what this leg moved, and answering wrongly.
+    """
+    fine = fine_issued_g(leg)
+    if not fine:
+        return None
     who = worker.name if worker else "unassigned"
     draft = EntryDraft(
         memo=f"{design.design_no}: issued {d(leg.gold_issued_g)}g to {who} ({leg.department.name})",
@@ -220,6 +343,7 @@ async def post_leg_issue(
             worker_id=leg.worker_id,
             native_g=d(leg.gold_issued_g),
             purity=leg.gold_issued_purity,
+            tunch=leg.gold_issued_tunch_pct,
             memo=f"Issued on leg #{leg.sequence}",
         )
     )
@@ -230,6 +354,7 @@ async def post_leg_issue(
             rate,
             native_g=-d(leg.gold_issued_g),
             purity=leg.gold_issued_purity,
+            tunch=leg.gold_issued_tunch_pct,
         )
     )
     return await post_entry(db, draft, user_id=user_id)
@@ -254,16 +379,54 @@ async def post_leg_receive(
     production and 4200 carrying what the shop intends to claim back, instead
     of a single number that hides both.
 
-    Fine grams are derived from the issued figure rather than re-converted from
-    each weight column, so the relief is exactly the debit posted at issue and
-    a worker's gold balance cannot drift by a rounding step per leg.
+    The relief of the worker's account is the issued figure exactly — the same
+    number that was debited to him when the metal left — so a balance cannot
+    drift by a rounding step per leg. What he returned is converted at *its own*
+    purity, which is the correction this used to get wrong: 21k jewellery
+    credited at 24k relieved him of metal he had not delivered.
+
+    Everything below is in fine grams, and the identity that keeps the entry
+    balanced is unchanged: what came back plus what was lost equals what went
+    out, because the loss is defined as the difference between the other two.
+    A leg made on the worker's own metal adds one term to that identity — what
+    he supplied — and it is a credit to his account rather than a loss.
     """
     purity = leg.gold_issued_purity
-    fine_issued = fine_grams(leg.gold_issued_g, purity)
-    fine_recv = fine_grams(leg.gold_received_g, purity)
+    recv_purity, recv_tunch = received_metal(leg)
+    fine_issued = fine_issued_g(leg)
+    fine_recv = fine_received_g(leg)
     fine_actual = fine_issued - fine_recv
-    fine_allowed = fine_grams(leg.wastage_allowed_g, purity)
+    # Written by `settle_wastage` at the purity the deal was struck against.
+    # Legs settled before that column existed have nothing here and fall back to
+    # converting the raw figure at the issued purity, exactly as they always
+    # did — so a re-post of an old leg reproduces its original entry.
+    fine_allowed = (
+        d(leg.wastage_allowed_fine_g)
+        if leg.wastage_allowed_fine_g is not None
+        else fine_grams(leg.wastage_allowed_g, purity, leg.gold_issued_tunch_pct)
+    )
     fine_excess = max(fine_actual - fine_allowed, Decimal("0"))
+
+    # Metal the worker put in out of his own stock, which the shop now holds and
+    # owes back. Only on a leg struck that way: a piece that comes back heavier
+    # off an ordinary leg has gained solder, alloy and findings, and that metal
+    # is the shop's. The two are indistinguishable by weight — both read as more
+    # returned than issued — so the flag decides, never the arithmetic.
+    #
+    # Requires a worker for the same reason the excess re-charge does: the
+    # credit has to land on somebody's account or it is a balance with no party
+    # to hand it back to. The API refuses the combination outright, and this is
+    # the second lock on it.
+    fine_supplied = (
+        max(fine_recv - fine_issued, Decimal("0"))
+        if leg.metal_on_credit and leg.worker_id
+        else Decimal("0")
+    )
+    # Netted out of the wastage line rather than posted beside it. What the
+    # worker supplied was never a loss, and leaving it in 5200 would report a
+    # negative cost of production — the shop appearing to *earn* wastage on a
+    # job where it lost none.
+    fine_wastage = fine_actual + fine_supplied
 
     who = worker.name if worker else "unassigned"
     draft = EntryDraft(
@@ -275,21 +438,48 @@ async def post_leg_receive(
 
     if fine_recv:
         draft.add(_gold(SystemAccount.GOLD_IN_HAND, fine_recv, rate,
-                        native_g=d(leg.gold_received_g), purity=purity))
-    if fine_actual:
-        draft.add(_gold(SystemAccount.WASTAGE_EXPENSE, fine_actual, rate,
+                        native_g=d(leg.gold_received_g), purity=recv_purity,
+                        tunch=recv_tunch))
+    if fine_wastage:
+        draft.add(_gold(SystemAccount.WASTAGE_EXPENSE, fine_wastage, rate,
                         memo=f"Wastage on leg #{leg.sequence}"))
-    draft.add(
-        _gold(
-            SystemAccount.GOLD_WITH_WORKERS,
-            -fine_issued,
-            rate,
-            worker_id=leg.worker_id,
-            native_g=-d(leg.gold_issued_g),
-            purity=purity,
-            memo=f"Relieved on leg #{leg.sequence}",
+    # The worker's own metal, now in the shop's safe and owed back to him. It
+    # goes to the same account his issues do, which swings negative to say the
+    # debt runs the other way — the shop is holding his gold. A separate
+    # liability account would split one man's metal position in two, and this
+    # trade settles it as one running figure.
+    if fine_supplied:
+        draft.add(
+            _gold(
+                SystemAccount.GOLD_WITH_WORKERS,
+                -fine_supplied,
+                rate,
+                worker_id=leg.worker_id,
+                purity=recv_purity,
+                tunch=recv_tunch,
+                memo=(
+                    f"{who}'s own metal on leg #{leg.sequence}"
+                    + (f", due {leg.metal_due_date}" if leg.metal_due_date else "")
+                ),
+            )
         )
-    )
+    # Nothing to relieve when nothing was issued, which is the credit leg. The
+    # zero line would balance perfectly and say the maker had been let off a
+    # debt he never had — and it would sit in his statement alongside the real
+    # credit above, which is where somebody reading it would trip.
+    if fine_issued:
+        draft.add(
+            _gold(
+                SystemAccount.GOLD_WITH_WORKERS,
+                -fine_issued,
+                rate,
+                worker_id=leg.worker_id,
+                native_g=-d(leg.gold_issued_g),
+                purity=purity,
+                tunch=leg.gold_issued_tunch_pct,
+                memo=f"Relieved on leg #{leg.sequence}",
+            )
+        )
     # Re-charging the excess only makes sense when somebody agreed to an
     # allowance in the first place. On an in-house leg there is no such
     # agreement and nobody to bill, so the metal simply stays where the line
@@ -305,7 +495,7 @@ async def post_leg_receive(
                 rate,
                 worker_id=leg.worker_id,
                 purity=purity,
-                memo=f"Wastage beyond {d(leg.wastage_allowed_pct)}% agreed — {fine_excess}g owed",
+                memo=f"Wastage beyond {agreed_terms(leg)} — {fine_excess}g owed",
             )
         )
         draft.add(_gold(SystemAccount.WASTAGE_RECOVERED, -fine_excess, rate,
@@ -374,7 +564,7 @@ async def post_leg_cancel(
     outstanding = (d(leg.gold_issued_g) - d(gold_recovered_g)).quantize(_G)
     if outstanding > 0:
         who = worker.name if worker else "unassigned"
-        fine = fine_grams(outstanding, leg.gold_issued_purity)
+        fine = fine_grams(outstanding, leg.gold_issued_purity, leg.gold_issued_tunch_pct)
         draft = EntryDraft(
             memo=f"{design.design_no}: {outstanding}g not recovered from {who} on cancellation",
             source_type=SOURCE_TYPE,
@@ -388,10 +578,12 @@ async def post_leg_cancel(
                 worker_id=leg.worker_id,
                 native_g=outstanding,
                 purity=leg.gold_issued_purity,
+                tunch=leg.gold_issued_tunch_pct,
                 memo="Outstanding after cancellation",
             )
         )
         draft.add(_gold(SystemAccount.GOLD_IN_HAND, -fine, rate,
-                        native_g=-outstanding, purity=leg.gold_issued_purity))
+                        native_g=-outstanding, purity=leg.gold_issued_purity,
+                        tunch=leg.gold_issued_tunch_pct))
         entries.append(await post_entry(db, draft, user_id=user_id))
     return entries

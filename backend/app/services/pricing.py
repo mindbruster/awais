@@ -65,6 +65,44 @@ def apply_ratti_discount(
     return (d(gold_weight_g) / base * remaining).quantize(Decimal("0.0001"))
 
 
+def ratti_allowance(
+    weight_g: Decimal,
+    ratti: Decimal,
+    ratti_base: int = DEFAULT_RATTI_BASE,
+) -> Decimal:
+    """
+    The metal a maker is allowed to keep, quoted in ratti against the same base.
+
+        allowed = weight / base * ratti
+
+    Six ratti on the 107.560g of 21k he hands back allows 6.7225g, which is
+    added to what he is credited with — so the 100g of 24k issued against it
+    comes back square.
+
+    The mirror image of `apply_ratti_discount`: that one bills `base - ratti` of
+    a weight, this one hands over `ratti` of it. They are quoted in the same
+    breath and share a base, which is why they sit together — but they are not
+    the same number and one must never stand in for the other.
+
+    Which weight this is measured against is the caller's decision and it is not
+    the obvious one: this convention reckons on what the worker *returns*, not
+    on what he was issued. See `settle_wastage`.
+    """
+    base = Decimal(str(ratti_base or DEFAULT_RATTI_BASE))
+    if base <= 0:
+        return Decimal("0")
+    allowed = d(ratti)
+    if allowed <= 0:
+        return Decimal("0")
+    if allowed >= base:
+        # At or beyond the whole base the worker would be allowed every gram he
+        # returned, and every job would settle square however much metal went
+        # missing. Clamped rather than trusted, the same way the discount above
+        # clamps at the other end.
+        allowed = base
+    return (d(weight_g) / base * allowed).quantize(Decimal("0.0001"))
+
+
 def price_line(
     *,
     gold_weight_g: Decimal,

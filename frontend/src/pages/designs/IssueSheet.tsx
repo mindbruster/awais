@@ -157,6 +157,15 @@ export function IssueSheet({
   const [rate, setRate] = useState("0");
   const [pieces, setPieces] = useState("");
   const [per100, setPer100] = useState("");
+  // The maker's deal, and it is a per-job switch rather than a department
+  // setting: the same man works one piece on a ratti wastage and the next on a
+  // flat per-gram with none at all.
+  const [rattiOn, setRattiOn] = useState(false);
+  const [ratti, setRatti] = useState("");
+  // The piece is being made on the worker's own gold, which the shop will owe
+  // back. Nothing leaves the safe, so there is no stock to draw on.
+  const [onCredit, setOnCredit] = useState(false);
+  const [dueDate, setDueDate] = useState("");
   const [lines, setLines] = useState<StoneLine[]>([]);
   const [stoneSrc, setStoneSrc] = useState("");
   const [notes, setNotes] = useState("");
@@ -238,10 +247,17 @@ export function IssueSheet({
   const stoneCt = round4(validLines.reduce((s, l) => s + Number(l.ct || 0), 0));
 
   const allowancePct = Number(worker?.effective_wastage_pct ?? 0);
-  const allowanceG = perPieces
+  // A ratti allowance is measured against the weight that comes *back*, so at
+  // issue time there is no figure to show — and showing a zero would read as
+  // "he is allowed nothing", which is the opposite of what was agreed.
+  const allowanceG = rattiOn
+    ? 0
+    : perPieces
     ? round4((Number(per100 || 0) * pieceN) / 100)
     : round4((goldG * allowancePct) / 100);
-  const allowanceWorking = perPieces
+  const allowanceWorking = rattiOn
+    ? `${ratti || 0} ratti of 96 on what comes back`
+    : perPieces
     ? `${pieceN} pcs × ${g3(Number(per100 || 0))}g/100`
     : `${allowancePct}% of ${wt(goldG)}`;
 
@@ -263,17 +279,26 @@ export function IssueSheet({
   // is still looking at the field.
   const problems: string[] = [];
   if (!deptId) problems.push("Pick a department.");
-  if (!goldSrc) problems.push("Pick which stock the gold comes out of.");
-  if (goldG <= 0) problems.push("Enter the gold going out.");
+  if (goldG > 0 && !goldSrc) problems.push("Pick which stock the gold comes out of.");
+  if (goldG <= 0 && !onCredit) problems.push("Enter the gold going out.");
+  // Credit needs somebody to owe: the shop cannot owe gold back to its own bench.
+  if (onCredit && !workerId)
+    problems.push(
+      "A piece made on credit needs the worker whose metal it is — mark the leg in-house or pick him.",
+    );
+  if (rattiOn && !ratti)
+    problems.push(
+      "Enter the ratti agreed — with none the worker is allowed nothing and charged for the whole difference.",
+    );
   if (goldSource && goldG > Number(goldSource.weight_g))
     problems.push(
       `${goldSource.label} holds ${wt(goldSource.weight_g)} — less than the ${wt(goldG)} being issued.`,
     );
-  if (perPieces && pieceN <= 0)
+  if (perPieces && !rattiOn && pieceN <= 0)
     problems.push(
       `${dept?.name} allows wastage per 100 pieces, so this leg needs a piece count — without one the allowance is zero and the worker carries the whole loss.`,
     );
-  if (perPieces && !per100)
+  if (perPieces && !rattiOn && !per100)
     problems.push(`No grams-per-100 figure is set for ${dept?.name}.`);
   if (basis === "per_piece" && pieceN <= 0)
     problems.push("Labour is charged per piece, so this leg needs a piece count — without one the worker is paid nothing.");
@@ -294,7 +319,11 @@ export function IssueSheet({
         worker_id: workerId ? Number(workerId) : null,
         gold_issued_g: gold || "0",
         gold_issued_purity: purity ? parseInt(purity, 10) : null,
-        gold_source_inventory_id: Number(goldSrc),
+        // Null on a leg the worker supplies the metal for: nothing comes off a
+        // shelf, so there is no shelf to name.
+        gold_source_inventory_id: goldSrc ? Number(goldSrc) : null,
+        metal_on_credit: onCredit,
+        metal_due_date: onCredit && dueDate ? dueDate : null,
         stones: validLines.map((l) => ({
           stone_id: Number(l.stone_id),
           quantity_issued: Number(l.qty || 0),
@@ -305,8 +334,11 @@ export function IssueSheet({
         piece_count: pieceN,
         // Sent explicitly rather than left to the server's fallback so the leg
         // is frozen on exactly the terms shown on this form.
-        wastage_basis: dept?.default_wastage_basis ?? "percent_of_issued",
-        wastage_per_100_pcs_g: perPieces ? per100 || "0" : null,
+        wastage_basis: rattiOn
+          ? "ratti_of_received"
+          : dept?.default_wastage_basis ?? "percent_of_issued",
+        wastage_per_100_pcs_g: perPieces && !rattiOn ? per100 || "0" : null,
+        wastage_ratti: rattiOn ? ratti || "0" : null,
         labour_basis: basis,
         labour_rate: rate || "0",
         notes: notes || null,
@@ -542,24 +574,62 @@ export function IssueSheet({
               )}
             </Section>
 
-            <Section step={2} title="What goes out" hint="Deducted from stock when you commit.">
+            <Section
+              step={2}
+              title="What goes out"
+              hint={
+                onCredit
+                  ? "Nothing leaves the safe — the metal is his and the shop owes it back."
+                  : "Deducted from stock when you commit."
+              }
+            >
+              {/* A maker will make a piece on his own gold. Nothing comes off a
+                  shelf, so the source and the weight both fall away — what
+                  arrives on return is credited to him instead. */}
+              <label className="flex items-start gap-2 rounded-xl border border-slate-200 px-3 py-2.5">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={onCredit}
+                  onChange={(e) => setOnCredit(e.target.checked)}
+                />
+                <span className="text-xs leading-relaxed text-slate-700">
+                  <span className="font-medium text-slate-900">Made on his own gold</span>
+                  <span className="block text-slate-500">
+                    The shop issues nothing and owes {holder} the metal back when the piece
+                    arrives.
+                  </span>
+                </span>
+              </label>
+              {onCredit && (
+                <TextField
+                  label="Metal due back"
+                  type="date"
+                  value={dueDate}
+                  onChange={(e) => setDueDate(e.target.value)}
+                  hint="A promise nobody wrote down is one nobody chases"
+                />
+              )}
               <SelectField
                 label="Gold from"
-                required
+                required={!onCredit}
                 value={goldSrc}
                 onChange={(e) => setGoldSrc(e.target.value)}
-                options={goldSources.map((g) => ({
-                  value: g.id,
-                  label: `${g.label} — ${wt(g.weight_g)}${g.purity ? `, ${g.purity}k` : ""}`,
-                }))}
+                options={[
+                  ...(onCredit ? [{ value: "", label: "None — his own metal" }] : []),
+                  ...goldSources.map((g) => ({
+                    value: g.id,
+                    label: `${g.label} — ${wt(g.weight_g)}${g.purity ? `, ${g.purity}k` : ""}`,
+                  })),
+                ]}
               />
               <div className="grid gap-3 sm:grid-cols-2">
                 <TextField
                   label="Gold (g)"
                   type="number"
                   step="0.0001"
-                  required
-                  min={0.0001}
+                  required={!onCredit}
+                  min={onCredit ? 0 : 0.0001}
                   value={gold}
                   onChange={(e) => setGold(e.target.value)}
                   hint={goldSource ? `${wt(goldSource.weight_g)} on hand` : undefined}
@@ -607,7 +677,7 @@ export function IssueSheet({
                   label="Pieces"
                   type="number"
                   min={0}
-                  required={perPieces || basis === "per_piece"}
+                  required={(perPieces && !rattiOn) || basis === "per_piece"}
                   value={pieces}
                   onChange={(e) => setPieces(e.target.value)}
                   hint={
@@ -618,7 +688,7 @@ export function IssueSheet({
                       : "Items handled on this leg"
                   }
                 />
-                {perPieces && (
+                {perPieces && !rattiOn && (
                   <TextField
                     label="Waste per 100 pcs (g)"
                     type="number"
@@ -630,7 +700,38 @@ export function IssueSheet({
                   />
                 )}
               </div>
-              {perPieces && pieceN <= 0 && (
+
+              {/* The maker's convention, and the one deal that cannot be worked
+                  out at issue: it is a share of the weight he hands back, which
+                  nobody knows until he does. */}
+              <label className="flex items-start gap-2 rounded-xl border border-slate-200 px-3 py-2.5">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={rattiOn}
+                  onChange={(e) => setRattiOn(e.target.checked)}
+                />
+                <span className="text-xs leading-relaxed text-slate-700">
+                  <span className="font-medium text-slate-900">Wastage agreed in ratti</span>
+                  <span className="block text-slate-500">
+                    Worked out on the weight that comes back, not on what goes out.
+                  </span>
+                </span>
+              </label>
+              {rattiOn && (
+                <TextField
+                  label="Ratti (of 96)"
+                  type="number"
+                  step="0.001"
+                  min={0}
+                  max={96}
+                  required
+                  value={ratti}
+                  onChange={(e) => setRatti(e.target.value)}
+                  hint="6 ratti on 107.560g back allows 6.723g — added to what he's credited with"
+                />
+              )}
+              {perPieces && !rattiOn && pieceN <= 0 && (
                 <p className="rounded-lg bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-900">
                   {dept?.name} allows wastage per 100 pieces. Without a piece count the allowance
                   is zero and the worker carries the whole loss, so the count is required.

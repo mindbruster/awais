@@ -2,6 +2,7 @@ import enum
 from datetime import date, datetime
 
 from sqlalchemy import (
+    Boolean,
     Date,
     DateTime,
     Enum,
@@ -10,6 +11,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -270,12 +272,27 @@ class JobLeg(Base, TimestampMixin):
     wastage_actual_fine_g: Mapped[float | None] = mapped_column(Numeric(14, 4))
     wastage_excess_fine_g: Mapped[float | None] = mapped_column(Numeric(14, 4))
 
-    # When the shop has to hand the metal over.
+    # Whose metal this leg is made of.
     #
     # Work does not always start with metal leaving the safe: a maker will make
-    # a piece on his own gold and be owed the metal back at a date the two of
-    # them agree. Nothing else in the system records a promise to *deliver*
-    # metal, and a promise nobody wrote down is one nobody chases.
+    # a piece on his own gold and be owed it back. That is not the same event as
+    # a piece coming back heavier, which is what solder and findings do and is
+    # the shop's own gain — but in raw arithmetic the two look identical, both
+    # being "more metal returned than issued". Told apart by this flag rather
+    # than guessed from the weights, because guessing wrong either forgives a
+    # debt the shop owes or books a worker's gold as free alloy.
+    #
+    # False on every existing leg, which is what they all were.
+    metal_on_credit: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+
+    # When the shop has to hand that metal over.
+    #
+    # A promise to *deliver* metal is recorded nowhere else in the system, and
+    # one nobody wrote down is one nobody chases. Separate from the flag above
+    # because the two are agreed at different moments: the gold arrives today
+    # and the date it is owed back may not be settled until later.
     metal_due_date: Mapped[date | None] = mapped_column(Date, index=True)
 
     # --- labour ---

@@ -12,7 +12,8 @@
 import { ReactNode } from "react";
 import { fmtMoney } from "@/lib/money";
 
-export type WastageBasis = "percent_of_issued" | "per_100_pieces";
+export type WastageBasis = "percent_of_issued" | "per_100_pieces" | "ratti_of_received";
+export type Metal = "gold" | "silver";
 export type LegStatus = "issued" | "received" | "cancelled";
 
 export interface LegStone {
@@ -34,21 +35,38 @@ export interface Leg {
   worker_id: number | null;
   worker_name: string | null;
   status: LegStatus;
+  metal: Metal;
   issued_at: string | null;
   gold_issued_g: string;
   gold_issued_purity: number | null;
+  gold_issued_tunch_pct: string | null;
   stones_issued_ct: string;
   received_at: string | null;
   gold_received_g: string;
+  // What came back, which is not what went out: pure metal goes to the maker
+  // and 21k jewellery returns. Null means nothing was said, and the settlement
+  // then reads it as the same metal that was issued.
+  gold_received_purity: number | null;
+  gold_received_tunch_pct: string | null;
+  metal_on_credit: boolean;
+  metal_due_date: string | null;
   stones_used_ct: string;
   stones_returned_ct: string;
   piece_count: number;
   wastage_basis: WastageBasis;
   wastage_per_100_pcs_g: string | null;
   wastage_allowed_pct: string | null;
+  wastage_ratti: string | null;
+  wastage_ratti_base: number;
   wastage_allowed_g: string;
   wastage_actual_g: string;
   wastage_excess_g: string;
+  // The same three in fine grams, which is what the worker is actually charged
+  // on once the two ends of the job are different purities. Null on legs closed
+  // before that reckoning existed.
+  wastage_allowed_fine_g: string | null;
+  wastage_actual_fine_g: string | null;
+  wastage_excess_fine_g: string | null;
   labour_basis: string;
   labour_rate: string;
   labour_amount: string;
@@ -184,6 +202,10 @@ export interface Terms {
   allowedPct: number;
   per100: number;
   pieces: number;
+  ratti: number;
+  rattiBase: number;
+  /** The purity the metal went out at, for the fine-gram reckoning below. */
+  issuedPurity: number | null;
 }
 
 export function termsOf(leg: Leg): Terms {
@@ -192,19 +214,77 @@ export function termsOf(leg: Leg): Terms {
     allowedPct: Number(leg.wastage_allowed_pct ?? 0),
     per100: Number(leg.wastage_per_100_pcs_g ?? 0),
     pieces: leg.piece_count,
+    ratti: Number(leg.wastage_ratti ?? 0),
+    rattiBase: leg.wastage_ratti_base || 96,
+    issuedPurity: leg.gold_issued_purity,
   };
 }
 
-export function allowanceOf(t: Terms, issued: number): number {
+/**
+ * The allowance, which for one of the three bases is measured against the
+ * weight the worker *hands back* rather than the weight he was issued. That is
+ * the maker's convention and it is why `received` is a parameter at all: until
+ * he returns the piece, his allowance is not a number anyone can know.
+ */
+export function allowanceOf(t: Terms, issued: number, received = 0): number {
+  if (t.basis === "ratti_of_received") {
+    const base = t.rattiBase || 96;
+    return round4((received / base) * Math.min(t.ratti, base));
+  }
   return t.basis === "per_100_pieces"
     ? round4((t.per100 * t.pieces) / 100)
     : round4((issued * t.allowedPct) / 100);
 }
 
-export function settle(issued: number, received: number, t: Terms) {
-  const allowed = allowanceOf(t, issued);
+/** As-weighed grams scaled to their 24k equivalent; no purity reads as pure. */
+const fine = (grams: number, purity: number | null) =>
+  round4((grams * (purity ?? 24)) / 24);
+
+/**
+ * The settlement as the server will compute it, previewed before the operator
+ * commits to it.
+ *
+ * Two readings, and the second is the one the worker is charged on. The raw
+ * figures compare grams to grams, which means something only while both ends
+ * of the job are the same metal — issue 100g of 24k, take back 107g of 21k,
+ * and the raw reading says the piece came back seven grams *heavier* when the
+ * metal is in fact square. So the liability is settled in fine grams, and the
+ * raw numbers are kept because they are what the scale said and what the
+ * worker will argue from.
+ *
+ * `receivedPurity` null means nothing was said about the return, which is read
+ * as the same metal that went out — exactly as the server reads it.
+ */
+export function settle(
+  issued: number,
+  received: number,
+  t: Terms,
+  receivedPurity: number | null = null,
+) {
+  const allowed = allowanceOf(t, issued, received);
   const actual = round4(issued - received);
-  return { allowed, actual, excess: Math.max(round4(actual - allowed), 0) };
+
+  // The allowance is converted at the purity it was measured against: a ratti
+  // allowance is a slice of the jewellery handed back, the other two are
+  // carved out of the metal issued.
+  const backPurity = receivedPurity ?? t.issuedPurity;
+  const allowedFine =
+    t.basis === "ratti_of_received"
+      ? fine(allowed, backPurity)
+      : fine(allowed, t.issuedPurity);
+  const actualFine = round4(fine(issued, t.issuedPurity) - fine(received, backPurity));
+
+  return {
+    allowed,
+    actual,
+    excess: Math.max(round4(actual - allowed), 0),
+    allowedFine,
+    actualFine,
+    excessFine: Math.max(round4(actualFine - allowedFine), 0),
+    // Whether the two readings disagree — which they do exactly when the metal
+    // came back at a different purity from the one it left at.
+    mixed: (backPurity ?? 24) !== (t.issuedPurity ?? 24),
+  };
 }
 
 /**
@@ -212,6 +292,8 @@ export function settle(issued: number, received: number, t: Terms) {
  * the arithmetic rather than trust the number.
  */
 export function allowanceWorking(t: Terms, allowed: number): string {
+  if (t.basis === "ratti_of_received")
+    return `${t.ratti} ratti of ${t.rattiBase} on what comes back = ${g3(allowed)} g allowed`;
   return t.basis === "per_100_pieces"
     ? `${t.pieces} pcs × ${g3(t.per100)}g/100 = ${g3(allowed)} g allowed`
     : `${t.allowedPct}% of issued`;
@@ -219,6 +301,7 @@ export function allowanceWorking(t: Terms, allowed: number): string {
 
 /** The same terms in a phrase, for "X beyond the … agreed with him". */
 export function termsPhrase(t: Terms): string {
+  if (t.basis === "ratti_of_received") return `${t.ratti} ratti of ${t.rattiBase}`;
   return t.basis === "per_100_pieces"
     ? `${g3(t.per100)}g per 100 pieces`
     : `${t.allowedPct}%`;
@@ -300,11 +383,12 @@ export function Figure({
  * or a live preview — the operator should recognise the number he approved.
  */
 export function Settlement({
-  allowed,
-  actual,
-  excess,
+  allowed: rawAllowed,
+  actual: rawActual,
+  excess: rawExcess,
   terms,
   worker,
+  fine,
   className = "",
 }: {
   allowed: number;
@@ -312,8 +396,18 @@ export function Settlement({
   excess: number;
   terms: Terms;
   worker: string | null;
+  /**
+   * The same three figures in fine grams, given only when the two ends of the
+   * job are different purities. Then they lead, because the raw ones are not
+   * comparable: 100g of 24k out against 107g of 21k back reads as a seven-gram
+   * gain on the scale while the metal is square.
+   */
+  fine?: { allowed: number; actual: number; excess: number };
   className?: string;
 }) {
+  const allowed = fine ? fine.allowed : rawAllowed;
+  const actual = fine ? fine.actual : rawActual;
+  const excess = fine ? fine.excess : rawExcess;
   const gain = actual < 0;
   const span = Math.max(allowed, actual, 0.0001);
   const pct = (v: number) => `${Math.min(100, Math.max(0, (v / span) * 100))}%`;
@@ -339,7 +433,7 @@ export function Settlement({
             {wt(gain ? -actual : actual)}
           </p>
           <p className="mt-0.5 text-[11px] leading-snug text-slate-500">
-            {gain ? "came back heavier" : "issued − received"}
+            {fine ? "issued − received, fine" : gain ? "came back heavier" : "issued − received"}
           </p>
         </div>
         <div>
@@ -356,6 +450,15 @@ export function Settlement({
           </p>
         </div>
       </div>
+
+      {fine && (
+        <p className="mt-3 rounded-lg bg-slate-100 px-3 py-2 text-[11px] leading-relaxed text-slate-600">
+          Settled in fine grams, because the metal came back at a different purity from the one it
+          went out at. On the scale it reads {wt(rawAllowed)} allowed against{" "}
+          {rawActual < 0 ? `${wt(-rawActual)} more` : `${wt(rawActual)} less`} returned — two
+          weights of different metal, which cannot be subtracted from one another.
+        </p>
+      )}
 
       {gain ? (
         <p className="mt-3 rounded-lg bg-sky-50 px-3 py-2 text-xs leading-relaxed text-sky-900">
