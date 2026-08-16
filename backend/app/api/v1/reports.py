@@ -22,6 +22,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import joinedload, selectinload
 
+from app.core import clock
 from app.api.deps import DbSession, require_perm
 from app.models.account import SystemAccount
 from app.models.currency import Currency
@@ -99,7 +100,7 @@ def _fine_sql(weight, purity):
 
 
 def _stamp(date_from: date | None, date_to: date | None) -> str:
-    return f"{date_from or 'open'}_{date_to or date.today()}"
+    return f"{date_from or 'open'}_{date_to or clock.today()}"
 
 
 def _csv_response(
@@ -164,7 +165,7 @@ async def stock_report(db: DbSession, format: Format = Query(default="json")):
 
     if format == "csv":
         return _csv_response(
-            f"stock_{date.today()}.csv",
+            f"stock_{clock.today()}.csv",
             ["type", "items", "total_quantity", "total_weight_g", "total_weight_ct"],
             [
                 [b.type.value, b.items, b.total_quantity, b.total_weight_g, b.total_weight_ct]
@@ -235,7 +236,7 @@ async def sales_report(
 
     if format == "csv":
         return _csv_response(
-            f"sales_{date.today()}.csv",
+            f"sales_{clock.today()}.csv",
             ["currency", "sale_type", "invoices", "subtotal", "discount", "total"],
             [
                 [b.currency.value, b.sale_type.value, b.invoice_count, b.subtotal, b.discount, b.total]
@@ -548,6 +549,8 @@ async def profit_report(
             Invoice.total,
             Invoice.tax_amount,
             func.coalesce(making_cost_subq.c.making_cost, 0),
+            Invoice.metal_due_fine_g,
+            Invoice.gold_rate_per_g,
         )
         .join(making_cost_subq, making_cost_subq.c.invoice_id == Invoice.id, isouter=True)
         .where(Invoice.status.in_((InvoiceStatus.issued, InvoiceStatus.paid)))
@@ -560,11 +563,21 @@ async def profit_report(
 
     rows: list[ProfitRow] = []
     by_cur: dict[str, dict] = {}
-    for inv_id, inv_no, currency, issued_at, total, tax, mc in (await db.execute(stmt)).all():
+    for inv_id, inv_no, currency, issued_at, total, tax, mc, metal_g, gold_rate in (
+        await db.execute(stmt)
+    ).all():
         # Tax is collected on the state's behalf and paid straight back out. It
         # is not the shop's money and counting it inflates profit by exactly the
         # tax — which is also what made this disagree with /reports/margin.
         revenue = (Decimal(str(total)) - Decimal(str(tax or 0))).quantize(Decimal("0.01"))
+        # Metal sold for metal is still sold. A trade bill never prices its
+        # gold, so `total` holds only the stones and the making — but the shop
+        # has parted with the metal and is owed gold for it, and this is the
+        # figure the ledger credits to Sales. Without it every wholesale bill
+        # reports as a loss the size of its own gold.
+        revenue += (
+            Decimal(str(metal_g or 0)) * Decimal(str(gold_rate or 0))
+        ).quantize(Decimal("0.01"))
         cost = Decimal(str(mc))
         profit = (revenue - cost).quantize(Decimal("0.01"))
         rows.append(
@@ -588,7 +601,7 @@ async def profit_report(
 
     if format == "csv":
         return _csv_response(
-            f"profit_{date.today()}.csv",
+            f"profit_{clock.today()}.csv",
             ["invoice_no", "currency", "issued_at", "revenue", "cost_of_goods", "profit"],
             [
                 [
@@ -720,6 +733,16 @@ async def margin_report(
         # the round-off taken off it, and the tax added on. Stripping the tax
         # back out leaves exactly the figure the levers below have to add up to.
         revenue = (_d(invoice.total) - tax).quantize(_PKR)
+        # Metal sold for metal is still sold. On a trade bill the gold is never
+        # priced, so `invoice.total` carries only the stones and the making —
+        # but the shop has parted with the metal and is owed gold for it, and
+        # the ledger credits Sales with exactly this figure. Leaving it out
+        # would report the whole metal side of the wholesale business as a
+        # dead loss: the cost of the gold in `cost_of_goods` with no revenue
+        # against it, and every lever below unattributed by the same amount.
+        revenue += (
+            _d(invoice.metal_due_fine_g) * _d(invoice.gold_rate_per_g)
+        ).quantize(_PKR)
         weight_discount = (
             _d(invoice.discount_weight_g) * _d(invoice.gold_rate_per_g)
         ).quantize(_PKR)
@@ -919,7 +942,7 @@ async def worker_performance_report(
 
     if format == "csv":
         return _csv_response(
-            f"worker-performance_{days}d_{date.today()}.csv",
+            f"worker-performance_{days}d_{clock.today()}.csv",
             [
                 "worker", "department", "legs", "gold_issued_g", "gold_received_g",
                 "wastage_allowed_g", "wastage_actual_g", "wastage_excess_g",

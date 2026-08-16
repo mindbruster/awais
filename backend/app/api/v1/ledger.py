@@ -14,6 +14,7 @@ from sqlalchemy import case, desc, func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
+from app.core import clock
 from app.api.deps import CurrentUser, DbSession, require_password_confirm, require_perm
 from app.core import lock_keys
 from app.models.account import Account, AccountType, SystemAccount
@@ -22,6 +23,7 @@ from app.models.currency import Currency
 from app.models.customer import Customer
 from app.models.gold_rate import GoldRate
 from app.models.journal import Commodity, JournalEntry, JournalLine, PartyType
+from app.models.purchase import Supplier
 from app.models.vendor import Vendor
 from app.schemas.ledger import (
     AccountCreate,
@@ -34,6 +36,8 @@ from app.schemas.ledger import (
     OpeningBalancePosted,
     OpeningBalanceResult,
     OpeningBalanceSkipped,
+    PartyStatementReport,
+    PartyStatementRow,
     PositionReport,
     StatementReport,
     StatementRow,
@@ -577,6 +581,200 @@ async def statement(
     )
 
 
+async def _party_name(db: DbSession, party_type: PartyType, party_id: int) -> str | None:
+    """
+    Whose account this is. None rather than an error if the row has gone —
+    a statement for a deleted party is still a truthful record of what moved.
+    """
+    model = {
+        PartyType.customer: Customer,
+        PartyType.supplier: Supplier,
+        PartyType.worker: Vendor,
+        # Salesmen are held as vendor rows until the route work gives them
+        # somewhere better to live.
+        PartyType.salesman: Vendor,
+    }[party_type]
+    row = await db.get(model, party_id)
+    return getattr(row, "name", None) if row else None
+
+
+@router.get("/party-statement", response_model=PartyStatementReport, dependencies=[read])
+async def party_statement(
+    db: DbSession,
+    party_type: PartyType = Query(...),
+    party_id: int = Query(...),
+    date_from: date | None = Query(default=None),
+    date_to: date | None = Query(default=None),
+    limit: int = Query(default=500, le=5000),
+    offset: int = Query(default=0, ge=0),
+) -> PartyStatementReport:
+    """
+    A trade party's account in both units at once — fine grams and rupees.
+
+    This is the document a wholesale jeweller actually keeps. His counterparty
+    owes him metal *and* money, the two settle on different days by different
+    means, and neither figure can be derived from the other: the metal side is
+    unpriced on purpose, because the rate is agreed on the day the gold moves
+    and not on the day the bill was written.
+
+    Deliberately not scoped to one account. The metal side is every GOLD line
+    carrying this party and the cash side is every non-GOLD line carrying it,
+    wherever they sit in the chart. That makes the statement agnostic to which
+    control account a document chose — and it means a jeweller who both buys
+    and sells nets correctly across Customers and Suppliers, which is how the
+    bazaar reads the relationship and how it will be argued at settlement.
+
+    The cash side sums `value_pkr`, not `quantity`, so a dollar bill and a
+    rupee bill land on the same column instead of being added as though the two
+    units were interchangeable. The metal side sums `quantity`, which is always
+    fine grams.
+    """
+    party_where = [
+        JournalLine.party_type == party_type,
+        JournalLine.party_id == party_id,
+    ]
+    is_metal = JournalLine.commodity == Commodity.GOLD
+
+    metal_q = func.coalesce(
+        func.sum(case((is_metal, JournalLine.quantity), else_=0)), 0
+    )
+    cash_q = func.coalesce(
+        func.sum(case((is_metal, 0), else_=JournalLine.value_pkr)), 0
+    )
+
+    # Opening carries in everything strictly before the window, so the first
+    # row continues the account rather than restarting it.
+    opening_metal = _ZERO
+    opening_cash = _ZERO
+    if date_from is not None:
+        opening_metal, opening_cash = (
+            await db.execute(
+                select(metal_q, cash_q)
+                .join(JournalEntry, JournalEntry.id == JournalLine.entry_id)
+                .where(*party_where, JournalEntry.entry_date < date_from)
+            )
+        ).one()
+        opening_metal, opening_cash = ledger.d(opening_metal), ledger.d(opening_cash)
+
+    def _in_period(q):
+        q = q.join(JournalEntry, JournalEntry.id == JournalLine.entry_id).where(*party_where)
+        if date_from is not None:
+            q = q.where(JournalEntry.entry_date >= date_from)
+        if date_to is not None:
+            q = q.where(JournalEntry.entry_date <= date_to)
+        return q
+
+    # One row per document, not per posting. A single invoice can put several
+    # lines against the same party, and a statement that showed each of them
+    # would be a journal rather than an account.
+    grouped = (
+        _in_period(
+            select(
+                JournalEntry.id,
+                JournalEntry.entry_no,
+                JournalEntry.entry_date,
+                JournalEntry.memo,
+                JournalEntry.source_type,
+                JournalEntry.source_id,
+                metal_q,
+                cash_q,
+                func.coalesce(
+                    func.sum(case((is_metal, JournalLine.native_weight_g), else_=0)), 0
+                ),
+                # Only reported when the document spoke with one voice. A bill
+                # covering three lots at three tunches has no single purity, and
+                # printing one of them would misdescribe the other two.
+                case(
+                    (
+                        func.count(func.distinct(JournalLine.native_purity)) == 1,
+                        func.max(JournalLine.native_purity),
+                    ),
+                    else_=None,
+                ),
+                case(
+                    (
+                        func.count(func.distinct(JournalLine.native_tunch_pct)) == 1,
+                        func.max(JournalLine.native_tunch_pct),
+                    ),
+                    else_=None,
+                ),
+            )
+        )
+        .group_by(
+            JournalEntry.id,
+            JournalEntry.entry_no,
+            JournalEntry.entry_date,
+            JournalEntry.memo,
+            JournalEntry.source_type,
+            JournalEntry.source_id,
+        )
+        .order_by(JournalEntry.entry_date, JournalEntry.id)
+    )
+
+    all_rows = (await db.execute(grouped)).all()
+    total_rows = len(all_rows)
+
+    # Period totals span the whole window even when the page does not, so a
+    # truncated statement still foots. Computed from the same grouped rows
+    # rather than a second query, which keeps the two definitions identical.
+    metal_in_total = sum((ledger.d(r[6]) for r in all_rows if r[6] and r[6] > 0), _ZERO)
+    metal_out_total = -sum((ledger.d(r[6]) for r in all_rows if r[6] and r[6] < 0), _ZERO)
+    cash_debit_total = sum((ledger.d(r[7]) for r in all_rows if r[7] and r[7] > 0), _ZERO)
+    cash_credit_total = -sum((ledger.d(r[7]) for r in all_rows if r[7] and r[7] < 0), _ZERO)
+
+    # The running balance has to be carried from the start of the period even
+    # when the page begins in the middle of it, or row 501 would open at
+    # nothing and every balance below it would be wrong.
+    metal_running = opening_metal
+    cash_running = opening_cash
+    rows: list[PartyStatementRow] = []
+    for index, r in enumerate(all_rows):
+        metal_delta = ledger.d(r[6])
+        cash_delta = ledger.d(r[7])
+        metal_running += metal_delta
+        cash_running += cash_delta
+        if index < offset or len(rows) >= limit:
+            continue
+        rows.append(
+            PartyStatementRow(
+                entry_id=r[0],
+                entry_no=r[1],
+                entry_date=r[2],
+                memo=r[3],
+                source_type=r[4],
+                source_id=r[5],
+                metal_in_g=metal_delta if metal_delta > 0 else _ZERO,
+                metal_out_g=-metal_delta if metal_delta < 0 else _ZERO,
+                metal_balance_g=metal_running,
+                native_weight_g=ledger.d(r[8]) or None,
+                native_purity=r[9],
+                native_tunch_pct=r[10],
+                cash_debit=cash_delta if cash_delta > 0 else _ZERO,
+                cash_credit=-cash_delta if cash_delta < 0 else _ZERO,
+                cash_balance=cash_running,
+            )
+        )
+
+    return PartyStatementReport(
+        party_type=party_type,
+        party_id=party_id,
+        party_name=await _party_name(db, party_type, party_id),
+        date_from=date_from,
+        date_to=date_to,
+        opening_metal_g=opening_metal,
+        opening_cash=opening_cash,
+        rows=rows,
+        metal_in_total_g=metal_in_total,
+        metal_out_total_g=metal_out_total,
+        cash_debit_total=cash_debit_total,
+        cash_credit_total=cash_credit_total,
+        closing_metal_g=metal_running,
+        closing_cash=cash_running,
+        total_rows=total_rows,
+        truncated=offset + len(rows) < total_rows,
+    )
+
+
 @router.get("/trial-balance", response_model=TrialBalanceReport, dependencies=[read])
 async def trial_balance(
     db: DbSession,
@@ -672,7 +870,7 @@ async def position(db: DbSession) -> PositionReport:
     workers = await ledger.balance_pkr(db, account_code=SystemAccount.WORKERS_PAYABLE.value)
 
     return PositionReport(
-        as_of=datetime.now(timezone.utc).date(),
+        as_of=clock.today(),
         cash_in_hand=cash,
         gold_in_hand_g=gold,
         gold_with_workers_g=with_workers,

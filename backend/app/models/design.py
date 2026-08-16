@@ -1,7 +1,8 @@
 import enum
-from datetime import datetime
+from datetime import date, datetime
 
 from sqlalchemy import (
+    Date,
     DateTime,
     Enum,
     ForeignKey,
@@ -17,6 +18,7 @@ from app.models.currency import Currency
 from app.models.customer import Customer
 from app.models.department import Department
 from app.models.item import Item
+from app.models.metal import Metal
 from app.models.mixins import TimestampMixin
 from app.models.stone import Stone
 from app.models.vendor import Vendor
@@ -46,16 +48,30 @@ class WastageBasis(str, enum.Enum):
     """
     How the metal a worker may keep is agreed.
 
-    Two conventions are in use and they are not interchangeable. Casting and
-    goldsmithing agree a percentage of the weight issued. Setting agrees a
-    weight per hundred stones — a setter handling 350 small stones loses metal
-    in proportion to how many he sets, not to how heavy the piece is, so a
-    percentage would under-charge a light piece with many stones and
-    over-charge a heavy one with few.
+    Three conventions are in use and none of them converts into another.
+
+    A percentage of the weight *issued* is what goldsmithing works on. A weight
+    per hundred pieces is what setting works on — a setter handling 350 small
+    stones loses metal in proportion to how many he sets, not to how heavy the
+    piece is, so a percentage would under-charge a light piece carrying many
+    stones and over-charge a heavy one carrying few. Ratti of the weight
+    *returned* is what the maker works on.
+
+    The reference weight is the part that makes them irreconcilable: two of
+    these are measured against what went out and one against what came back,
+    and until the job is finished nobody knows the second number. So the basis
+    is chosen when the deal is struck and travels on the leg.
     """
 
     percent_of_issued = "percent_of_issued"
     per_100_pieces = "per_100_pieces"
+    # The maker's convention: ratti out of 96, applied to the weight he
+    # *returns* rather than the weight he was issued, and added to what he is
+    # credited with. Six ratti on 107.560 g allows 6.7225 g. Distinct from a
+    # percentage because the reference weight is the other end of the job —
+    # a percentage of issued and a ratti of received are not the same number
+    # and cannot be converted into one another without knowing the outcome.
+    ratti_of_received = "ratti_of_received"
 
 
 class Design(Base, TimestampMixin):
@@ -158,8 +174,20 @@ class JobLeg(Base, TimestampMixin):
 
     # --- issue side ---
     issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Which metal this leg is working. Gold unless said otherwise, so every
+    # leg written before silver existed reads correctly without being touched.
+    # Purity lives in the tunch/karat columns and works the same for both.
+    metal: Mapped[Metal] = mapped_column(
+        Enum(Metal, name="metal"), nullable=False, default=Metal.gold, index=True
+    )
     gold_issued_g: Mapped[float] = mapped_column(Numeric(14, 4), nullable=False, default=0)
     gold_issued_purity: Mapped[int | None] = mapped_column(Integer)
+    # Fineness in percent, preferred over the karat integer above. Metal goes
+    # out to a karigar and comes back short by an agreed wastage; both sides of
+    # that reckoning have to be in the same unit the metal was weighed in, or
+    # the excess-wastage figure argues with the scale. See
+    # `Product.gold_tunch_pct`.
+    gold_issued_tunch_pct: Mapped[float | None] = mapped_column(Numeric(6, 3))
     stones_issued_ct: Mapped[float] = mapped_column(Numeric(14, 4), nullable=False, default=0)
     gold_source_inventory_id: Mapped[int | None] = mapped_column(
         ForeignKey("inventory_items.id", ondelete="SET NULL")
@@ -171,6 +199,18 @@ class JobLeg(Base, TimestampMixin):
     # --- receive side ---
     received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     gold_received_g: Mapped[float] = mapped_column(Numeric(14, 4), nullable=False, default=0)
+    # The purity of what came *back*, which is not the purity of what went out.
+    #
+    # Pure 24k metal goes to the maker and 21k or 18k jewellery comes back. The
+    # system used to value the returned weight at the *issued* purity, which
+    # credited a 21k piece as though it were pure and overstated the maker's
+    # return by about fourteen percent — the shop would believe a job had
+    # settled while the metal was still short.
+    #
+    # Nullable, and read as "same as issued" when absent, so every leg recorded
+    # before this column existed keeps computing exactly as it did.
+    gold_received_purity: Mapped[int | None] = mapped_column(Integer)
+    gold_received_tunch_pct: Mapped[float | None] = mapped_column(Numeric(6, 3))
     stones_used_ct: Mapped[float] = mapped_column(Numeric(14, 4), nullable=False, default=0)
     stones_returned_ct: Mapped[float] = mapped_column(Numeric(14, 4), nullable=False, default=0)
 
@@ -202,6 +242,41 @@ class JobLeg(Base, TimestampMixin):
     # Only the part beyond the allowance is the worker's liability. This is
     # what gets debited to his gold account.
     wastage_excess_g: Mapped[float] = mapped_column(Numeric(14, 4), nullable=False, default=0)
+
+    # Ratti of wastage allowed to the maker, against `wastage_ratti_base`.
+    #
+    # The maker's convention, and a third thing again from the two above. It is
+    # worked out on the weight he *returns*, not on what he was issued: six
+    # ratti on 107.560 g of finished 21k allows 107.560 / 96 * 6 = 6.7225 g,
+    # which is added to what he is credited with. Quoted 1 to 24 against a base
+    # of 96, and the base travels on the leg because it is a convention rather
+    # than a constant.
+    wastage_ratti: Mapped[float | None] = mapped_column(Numeric(6, 3))
+    wastage_ratti_base: Mapped[int] = mapped_column(Integer, nullable=False, default=96)
+
+    # The same three figures as above, in *fine* grams.
+    #
+    # The raw columns compare grams to grams, which only means anything while
+    # what went out and what came back are the same purity. Once the maker
+    # returns 21k against issued 24k they are different assets and the
+    # reckoning has to happen in fine grams or it is subtracting apples from
+    # oranges. These carry that reckoning; the raw columns above stay as what
+    # the scale actually read.
+    #
+    # Nullable and never backfilled. A leg written before this existed has
+    # nothing here, and the receive path falls back to converting the raw
+    # columns exactly as it always did — so no settled job moves.
+    wastage_allowed_fine_g: Mapped[float | None] = mapped_column(Numeric(14, 4))
+    wastage_actual_fine_g: Mapped[float | None] = mapped_column(Numeric(14, 4))
+    wastage_excess_fine_g: Mapped[float | None] = mapped_column(Numeric(14, 4))
+
+    # When the shop has to hand the metal over.
+    #
+    # Work does not always start with metal leaving the safe: a maker will make
+    # a piece on his own gold and be owed the metal back at a date the two of
+    # them agree. Nothing else in the system records a promise to *deliver*
+    # metal, and a promise nobody wrote down is one nobody chases.
+    metal_due_date: Mapped[date | None] = mapped_column(Date, index=True)
 
     # --- labour ---
     labour_basis: Mapped[LabourBasis] = mapped_column(

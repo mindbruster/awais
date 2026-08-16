@@ -14,13 +14,17 @@ interface NavItem {
 // Mirrors backend permissions in app/core/permissions.py.
 const NAV: NavItem[] = [
   { to: "/", label: "Dashboard", end: true },
+  { to: "/orders", label: "Orders & repairs" },
   { to: "/designs", label: "Designs" },
   { to: "/invoices", label: "Invoices" },
+  { to: "/approvals", label: "On approval" },
   { to: "/products", label: "Products" },
   { to: "/inventory", label: "Inventory" },
   { to: "/stones", label: "Stones" },
   { to: "/stock-movements", label: "Stock ledger" },
+  { to: "/transfers", label: "Transfers" },
   { to: "/customers", label: "Customers" },
+  { to: "/messages", label: "Messages" },
   { to: "/vendors", label: "Workers" },
   { to: "/gold-rates", label: "Gold rates" },
   { to: "/reports", label: "Reports" },
@@ -34,6 +38,7 @@ const NAV: NavItem[] = [
 // Buying: metal back over the counter, and stones from suppliers. Counter staff
 // do both, so this is not hidden from them.
 const PURCHASING_NAV: NavItem[] = [
+  { to: "/purchasing/gold", label: "Gold purchases" },
   { to: "/purchasing/old-gold", label: "Old gold" },
   { to: "/purchasing/stones", label: "Stone purchases" },
   { to: "/purchasing/stone-stock", label: "Stone stock" },
@@ -44,6 +49,7 @@ const PURCHASING_NAV: NavItem[] = [
 // doing their job, but they don't get to read it.
 const LEDGER_NAV: NavItem[] = [
   { to: "/ledger/position", label: "Position" },
+  { to: "/ledger/trade-account", label: "Trade accounts" },
   { to: "/ledger/statement", label: "Statements" },
   { to: "/ledger/journal", label: "Journal" },
   { to: "/ledger/accounts", label: "Chart of accounts" },
@@ -54,7 +60,7 @@ const LEDGER_NAV: NavItem[] = [
 // hidden from staff rather than showing them screens they can't act on.
 const SETTINGS_NAV: NavItem[] = [
   { to: "/settings/items", label: "Items" },
-  { to: "/settings/departments", label: "Departments" },
+  { to: "/settings/branches", label: "Branches" },
   { to: "/settings/stone-attributes", label: "Stone attributes" },
   { to: "/settings/locations", label: "Countries & cities" },
   { to: "/settings/banks", label: "Banks" },

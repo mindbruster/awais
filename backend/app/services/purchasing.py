@@ -1,5 +1,6 @@
 """
-The buying side: metal back over the counter, and stones from suppliers.
+The buying side: bullion from a dealer, metal back over the counter, stones
+from suppliers.
 
 Everything a purchase has to get right lives here rather than in the router,
 because both halves of a purchase have to agree and there is exactly one place
@@ -18,12 +19,20 @@ from fastapi import HTTPException, status
 from sqlalchemy import Integer, cast, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import clock
 from app.core import lock_keys
 from app.models.account import SystemAccount
 from app.models.design import JobLeg, LegStatus, LegStone
 from app.models.inventory import InventoryItem, InventoryType
 from app.models.journal import Commodity, JournalEntry, PartyType
-from app.models.purchase import OldGoldPurchase, StonePurchase, StonePurchaseItem
+from app.models.purchase import (
+    GoldPaymentMode,
+    GoldPurchase,
+    GoldPurchaseItem,
+    OldGoldPurchase,
+    StonePurchase,
+    StonePurchaseItem,
+)
 from app.models.stock_movement import MovementType
 from app.models.stone import Stone, StoneCategory
 from app.services.inventory import post_movement
@@ -33,14 +42,17 @@ from app.services.ledger import EntryDraft, Posting, d, fine_grams, post_entry, 
 # a reversal knows what it is undoing.
 OLD_GOLD_SOURCE = "old_gold_purchase"
 STONE_PURCHASE_SOURCE = "stone_purchase"
+GOLD_PURCHASE_SOURCE = "gold_purchase"
 
 _PKR = Decimal("0.01")
+_ZERO_PKR = Decimal("0")
 _CT = Decimal("0.0001")
 
 # Advisory-lock keys, in the same 7_3xx_xxx block the rest of the app uses so
 # nothing here can collide with a serial mint or the opening-balance run.
 _OLD_GOLD_NO_LOCK = lock_keys.OLD_GOLD_PURCHASE_NO
 _STONE_PURCHASE_NO_LOCK = lock_keys.STONE_PURCHASE_NO
+_GOLD_PURCHASE_NO_LOCK = lock_keys.GOLD_PURCHASE_NO
 _RAW_STONE_ITEM_LOCK = lock_keys.RAW_STONE_ITEM
 # Melt pots are per purity, so the lock is too — buying 22k must not serialise
 # against someone buying 21k at the next counter.
@@ -90,10 +102,22 @@ async def next_stone_purchase_no(db: AsyncSession) -> str:
     )
 
 
+async def next_gold_purchase_no(db: AsyncSession) -> str:
+    # `GP`, not `OG`: a dealer's bill and a counter buy-back are different
+    # documents and the shop has to be able to tell them apart by number alone.
+    return await _next_no(
+        db,
+        model=GoldPurchase,
+        column=GoldPurchase.purchase_no,
+        prefix="GP",
+        lock_key=_GOLD_PURCHASE_NO_LOCK,
+    )
+
+
 # --------------------------------------------------------------------------
 # Where bought material lands in stock
 # --------------------------------------------------------------------------
-async def raw_gold_item(db: AsyncSession, *, purity: int) -> InventoryItem:
+async def raw_gold_item(db: AsyncSession, *, purity: int, branch_id: int) -> InventoryItem:
     """
     The melt pot for one purity, created on first use.
 
@@ -115,6 +139,10 @@ async def raw_gold_item(db: AsyncSession, *, purity: int) -> InventoryItem:
                 .where(
                     InventoryItem.type == InventoryType.raw_gold,
                     InventoryItem.purity == purity,
+                    # Per branch: 22k in the Anarkali safe is not 22k in the
+                    # Gulberg safe, and topping one up from the other's counter
+                    # would make both branch stock reports wrong at once.
+                    InventoryItem.branch_id == branch_id,
                 )
                 .order_by(InventoryItem.id)
                 .limit(1)
@@ -129,6 +157,7 @@ async def raw_gold_item(db: AsyncSession, *, purity: int) -> InventoryItem:
             type=InventoryType.raw_gold,
             label=f"Raw gold {purity}k",
             purity=purity,
+            branch_id=branch_id,
             quantity=0,
             weight_g=Decimal("0"),
             weight_ct=Decimal("0"),
@@ -153,6 +182,7 @@ async def raw_stone_item(
     cut: str | None,
     color: str | None,
     clarity: str | None,
+    branch_id: int,
 ) -> InventoryItem:
     """
     The packet a graded lot goes into, created on first use.
@@ -174,6 +204,7 @@ async def raw_stone_item(
                 .where(
                     InventoryItem.type == InventoryType.raw_stone,
                     InventoryItem.label == label,
+                    InventoryItem.branch_id == branch_id,
                 )
                 .order_by(InventoryItem.id)
                 .limit(1)
@@ -187,6 +218,7 @@ async def raw_stone_item(
         item = InventoryItem(
             type=InventoryType.raw_stone,
             label=label,
+            branch_id=branch_id,
             quantity=0,
             weight_g=Decimal("0"),
             weight_ct=Decimal("0"),
@@ -259,7 +291,7 @@ async def post_old_gold_purchase(
             f"{purchase.purchase_no}: bought {d(purchase.weight_g)}g "
             f"{purchase.kind.value} gold from {who} at {d(purchase.rate_per_g)}/g"
         ),
-        entry_date=purchase.purchased_at.date(),
+        entry_date=clock.shop_date(purchase.purchased_at),
         source_type=OLD_GOLD_SOURCE,
         source_id=purchase.id,
     )
@@ -332,6 +364,188 @@ async def reverse_old_gold_purchase(
 
 
 # --------------------------------------------------------------------------
+# Gold purchases (from a dealer)
+# --------------------------------------------------------------------------
+def gold_line_amount(weight_g: Decimal, rate_per_g: Decimal) -> Decimal:
+    """
+    Quoted against the actual weight, not the fine weight.
+
+    That is how the trade quotes it, and it matches how a buy-back is recorded,
+    so the two documents can be compared without one of them being converted
+    first. Fine grams are derived once, at posting time, from the purity.
+    """
+    return (d(weight_g) * d(rate_per_g)).quantize(_PKR)
+
+
+async def lots_of(db: AsyncSession, purchase: GoldPurchase) -> list[GoldPurchaseItem]:
+    """The bill's lots, fetched rather than read off the relationship."""
+    return list(
+        (
+            await db.execute(
+                select(GoldPurchaseItem)
+                .where(GoldPurchaseItem.purchase_id == purchase.id)
+                .order_by(GoldPurchaseItem.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+_CREDIT_ACCOUNT = {
+    GoldPaymentMode.cash: SystemAccount.CASH_IN_HAND,
+    GoldPaymentMode.bank: SystemAccount.BANK,
+    GoldPaymentMode.credit: SystemAccount.SUPPLIERS,
+}
+
+
+async def post_gold_purchase(
+    db: AsyncSession,
+    purchase: GoldPurchase,
+    items: list[GoldPurchaseItem],
+    *,
+    supplier_name: str,
+    user_id: int | None = None,
+) -> JournalEntry:
+    """
+    Metal in at what it cost; money out of wherever it came from.
+
+    Debit 1130 Gold in Hand once per lot, in *fine* grams, carrying that lot's
+    own actual weight and purity — one aggregate posting would lose the purity
+    breakdown the metal ledger reads, and a bill with 22k and 24k bars on it
+    would become an untraceable blended figure.
+
+    Carriage and assay are capitalised into the metal rather than expensed:
+    they are part of what the gold cost, and expensing them would understate
+    stock and overstate this month's costs at the same time. They are spread
+    across the lots in proportion to value, which is why the rate per fine gram
+    is derived from the loaded total rather than from what the dealer quoted.
+
+    The credit side follows how it was paid. Only `credit` tags the supplier —
+    the party fields say *whose balance this line is part of*, and cash out of
+    the shop's own till is not the dealer's balance, however it got to them.
+    """
+    total = d(purchase.total)
+    if total <= 0:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "A bill of zero rupees has nothing to post."
+        )
+    subtotal = d(purchase.subtotal)
+    if subtotal <= 0:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "A bill with no metal on it has nothing to post."
+        )
+
+    draft = EntryDraft(
+        memo=f"{purchase.purchase_no}: raw gold from {supplier_name}"
+        + (f" ({purchase.reference})" if purchase.reference else ""),
+        entry_date=clock.shop_date(purchase.purchased_at),
+        source_type=GOLD_PURCHASE_SOURCE,
+        source_id=purchase.id,
+    )
+
+    # Loading is apportioned by value, and the last lot absorbs the rounding —
+    # otherwise the debits and the credit differ by a paisa and the entry will
+    # not balance.
+    booked = _ZERO_PKR
+    for index, item in enumerate(items):
+        amount = d(item.amount)
+        if index == len(items) - 1:
+            loaded = total - booked
+        else:
+            loaded = (total * amount / subtotal).quantize(_PKR)
+        booked += loaded
+
+        fine = fine_grams(item.weight_g, item.purity)
+        if fine <= 0:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"Lot {index + 1} weighs nothing, so there is no metal to book.",
+            )
+        draft.add(
+            Posting(
+                account_code=SystemAccount.GOLD_IN_HAND.value,
+                quantity=fine,
+                commodity=Commodity.GOLD,
+                rate=effective_fine_rate(loaded, fine),
+                native_weight_g=d(item.weight_g),
+                native_purity=item.purity,
+                memo=f"{d(item.weight_g)}g {item.purity}k = {fine}g fine",
+            )
+        )
+
+    account = _CREDIT_ACCOUNT[purchase.payment_mode]
+    on_credit = purchase.payment_mode is GoldPaymentMode.credit
+    draft.add(
+        Posting(
+            account_code=account.value,
+            quantity=-total,
+            party_type=PartyType.supplier if on_credit else None,
+            party_id=purchase.supplier_id if on_credit else None,
+            memo=(
+                f"Payable to {supplier_name}"
+                if on_credit
+                else f"Paid to {supplier_name} by {purchase.payment_mode.value}"
+            ),
+        )
+    )
+    return await post_entry(db, draft, user_id=user_id)
+
+
+async def reverse_gold_purchase(
+    db: AsyncSession, purchase: GoldPurchase, *, user_id: int | None = None
+) -> JournalEntry:
+    """
+    Undo both halves, or neither.
+
+    The books go first because `reverse_entry` is what refuses a second
+    attempt — doing the stock first would let a double-click take the metal out
+    twice before the ledger objected. If a bar has already been issued to a
+    worker, `post_movement` refuses and the whole transaction rolls back, which
+    is the right answer: you cannot un-buy metal that is no longer there.
+    """
+    if purchase.journal_entry_id is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"{purchase.purchase_no} never posted to the ledger, so there is nothing to reverse.",
+        )
+    original = await db.get(JournalEntry, purchase.journal_entry_id)
+    if original is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"The journal entry behind {purchase.purchase_no} is missing.",
+        )
+    reversal = await reverse_entry(
+        db,
+        original,
+        memo=f"Reversal of gold purchase {purchase.purchase_no}",
+        user_id=user_id,
+    )
+
+    # Selected rather than read off `purchase.items`. The relationship is only
+    # populated when the parent was loaded by a query that eager-loaded it;
+    # rows added earlier in the same session leave it stale, and touching it
+    # then triggers a lazy load, which async SQLAlchemy refuses outright.
+    for item in await lots_of(db, purchase):
+        if item.inventory_item_id is None:
+            continue
+        pot = await db.get(InventoryItem, item.inventory_item_id)
+        if pot is None:
+            continue
+        await post_movement(
+            db,
+            item=pot,
+            type=MovementType.adjustment,
+            weight_g_delta=-d(item.weight_g),
+            reference_type=GOLD_PURCHASE_SOURCE,
+            reference_id=purchase.id,
+            notes=f"Reversal of {purchase.purchase_no}",
+            user_id=user_id,
+        )
+    return reversal
+
+
+# --------------------------------------------------------------------------
 # Stone purchases
 # --------------------------------------------------------------------------
 def stone_line_amount(weight_ct: Decimal, rate_per_ct: Decimal) -> Decimal:
@@ -373,7 +587,7 @@ async def post_stone_purchase(
     draft = EntryDraft(
         memo=f"{purchase.purchase_no}: stones from {who}"
         + (f" ({purchase.reference})" if purchase.reference else ""),
-        entry_date=purchase.purchased_at.date(),
+        entry_date=clock.shop_date(purchase.purchased_at),
         source_type=STONE_PURCHASE_SOURCE,
         source_id=purchase.id,
     )

@@ -84,10 +84,21 @@ class _Block:
 
 @dataclass
 class _Message:
-    """The shape the call sites already expect, whoever produced it."""
+    """
+    The shape the call sites already expect, whoever produced it.
+
+    `model` is part of that shape: `generate_sql` returns it so the owner can
+    see which model wrote a query. Omitting it here meant every OpenRouter call
+    that reached that line died with an AttributeError — invisible until a real
+    key existed, because without one the request 503s long before it.
+    """
 
     content: list[_Block]
     stop_reason: str | None = None
+    # What actually served the request, which is not always what was asked for:
+    # OpenRouter falls back to another provider for a model under load, and the
+    # response says so.
+    model: str = ""
 
 
 class _OpenRouterMessages:
@@ -157,6 +168,7 @@ class _OpenRouterMessages:
         return _Message(
             content=[_Block(type="text", text=text)],
             stop_reason="refusal" if finish == "content_filter" else finish,
+            model=data.get("model") or model,
         )
 
 
@@ -524,7 +536,21 @@ async def generate_sql(question: str) -> GeneratedQuery:
             status.HTTP_400_BAD_REQUEST,
             "The model declined to answer that question.",
         )
-    data = json.loads(_text_of(message))
+    raw = _text_of(message)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        # The model answered in prose rather than the schema. In practice this
+        # is how a small model declines — asked for the users table and its
+        # password hashes, it explains why it won't instead of emitting the
+        # refusal token. That is a 400 with the model's own words, not a 500:
+        # nothing was run, and the person asking should see the reason.
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"The model did not return a query for that question. It said: {raw[:300]}"
+            if raw
+            else "The model returned nothing for that question.",
+        ) from None
     return GeneratedQuery(
         sql=validate_select(data.get("sql", "")),
         model=message.model,
@@ -790,6 +816,24 @@ def _history_text(messages: list[dict[str, str]]) -> str:
     return "\n".join(f"{m.get('role', 'user')}: {m.get('content', '')}" for m in recent)
 
 
+def _provider_failure(exc: Exception, what: str) -> HTTPException:
+    """
+    Turn a provider fault into something the operator can act on.
+
+    `generate_sql` already does this and the conversation paths did not, so an
+    out-of-credit account — which is the ordinary first-run state of a new
+    OpenRouter key — surfaced as a 500 and a traceback instead of the one
+    sentence that tells you to top up. The provider's own message is passed
+    through: "insufficient credits", "no such model" and "rate limited" need
+    three different actions, and collapsing them strands you.
+    """
+    log.warning("ai.%s failed (%s)", what, type(exc).__name__)
+    return HTTPException(
+        status.HTTP_502_BAD_GATEWAY,
+        f"The model could not be reached: {exc}"[:500],
+    )
+
+
 async def _route(messages: list[dict[str, str]]) -> tuple[str, str]:
     cfg = require_provider()
     schema = {
@@ -802,37 +846,51 @@ async def _route(messages: list[dict[str, str]]) -> tuple[str, str]:
         "additionalProperties": False,
     }
     client = _client(cfg, _NARRATION_TIMEOUT_S)
-    message = await client.messages.create(
-        model=cfg.model,
-        max_tokens=2000,
-        system=_CHAT_ROUTER_RULES,
-        output_config={"effort": "low", "format": {"type": "json_schema", "schema": schema}},
-        messages=[{"role": "user", "content": _history_text(messages)}],
-    )
-    data = json.loads(_text_of(message))
     latest = next(
         (m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), ""
     )
+    try:
+        message = await client.messages.create(
+            model=cfg.model,
+            max_tokens=2000,
+            system=_CHAT_ROUTER_RULES,
+            output_config={"effort": "low", "format": {"type": "json_schema", "schema": schema}},
+            messages=[{"role": "user", "content": _history_text(messages)}],
+        )
+    except Exception as exc:
+        raise _provider_failure(exc, "chat routing") from None
+    try:
+        data = json.loads(_text_of(message))
+    except json.JSONDecodeError:
+        # A model that ignored the schema should not sink the turn. Treating it
+        # as a data question is the useful default: that path validates
+        # everything it produces anyway, so a wrong guess is refused, not run.
+        return "data", latest
     return data.get("kind", "chat"), (data.get("question") or latest).strip()
 
 
 async def _answer_howto(question: str, messages: list[dict[str, str]]) -> str:
     cfg = require_provider()
     client = _client(cfg, _NARRATION_TIMEOUT_S)
-    message = await client.messages.create(
-        model=cfg.model,
-        max_tokens=4000,
-        system=(
-            "You are the assistant inside a jewellery shop's ERP. Explain how to "
+    try:
+        message = await client.messages.create(
+            model=cfg.model,
+            max_tokens=4000,
+            system=(
+                "You are the assistant inside a jewellery shop's ERP. Explain how to "
             "do things using ONLY the guide below — it describes this system, and "
             "screens or buttons outside it do not exist. If the guide does not "
             "cover something, say so plainly rather than guessing. Answer in the "
             "language the person used (English, Urdu or Roman-Urdu), in a few "
-            "short sentences or steps.\n\n" + WORKFLOW_GUIDE
-        ),
-        output_config={"effort": "low"},
-        messages=[{"role": "user", "content": f"{_history_text(messages)}\n\nAnswer: {question}"}],
-    )
+                "short sentences or steps.\n\n" + WORKFLOW_GUIDE
+            ),
+            output_config={"effort": "low"},
+            messages=[
+                {"role": "user", "content": f"{_history_text(messages)}\n\nAnswer: {question}"}
+            ],
+        )
+    except Exception as exc:
+        raise _provider_failure(exc, "chat how-to") from None
     return _text_of(message) or "I could not answer that."
 
 
@@ -870,16 +928,19 @@ async def chat(db: AsyncSession, messages: list[dict[str, str]]) -> ChatTurn:
 
     cfg = require_provider()
     client = _client(cfg, _NARRATION_TIMEOUT_S)
-    message = await client.messages.create(
-        model=cfg.model,
-        max_tokens=1000,
-        system=(
-            "You are the assistant inside a jewellery shop's ERP. Be brief and "
-            "practical. You can answer questions about the shop's own records "
-            "and explain how to use the system — say so if it helps. Reply in "
-            "the language the person used."
-        ),
-        output_config={"effort": "low"},
-        messages=[{"role": "user", "content": _history_text(messages)}],
-    )
+    try:
+        message = await client.messages.create(
+            model=cfg.model,
+            max_tokens=1000,
+            system=(
+                "You are the assistant inside a jewellery shop's ERP. Be brief and "
+                "practical. You can answer questions about the shop's own records "
+                "and explain how to use the system — say so if it helps. Reply in "
+                "the language the person used."
+            ),
+            output_config={"effort": "low"},
+            messages=[{"role": "user", "content": _history_text(messages)}],
+        )
+    except Exception as exc:
+        raise _provider_failure(exc, "chat") from None
     return ChatTurn(reply=_text_of(message) or "…", kind=kind)

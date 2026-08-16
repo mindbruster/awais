@@ -27,7 +27,10 @@ from app.schemas.insights import (
     ChatRequest,
     ChatResponse,
     CustomerDiscountRow,
+    KarigarRiskReport,
+    KarigarRiskRow,
     MarginRow,
+    RiskReason,
     MarginWatchReport,
     WastageAnomalyReport,
     WastageHalf,
@@ -592,4 +595,325 @@ async def chat(payload: ChatRequest, db: DbSession) -> ChatResponse:
         rows=turn.rows,
         notes=turn.notes,
         model=turn.model,
+    )
+
+
+# --------------------------------------------------------------------------
+# 4. Karigar risk
+# --------------------------------------------------------------------------
+# A worker needs this many finished legs in the window before he is scored at
+# all. Below it the figures describe the sample, not the man.
+RISK_MIN_LEGS = 4
+# Metal still out past this many days is treated as exposure rather than
+# ordinary work-in-progress. Set from what a shop actually tolerates: a piece
+# at setting for a fortnight is normal, a month is a conversation.
+STALE_OPEN_DAYS = 30
+# Band edges. Deliberately wide in the middle — the useful output of this report
+# is "watch these three", not a league table of everyone.
+BAND_WATCH = 25
+BAND_HIGH = 55
+
+
+def _score_component(value: Decimal, floor: Decimal, ceiling: Decimal, weight: int) -> int:
+    """
+    Turn one measure into points, clamped.
+
+    Linear between a floor (nothing worth saying) and a ceiling (as bad as this
+    component gets). Anything past the ceiling scores the same as the ceiling —
+    a worker who is ten times over his allowance is not usefully distinguished
+    from one who is five times over; both need the same conversation.
+    """
+    if ceiling <= floor:
+        return 0
+    if value <= floor:
+        return 0
+    ratio = min((value - floor) / (ceiling - floor), Decimal("1"))
+    return int((ratio * weight).quantize(Decimal("1")))
+
+
+@router.get("/karigar-risk", response_model=KarigarRiskReport, dependencies=[loss])
+async def karigar_risk(
+    db: DbSession,
+    days: int = Query(default=180, ge=30, le=730),
+) -> KarigarRiskReport:
+    """
+    Which workers to watch, and why.
+
+    The wastage report above answers "whose losses moved". This answers a
+    different question the shop actually asks: taking everything together —
+    how much he loses, whether it is getting worse, how long he sits on a job,
+    and how much of my metal he is holding right now — who should I be paying
+    attention to?
+
+    The score is a sum of four transparent components rather than a model's
+    opinion. That matters: the output of this report is a difficult
+    conversation with someone the owner has worked with for years, and it has
+    to be possible to show him the arithmetic. A model, where configured, is
+    only asked to write the covering sentence over figures that were already
+    computed here.
+    """
+    start, midpoint, end = _window(days)
+
+    # --- finished legs in the window ---------------------------------------
+    rows = (
+        await db.execute(
+            select(
+                JobLeg.worker_id,
+                Vendor.name,
+                Department.name,
+                func.count(JobLeg.id),
+                func.coalesce(func.sum(JobLeg.gold_issued_g), 0),
+                func.coalesce(func.sum(JobLeg.wastage_excess_g), 0),
+                func.coalesce(func.sum(JobLeg.wastage_actual_g), 0),
+                func.avg(
+                    func.extract("epoch", JobLeg.received_at - JobLeg.issued_at) / 86400.0
+                ),
+                # The two halves, for the trend component.
+                func.coalesce(
+                    func.sum(
+                        case((JobLeg.received_at < midpoint, JobLeg.gold_issued_g), else_=0)
+                    ),
+                    0,
+                ),
+                func.coalesce(
+                    func.sum(
+                        case((JobLeg.received_at < midpoint, JobLeg.wastage_actual_g), else_=0)
+                    ),
+                    0,
+                ),
+                func.coalesce(
+                    func.sum(
+                        case((JobLeg.received_at >= midpoint, JobLeg.gold_issued_g), else_=0)
+                    ),
+                    0,
+                ),
+                func.coalesce(
+                    func.sum(
+                        case((JobLeg.received_at >= midpoint, JobLeg.wastage_actual_g), else_=0)
+                    ),
+                    0,
+                ),
+            )
+            .join(Vendor, Vendor.id == JobLeg.worker_id)
+            .outerjoin(Department, Department.id == JobLeg.department_id)
+            .where(
+                JobLeg.worker_id.is_not(None),
+                JobLeg.status == LegStatus.received,
+                JobLeg.received_at >= start,
+            )
+            .group_by(JobLeg.worker_id, Vendor.name, Department.name)
+        )
+    ).all()
+
+    # --- metal still out, right now ----------------------------------------
+    open_rows = {
+        r[0]: r
+        for r in (
+            await db.execute(
+                select(
+                    JobLeg.worker_id,
+                    func.count(JobLeg.id),
+                    func.coalesce(func.sum(JobLeg.gold_issued_g), 0),
+                    func.min(JobLeg.issued_at),
+                )
+                .where(JobLeg.worker_id.is_not(None), JobLeg.status == LegStatus.issued)
+                .group_by(JobLeg.worker_id)
+            )
+        ).all()
+    }
+
+    shop_issued = sum((_d(r[4]) for r in rows), _ZERO)
+    shop_excess = sum((_d(r[5]) for r in rows), _ZERO)
+    held = [_d(r[7]) for r in rows if r[7] is not None]
+    shop_days = (sum(held, _ZERO) / len(held)).quantize(_PCT) if held else None
+
+    out: list[KarigarRiskRow] = []
+    for (
+        wid, wname, dept, legs, issued, excess, actual, avg_days,
+        e_issued, e_actual, r_issued, r_actual,
+    ) in rows:
+        issued_d, excess_d = _d(issued), _d(excess)
+        excess_rate = _pct(excess_d, issued_d)
+        earlier_rate = _pct(_d(e_actual), _d(e_issued)) if _d(e_issued) > 0 else None
+        recent_rate = _pct(_d(r_actual), _d(r_issued)) if _d(r_issued) > 0 else None
+
+        op = open_rows.get(wid)
+        open_legs = int(op[1]) if op else 0
+        open_gold = _d(op[2]) if op else _ZERO
+        oldest_open = (
+            (end - op[3]).days if op and op[3] is not None else None
+        )
+
+        reasons: list[RiskReason] = []
+        score = 0
+
+        if legs >= RISK_MIN_LEGS:
+            # 1. How far past his allowance he runs. The headline number.
+            pts = _score_component(excess_rate, Decimal("0.2"), Decimal("3"), 40)
+            if pts:
+                reasons.append(RiskReason(
+                    code="excess",
+                    label="Losses past his allowance",
+                    detail=(
+                        f"{excess_d.quantize(_G)} g beyond what was agreed across {legs} legs "
+                        f"— {excess_rate}% of the {issued_d.quantize(_G)} g he was issued."
+                    ),
+                    points=pts,
+                ))
+                score += pts
+
+            # 2. Whether it is getting worse.
+            if earlier_rate is not None and recent_rate is not None and earlier_rate > 0:
+                ratio = recent_rate / earlier_rate
+                pts = _score_component(ratio, DETERIORATION_RATIO, Decimal("3"), 20)
+                if pts:
+                    reasons.append(RiskReason(
+                        code="trend",
+                        label="Getting worse",
+                        detail=(
+                            f"Wastage rate has gone from {earlier_rate}% to {recent_rate}% "
+                            "between the first and second half of the window."
+                        ),
+                        points=pts,
+                    ))
+                    score += pts
+
+            # 3. How long he sits on a job, against the shop's own average.
+            if avg_days is not None and shop_days and shop_days > 0:
+                mine = _d(avg_days)
+                pts = _score_component(mine / shop_days, Decimal("1.5"), Decimal("4"), 15)
+                if pts:
+                    reasons.append(RiskReason(
+                        code="slow",
+                        label="Holds work longer than the shop average",
+                        detail=(
+                            f"Averages {mine.quantize(_PCT)} days a leg against the shop's "
+                            f"{shop_days}."
+                        ),
+                        points=pts,
+                    ))
+                    score += pts
+
+        # 4. What he is holding right now. Scored regardless of leg count —
+        #    exposure is exposure even for a worker who is new.
+        if oldest_open is not None and oldest_open > STALE_OPEN_DAYS:
+            pts = _score_component(
+                Decimal(oldest_open), Decimal(STALE_OPEN_DAYS), Decimal(STALE_OPEN_DAYS * 4), 25
+            )
+            if pts:
+                reasons.append(RiskReason(
+                    code="stale_open",
+                    label="Holding metal that hasn't come back",
+                    detail=(
+                        f"{open_gold.quantize(_G)} g out across {open_legs} leg(s); the oldest "
+                        f"has been with him {oldest_open} days."
+                    ),
+                    points=pts,
+                ))
+                score += pts
+
+        score = min(score, 100)
+        band = (
+            "insufficient" if legs < RISK_MIN_LEGS and not reasons
+            else "high" if score >= BAND_HIGH
+            else "watch" if score >= BAND_WATCH
+            else "low"
+        )
+
+        out.append(KarigarRiskRow(
+            worker_id=wid,
+            worker_name=wname,
+            department=dept,
+            legs=legs,
+            gold_issued_g=issued_d.quantize(_G),
+            excess_g=excess_d.quantize(_G),
+            excess_rate_pct=excess_rate,
+            avg_days_held=_d(avg_days).quantize(_PCT) if avg_days is not None else None,
+            earlier_rate_pct=earlier_rate,
+            recent_rate_pct=recent_rate,
+            open_legs=open_legs,
+            open_gold_g=open_gold.quantize(_G),
+            oldest_open_days=oldest_open,
+            score=score,
+            band=band,
+            reasons=reasons,
+        ))
+
+    # Workers who are holding metal but finished nothing in the window would
+    # otherwise be invisible — and metal sitting with someone who has delivered
+    # nothing is exactly what this report exists to surface.
+    seen = {r.worker_id for r in out}
+    for wid, (_, open_legs, open_gold, oldest) in (
+        (k, v) for k, v in open_rows.items() if k not in seen
+    ):
+        vendor = await db.get(Vendor, wid)
+        oldest_days = (end - oldest).days if oldest is not None else None
+        reasons = []
+        score = 0
+        if oldest_days is not None and oldest_days > STALE_OPEN_DAYS:
+            score = _score_component(
+                Decimal(oldest_days), Decimal(STALE_OPEN_DAYS), Decimal(STALE_OPEN_DAYS * 4), 25
+            )
+            reasons.append(RiskReason(
+                code="stale_open",
+                label="Holding metal, nothing delivered",
+                detail=(
+                    f"{_d(open_gold).quantize(_G)} g out across {int(open_legs)} leg(s), oldest "
+                    f"{oldest_days} days — and no finished leg in the last {days} days."
+                ),
+                points=score,
+            ))
+        out.append(KarigarRiskRow(
+            worker_id=wid,
+            worker_name=vendor.name if vendor else f"#{wid}",
+            department=vendor.department_name if vendor else None,
+            legs=0,
+            gold_issued_g=_ZERO,
+            excess_g=_ZERO,
+            excess_rate_pct=_ZERO,
+            open_legs=int(open_legs),
+            open_gold_g=_d(open_gold).quantize(_G),
+            oldest_open_days=oldest_days,
+            score=score,
+            band="high" if score >= BAND_HIGH else "watch" if score >= BAND_WATCH else "insufficient",
+            reasons=reasons,
+        ))
+
+    out.sort(key=lambda r: (-r.score, -r.excess_g))
+
+    notable = [r for r in out if r.band in ("high", "watch")]
+    narratives = await ai.narrate_map(
+        task=(
+            "Each key is a karigar (goldsmith) at a jewellery workshop who has been "
+            "flagged by a risk report. The score is already computed from his figures. "
+            "Write one plain sentence for the shop owner saying what the numbers show "
+            "and what to do about it — chase a specific job, ask about a specific "
+            "figure. Do not accuse anyone of theft; wastage has honest causes."
+        ),
+        payload={
+            "window_days": days,
+            "shop_excess_rate_pct": str(_pct(shop_excess, shop_issued)),
+            "shop_avg_days_held": str(shop_days) if shop_days else None,
+            "workers": {
+                str(r.worker_id): r.model_dump(mode="json", exclude={"narrative"})
+                for r in notable
+            },
+        },
+        keys=[str(r.worker_id) for r in notable],
+    )
+    for r in notable:
+        r.narrative = narratives.get(str(r.worker_id))
+
+    return KarigarRiskReport(
+        days=days,
+        period_from=start.date(),
+        period_to=end.date(),
+        min_legs=RISK_MIN_LEGS,
+        shop_excess_rate_pct=_pct(shop_excess, shop_issued),
+        shop_avg_days_held=shop_days,
+        rows=out,
+        scored_count=sum(1 for r in out if r.band != "insufficient"),
+        high_count=sum(1 for r in out if r.band == "high"),
+        ai_enabled=ai.ai_available(),
+        ai_note=ai.ai_settings().unconfigured_reason,
     )

@@ -1,5 +1,6 @@
 """
-Buying: metal back over the counter, and stones from suppliers.
+Buying: bullion from a dealer, metal back over the counter, stones from
+suppliers.
 
 Money and weights are `Decimal` end to end — Pydantic serialises them as
 strings, so the browser never sees a float that has already lost paisas.
@@ -9,7 +10,8 @@ from decimal import Decimal
 
 from pydantic import BaseModel, Field, model_validator
 
-from app.models.purchase import GoldKind
+from app.models.currency import Currency
+from app.models.purchase import GoldKind, GoldPaymentMode
 from app.models.stone import StoneCategory, StoneKind
 from app.schemas.common import ORMModel, TimestampedRead
 
@@ -58,6 +60,10 @@ class OldGoldCreate(BaseModel):
     quietly fell back to the market number would book the purchase at zero
     profit and nobody would ever see it happen.
     """
+    # Which shop this belongs to. Optional: left unset it falls back to the
+    # user's own branch, then to the default, so a single-shop business
+    # never sees the field and a multi-shop one can be explicit.
+    branch_id: int | None = None
 
     customer_id: int | None = None
     walk_in_name: str | None = Field(default=None, max_length=150)
@@ -140,6 +146,10 @@ class StonePurchaseItemCreate(BaseModel):
 
 
 class StonePurchaseCreate(BaseModel):
+    # Which shop this belongs to. Optional: left unset it falls back to the
+    # user's own branch, then to the default, so a single-shop business
+    # never sees the field and a multi-shop one can be explicit.
+    branch_id: int | None = None
     supplier_id: int
     purchased_at: datetime | None = None
     reference: str | None = Field(default=None, max_length=120)
@@ -224,3 +234,94 @@ class StoneStockReport(ORMModel):
     total_purchased_weight_ct: Decimal
     total_used_weight_ct: Decimal
     total_available_weight_ct: Decimal
+
+
+# --------------------------------------------------------------------------
+# Gold purchases (from a dealer)
+# --------------------------------------------------------------------------
+class GoldPurchaseItemCreate(BaseModel):
+    """
+    One lot on the dealer's bill: a bar, or a parcel of one purity.
+
+    `rate_per_g` is quoted against the actual weight, the way the trade quotes
+    it. The fine-gram conversion happens once, server-side, from `purity` — so
+    nothing on the counter has to do karat arithmetic to fill this in.
+    """
+
+    description: str | None = Field(default=None, max_length=150)
+    purity: int = Field(ge=1, le=24)
+    weight_g: Decimal = Field(gt=0)
+    rate_per_g: Decimal = Field(ge=0)
+    notes: str | None = None
+
+
+class GoldPurchaseCreate(BaseModel):
+    # Which shop this belongs to. Optional: left unset it falls back to the
+    # user's own branch, then to the default, so a single-shop business never
+    # sees the field and a multi-shop one can be explicit.
+    branch_id: int | None = None
+    supplier_id: int
+    purchased_at: datetime | None = None
+    reference: str | None = Field(default=None, max_length=120)
+    # What the dealer quoted in. Anything but rupees needs an exchange rate on
+    # record for the day, or the bill is refused rather than booked at 1.
+    currency: Currency = Currency.PKR
+    # How it was paid. `cash` is the default because it is the common case at a
+    # small shop; `credit` is what puts the bill on the supplier's account.
+    payment_mode: GoldPaymentMode = GoldPaymentMode.cash
+    bank_account_id: int | None = None
+    # Carriage, assay, the dealer's loading — quoted as a percentage on the
+    # subtotal, which is how these bills arrive.
+    extra_cost_pct: Decimal = Field(default=Decimal("0"), ge=0, le=100)
+    items: list[GoldPurchaseItemCreate] = Field(min_length=1)
+    notes: str | None = None
+
+
+class GoldPurchaseItemRead(TimestampedRead):
+    purchase_id: int
+    description: str | None = None
+    purity: int
+    weight_g: Decimal
+    rate_per_g: Decimal
+    currency: Currency
+    fx_rate_to_pkr: Decimal
+    amount: Decimal
+    # 24k-equivalent grams. Derived on read rather than stored: the inputs are
+    # on the row, and a stored copy is one more thing that can disagree.
+    fine_weight_g: Decimal
+    inventory_item_id: int | None = None
+    notes: str | None = None
+
+
+class GoldPurchaseRead(TimestampedRead):
+    purchase_no: str
+    supplier_id: int
+    supplier_name: str | None = None
+    branch_id: int
+    branch_name: str | None = None
+    purchased_at: datetime
+    reference: str | None = None
+    payment_mode: GoldPaymentMode
+    bank_account_id: int | None = None
+    subtotal: Decimal
+    extra_cost_pct: Decimal
+    extra_cost_amount: Decimal
+    total: Decimal
+    item_count: int
+    total_weight_g: Decimal
+    total_fine_g: Decimal
+    # What the metal actually cost per fine gram once loading is in. This is
+    # the number to compare against the day's rate — the quoted rate per gram
+    # is not, because it is against gross weight and excludes carriage.
+    effective_rate_per_fine_g: Decimal
+    journal_entry_id: int | None = None
+    journal_entry_no: str | None = None
+    # A reversal is a new entry pointing back at the original, so "was this
+    # undone" is a question for the journal, never a flag on this row.
+    is_reversed: bool = False
+    reversal_entry_no: str | None = None
+    notes: str | None = None
+
+
+class GoldPurchaseDetail(GoldPurchaseRead):
+    items: list[GoldPurchaseItemRead] = Field(default_factory=list)

@@ -25,11 +25,19 @@ import { DesignsPage } from "@/pages/designs/DesignsPage";
 import { DesignDetailPage } from "@/pages/designs/DesignDetailPage";
 import { ChartOfAccountsPage } from "@/pages/ledger/ChartOfAccountsPage";
 import { StatementPage } from "@/pages/ledger/StatementPage";
+import { TradeAccountPage } from "@/pages/ledger/TradeAccountPage";
 import { JournalPage } from "@/pages/ledger/JournalPage";
 import { PositionPage } from "@/pages/ledger/PositionPage";
 import { InsightsPage } from "@/pages/InsightsPage";
 import { StockFormPage } from "@/pages/designs/StockFormPage";
+import { BranchesPage } from "@/pages/settings/BranchesPage";
+import { TransfersPage } from "@/pages/branches/TransfersPage";
+import { OrdersPage } from "@/pages/orders/OrdersPage";
+import { OrderDetailPage } from "@/pages/orders/OrderDetailPage";
+import { MessagesPage } from "@/pages/MessagesPage";
+import { ApprovalsPage } from "@/pages/ApprovalsPage";
 import { OldGoldPage } from "@/pages/purchasing/OldGoldPage";
+import { GoldPurchasePage } from "@/pages/purchasing/GoldPurchasePage";
 import { StonePurchasePage } from "@/pages/purchasing/StonePurchasePage";
 import { StoneStockPage } from "@/pages/purchasing/StoneStockPage";
 
@@ -77,11 +85,19 @@ export const router = createBrowserRouter([
           { path: "/designs", element: <DesignsPage /> },
           { path: "/designs/:id", element: <DesignDetailPage /> },
           { path: "/designs/:id/stock", element: <StockFormPage /> },
+          { path: "/transfers", element: <TransfersPage /> },
+          { path: "/orders", element: <OrdersPage /> },
+          { path: "/orders/:id", element: <OrderDetailPage /> },
+          { path: "/messages", element: <MessagesPage /> },
+          { path: "/approvals", element: <ApprovalsPage /> },
+          { path: "/settings/branches", element: <BranchesPage /> },
+          { path: "/purchasing/gold", element: <GoldPurchasePage /> },
           { path: "/purchasing/old-gold", element: <OldGoldPage /> },
           { path: "/purchasing/stones", element: <StonePurchasePage /> },
           { path: "/purchasing/stone-stock", element: <StoneStockPage /> },
           { path: "/ledger/position", element: <PositionPage /> },
           { path: "/ledger/statement", element: <StatementPage /> },
+          { path: "/ledger/trade-account", element: <TradeAccountPage /> },
           { path: "/ledger/journal", element: <JournalPage /> },
           { path: "/ledger/accounts", element: <ChartOfAccountsPage /> },
           { path: "/insights", element: <InsightsPage /> },

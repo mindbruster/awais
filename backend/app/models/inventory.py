@@ -4,6 +4,7 @@ from sqlalchemy import Enum, ForeignKey, Integer, Numeric, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
+from app.models.branch import Branch
 from app.models.mixins import TimestampMixin
 from app.models.product import Product
 
@@ -37,9 +38,21 @@ class InventoryItem(Base, TimestampMixin):
     weight_g: Mapped[float] = mapped_column(Numeric(12, 4), default=0, nullable=False)
     weight_ct: Mapped[float] = mapped_column(Numeric(12, 4), default=0, nullable=False)
     purity: Mapped[int | None] = mapped_column(Integer)  # for raw_gold
+    # Fineness in percent, preferred over the karat integer above. Bullion is
+    # bought on an assayed tunch — 99.5, 99.9 — which karat cannot express at
+    # all. See `Product.gold_tunch_pct`.
+    tunch_pct: Mapped[float | None] = mapped_column(Numeric(6, 3))
 
     product_id: Mapped[int | None] = mapped_column(
         ForeignKey("products.id", ondelete="SET NULL"),
         index=True,
     )
     product: Mapped[Product | None] = relationship(lazy="joined")
+
+    # Which shop holds this stock. Not nullable: "we have 400g of 22k" is not
+    # an answer once there is more than one counter, and a row that cannot say
+    # where it sits cannot be counted at either.
+    branch_id: Mapped[int] = mapped_column(
+        ForeignKey("branches.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    branch: Mapped[Branch] = relationship(lazy="joined")

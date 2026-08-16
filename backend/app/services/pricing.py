@@ -79,9 +79,28 @@ def price_line(
     sale_wastage_pct: Decimal = Decimal("0"),
     sale_wastage_g: Decimal = Decimal("0"),
     quantity: int = 1,
-) -> tuple[Decimal, Decimal, Decimal]:
+    gold_tunch_pct: Decimal | None = None,
+    gold_charged_in: str = "rupees",
+) -> tuple[Decimal, Decimal, Decimal, Decimal]:
     """
-    Returns (gold_amount, stone_amount, line_total).
+    Returns (gold_amount, stone_amount, line_total, fine_g).
+
+    `gold_charged_in` decides whether the metal on this line is sold for money
+    or handed over as metal, and it is the difference between the two kinds of
+    bill this shop writes.
+
+    At the counter it is `"rupees"`: the gold is priced, lands in `gold_amount`,
+    and the customer settles the whole thing in one figure.
+
+    With another jeweller it is `"grams"`: the metal is **not priced at all**.
+    `gold_amount` comes back zero, `line_total` carries only the stones, the
+    labour and the discount, and `fine_g` carries what the buyer must hand over
+    in metal. The rate is deliberately absent from that side of the bill —
+    between houses it is agreed on the day the gold actually moves, and a rate
+    printed weeks earlier would be quoting a price nobody accepted.
+
+    `fine_g` is returned in both modes because it is simply what the line is
+    worth in 24k-equivalent grams, which the metal ledger wants either way.
 
     Gold is marked up by any sale wastage, reduced by any ratti discount, then
     purity-adjusted:
@@ -112,13 +131,37 @@ def price_line(
     # was promised.
     charged_g = apply_sale_wastage(gold_weight_g, sale_wastage_pct, sale_wastage_g)
     billable_g = apply_ratti_discount(charged_g, discount_ratti, ratti_base)
-    purity_factor = d(gold_purity) / Decimal("24") if gold_purity else Decimal("1")
-    gold_amount = (billable_g * purity_factor * d(gold_rate_per_g) * qty).quantize(Decimal("0.01"))
+    # Tunch wins over karat when the line carries one — 91.6 is a reading off a
+    # scale, 22 is a band somebody rounded it into. Same precedence as
+    # `ledger.fine_grams`, so the money side and the metal side of a bill can
+    # never disagree about how pure the gold was.
+    if gold_tunch_pct:
+        purity_factor = d(gold_tunch_pct) / Decimal("100")
+    elif gold_purity:
+        purity_factor = d(gold_purity) / Decimal("24")
+    else:
+        purity_factor = Decimal("1")
+    # Kept unrounded for the money path. Rounding the grams to four places and
+    # *then* multiplying by the rate moves the line total by up to a rupee on a
+    # normal piece — which would silently restate every invoice already issued.
+    # The metal path rounds at the end, where it is the figure being reported.
+    fine_raw = billable_g * purity_factor * qty
+    fine_g = fine_raw.quantize(Decimal("0.0001"))
+
     stone_amount = (d(stone_weight_ct) * d(stone_rate_per_ct) * qty).quantize(Decimal("0.01"))
     labor_total = (d(labor_amount) * qty).quantize(Decimal("0.01"))
+
+    if gold_charged_in == "grams":
+        # The metal is settled in metal. Pricing it here would put a rupee
+        # figure on the bill for gold the buyer is paying for in gold, and the
+        # customer would owe for the same metal twice.
+        gold_amount = Decimal("0.00")
+    else:
+        gold_amount = (fine_raw * d(gold_rate_per_g)).quantize(Decimal("0.01"))
+
     raw_total = gold_amount + stone_amount + labor_total - d(line_discount)
     line_total = max(raw_total, Decimal("0")).quantize(Decimal("0.01"))
-    return gold_amount, stone_amount, line_total
+    return gold_amount, stone_amount, line_total, fine_g
 
 
 def invoice_totals(
@@ -128,13 +171,25 @@ def invoice_totals(
     discount_amount: Decimal,
     discount_weight_g: Decimal,
     tax_amount: Decimal,
+    gold_charged_in: str = "rupees",
 ) -> tuple[Decimal, Decimal]:
     """
     Returns (subtotal, total). Discount can be expressed as a flat amount AND/OR
     as a weight in grams (converted at gold_rate_per_g).
+
+    On a bill whose gold is charged in grams the weight discount is *not*
+    converted to money here. Nothing on that bill prices metal, so turning a
+    gram giveaway into a rupee deduction would take it off the cash the jeweller
+    owes for stones and making — money that has nothing to do with the metal
+    that was discounted. It comes off the metal instead, where the caller
+    applies it.
     """
     subtotal = sum((d(t) for t in line_totals), Decimal("0")).quantize(Decimal("0.01"))
-    weight_discount = (d(discount_weight_g) * d(gold_rate_per_g)).quantize(Decimal("0.01"))
+    weight_discount = (
+        Decimal("0.00")
+        if gold_charged_in == "grams"
+        else (d(discount_weight_g) * d(gold_rate_per_g)).quantize(Decimal("0.01"))
+    )
     total = (subtotal - d(discount_amount) - weight_discount + d(tax_amount)).quantize(
         Decimal("0.01")
     )

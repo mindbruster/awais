@@ -141,7 +141,7 @@ photographs of others in the tray.
 ```bash
 AI_PROVIDER=openrouter
 OPENROUTER_API_KEY=sk-or-...
-AI_IMAGE_MODEL=google/gemini-2.5-flash-image-preview   # optional; this is the default
+AI_IMAGE_MODEL=google/gemini-2.5-flash-image   # optional; this is the default
 ```
 
 OpenRouter only — Anthropic's models do not draw, and a shop configured for

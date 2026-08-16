@@ -1,5 +1,4 @@
 import uuid
-from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy import or_, select
@@ -7,35 +6,39 @@ from starlette.concurrency import run_in_threadpool
 from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import CurrentUser, DbSession, require_password_confirm, require_perm
-from app.models.product import Product
+from app.models.product import Product, ProductStatus
 from app.schemas.product import (
     GeneratedImageRead,
     ProductCreate,
     ProductRead,
     ProductUpdate,
 )
-from app.services import image_gen
+from app.services import branches, image_gen
 from app.services.audit import log_action
 from app.services.serial import next_product_serial
-from app.services.storage import StorageError, get_storage
+from app.services.storage import StorageError, get_storage, read_image_upload
 
 router = APIRouter()
 read = Depends(require_perm("product:read"))
 write = Depends(require_perm("product:write"))
 delete = Depends(require_perm("product:delete"))
 
-ALLOWED_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
-MAX_IMAGE_BYTES = 5 * 1024 * 1024  # 5 MB
 
 
 @router.get("", response_model=list[ProductRead], dependencies=[read])
 async def list_products(
     db: DbSession,
     q: str | None = Query(default=None),
+    branch_id: int | None = Query(default=None, description="Pieces sitting at this shop"),
+    status: ProductStatus | None = Query(default=None),
     limit: int = Query(default=100, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> list[Product]:
     stmt = select(Product).order_by(Product.id.desc()).limit(limit).offset(offset)
+    if branch_id is not None:
+        stmt = stmt.where(Product.branch_id == branch_id)
+    if status is not None:
+        stmt = stmt.where(Product.status == status)
     if q:
         like = f"%{q}%"
         stmt = stmt.where(
@@ -46,11 +49,19 @@ async def list_products(
 
 
 @router.post("", response_model=ProductRead, status_code=status.HTTP_201_CREATED, dependencies=[write])
-async def create_product(payload: ProductCreate, db: DbSession) -> Product:
+async def create_product(
+    payload: ProductCreate, db: DbSession, current: CurrentUser
+) -> Product:
     data = payload.model_dump()
     if not data.get("serial_no"):
         data["serial_no"] = await next_product_serial(db)
+    # A piece sits in a showroom. Resolved rather than required, so a
+    # single-shop business never has to state the obvious.
+    branch = await branches.resolve_branch(
+        db, requested_id=data.pop("branch_id", None), user=current
+    )
     product = Product(**data)
+    product.branch_id = branch.id
     db.add(product)
     try:
         await db.commit()
@@ -125,31 +136,7 @@ async def upload_image(
     if product is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Product not found")
 
-    ext = Path(file.filename or "").suffix.lower()
-    if ext not in ALLOWED_IMAGE_EXT:
-        raise HTTPException(
-            status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            f"Unsupported file type: {ext or 'unknown'}",
-        )
-
-    # Read in chunks and stop at the limit rather than pulling the whole body in
-    # and measuring it. `await file.read()` on a 2 GB upload buys a 2 GB
-    # allocation before the check can fire, which on a container with a memory
-    # cap kills the process — one oversized POST takes the shop's till offline
-    # instead of getting a 413.
-    chunks: list[bytes] = []
-    total = 0
-    while chunk := await file.read(64 * 1024):
-        total += len(chunk)
-        if total > MAX_IMAGE_BYTES:
-            raise HTTPException(
-                status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                f"Image exceeds the {MAX_IMAGE_BYTES // (1024 * 1024)}MB limit.",
-            )
-        chunks.append(chunk)
-    contents = b"".join(chunks)
-    if not contents:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "The uploaded file is empty.")
+    contents, ext = await read_image_upload(file)
 
     storage = get_storage()
     previous_url = product.image_url

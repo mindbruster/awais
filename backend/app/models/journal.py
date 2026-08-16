@@ -37,6 +37,12 @@ class PartyType(str, enum.Enum):
     customer = "customer"
     worker = "worker"
     supplier = "supplier"
+    # Staff who carry stock out to jewellers and sell on the road. A fourth
+    # party rather than a kind of worker: a karigar is given metal to transform
+    # and owes it back as pieces, a salesman is given finished pieces and owes
+    # them back as either goods or money. Both hold the firm's assets, but the
+    # obligations settle in different units, so they cannot share a sub-ledger.
+    salesman = "salesman"
 
 
 class JournalEntry(Base, TimestampMixin):
@@ -129,6 +135,10 @@ class JournalLine(Base, TimestampMixin):
     # Gold as the counter entered it, for display only — never used in maths.
     native_weight_g: Mapped[float | None] = mapped_column(Numeric(14, 4))
     native_purity: Mapped[int | None] = mapped_column(Integer)
+    # And the tunch it was weighed at, when the document carried one. Display
+    # only, like the two columns above it — `quantity` is already fine grams
+    # and remains the only figure any balance is computed from.
+    native_tunch_pct: Mapped[float | None] = mapped_column(Numeric(6, 3))
 
     # Subsidiary identity behind a control account. A customer statement is
     # (account = Customers, party_type = customer, party_id = N).

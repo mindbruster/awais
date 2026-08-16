@@ -3,6 +3,7 @@ import { api } from "@/api/client";
 import { Modal } from "@/components/Modal";
 import { SelectField, TextField, TextArea } from "@/components/Field";
 import { SearchBox, FilterSelect, Toolbar } from "@/components/Toolbar";
+import { DepartmentsPage } from "@/pages/settings/DepartmentsPage";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { toast } from "@/components/Toast";
 import { apiError } from "@/lib/api-error";
@@ -29,13 +30,6 @@ interface Department {
   name: string;
 }
 
-const VENDOR_TYPES = [
-  { value: "karigar", label: "Karigar" },
-  { value: "stone_fixer", label: "Stone fixer" },
-  { value: "polish", label: "Polish" },
-  { value: "other", label: "Other" },
-];
-
 export function VendorsPage() {
   const [items, setItems] = useState<Vendor[]>([]);
   const [loading, setLoading] = useState(true);
@@ -45,13 +39,22 @@ export function VendorsPage() {
   const [deleting, setDeleting] = useState<Vendor | null>(null);
   const [busyDelete, setBusyDelete] = useState(false);
   const [q, setQ] = useState("");
-  const [type, setType] = useState("");
+  // The stage he handles — the only grouping of workers the shop has.
+  const [departmentId, setDepartmentId] = useState("");
+  const [departments, setDepartments] = useState<Department[]>([]);
+
+  useEffect(() => {
+    api
+      .get<Department[]>("/departments", { params: { limit: "200", is_active: "true" } })
+      .then((r) => setDepartments(r.data))
+      .catch(() => setDepartments([]));
+  }, []);
 
   const load = () => {
     setLoading(true);
     const params: Record<string, string> = {};
     if (q) params.q = q;
-    if (type) params.type = type;
+    if (departmentId) params.department_id = departmentId;
     api
       .get<Vendor[]>("/vendors", { params })
       .then((res) => setItems(res.data))
@@ -59,7 +62,7 @@ export function VendorsPage() {
       .finally(() => setLoading(false));
   };
 
-  useEffect(load, [q, type]);
+  useEffect(load, [q, departmentId]);
 
   const confirmDelete = async () => {
     if (!deleting) return;
@@ -77,7 +80,8 @@ export function VendorsPage() {
   };
 
   return (
-    <div>
+    <div className="space-y-10">
+      <div>
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-semibold text-slate-900">Workers</h1>
         <button className="btn-primary" onClick={() => setOpen(true)}>
@@ -85,12 +89,17 @@ export function VendorsPage() {
         </button>
       </div>
       <p className="mt-1 text-sm text-slate-500">
-        The karigars, stone-fixers and polishers the shop issues material to. Each belongs to a
-        department and carries the wastage rate agreed with him.
+        The people the shop issues material to. Each one handles a stage and carries the wastage
+        rate agreed with him.
       </p>
       <Toolbar>
         <SearchBox value={q} onChange={setQ} placeholder="Search by name, phone or CNIC…" className="w-72" />
-        <FilterSelect value={type} onChange={setType} options={VENDOR_TYPES} allLabel="All types" />
+        <FilterSelect
+          value={departmentId}
+          onChange={setDepartmentId}
+          options={departments.map((d) => ({ value: String(d.id), label: d.name }))}
+          allLabel="All stages"
+        />
         <span className="ml-auto text-xs text-slate-500">{items.length} shown</span>
       </Toolbar>
       <div className="card mt-4 overflow-hidden p-0">
@@ -98,7 +107,7 @@ export function VendorsPage() {
         {error && <div className="p-6 text-sm text-red-600">{error}</div>}
         {!loading && !error && items.length === 0 && (
           <div className="p-6 text-sm text-slate-500">
-            {q || type ? "No workers matching the filters." : "No workers yet."}
+            {q || departmentId ? "No workers matching the filters." : "No workers yet."}
           </div>
         )}
         {items.length > 0 && (
@@ -106,8 +115,7 @@ export function VendorsPage() {
             <thead className="bg-slate-50 text-left text-xs uppercase text-slate-500">
               <tr>
                 <th className="px-4 py-3">Name</th>
-                <th className="px-4 py-3">Department</th>
-                <th className="px-4 py-3">Type</th>
+                <th className="px-4 py-3">Stage</th>
                 <th className="px-4 py-3">Wastage</th>
                 <th className="px-4 py-3">Opening gold</th>
                 <th className="px-4 py-3">Phone</th>
@@ -135,9 +143,6 @@ export function VendorsPage() {
                         none — cannot be given work
                       </span>
                     )}
-                  </td>
-                  <td className="px-4 py-3">
-                    <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs">{v.type}</span>
                   </td>
                   <td className="px-4 py-3">
                     {v.effective_wastage_pct === null ? (
@@ -205,6 +210,15 @@ export function VendorsPage() {
         busy={busyDelete}
         onConfirm={confirmDelete}
       />
+      </div>
+
+      {/* The stages, on the same screen as the people who work them.
+          They are kept as separate records underneath, and deliberately: the
+          terms belong to the stage, not the man, so hiring a second maker means
+          adding one worker rather than re-agreeing the shop's wastage rules.
+          But there is no reason anyone should have to visit two screens to see
+          a floor of three people. */}
+      <DepartmentsPage />
     </div>
   );
 }
@@ -221,7 +235,6 @@ function VendorForm({
   existing?: Vendor | null;
 }) {
   const [name, setName] = useState("");
-  const [type, setType] = useState("karigar");
   const [departmentId, setDepartmentId] = useState("");
   const [phone, setPhone] = useState("");
   const [cnic, setCnic] = useState("");
@@ -237,7 +250,6 @@ function VendorForm({
   useEffect(() => {
     if (open) {
       setName(existing?.name ?? "");
-      setType(existing?.type ?? "karigar");
       setDepartmentId(existing?.department_id ? String(existing.department_id) : "");
       setPhone(existing?.phone ?? "");
       setCnic(existing?.cnic ?? "");
@@ -260,7 +272,6 @@ function VendorForm({
     try {
       const body = {
         name,
-        type,
         department_id: departmentId ? Number(departmentId) : null,
         phone: phone || null,
         cnic: cnic || null,
@@ -291,27 +302,20 @@ function VendorForm({
       <form onSubmit={submit} className="space-y-4">
         <TextField label="Name" required value={name} onChange={(e) => setName(e.target.value)} />
         <div className="grid grid-cols-2 gap-3">
-          {/* Department first, and required: it is what decides whether this
-              worker can be picked on a job at all. The worker dropdown on a
-              design is filtered by department, so one saved without a
-              department is invisible on every screen that matters. */}
+          {/* Stage first, and required: it is what decides whether this worker
+              can be picked on a job at all. The worker dropdown on a design is
+              filtered by it, so one saved without a stage is invisible on every
+              screen that matters. */}
           <SelectField
-            label="Department"
+            label="Stage"
             required
-            hint="Which stage this worker handles"
+            hint="Maker, stone fixer or lacker"
             options={[
-              { value: "", label: "Select a department…" },
+              { value: "", label: "Select a stage…" },
               ...departments.map((d) => ({ value: d.id, label: d.name })),
             ]}
             value={departmentId}
             onChange={(e) => setDepartmentId(e.target.value)}
-          />
-          <SelectField
-            label="Type"
-            hint="Legacy grouping, kept for old reports"
-            options={VENDOR_TYPES}
-            value={type}
-            onChange={(e) => setType(e.target.value)}
           />
           <TextField label="Phone" value={phone} onChange={(e) => setPhone(e.target.value)} />
           <TextField

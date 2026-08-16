@@ -79,6 +79,10 @@ class Payment(Base, TimestampMixin):
     # Only for gold_exchange: what came across the counter, as weighed.
     gold_weight_g: Mapped[float | None] = mapped_column(Numeric(14, 4))
     gold_purity: Mapped[int | None] = mapped_column(Integer)
+    # Fineness in percent, preferred over the karat integer above. Metal handed
+    # over in settlement is assayed before it is accepted, and the assay is a
+    # decimal. See `Product.gold_tunch_pct`.
+    gold_tunch_pct: Mapped[float | None] = mapped_column(Numeric(6, 3))
     gold_rate_per_g: Mapped[float | None] = mapped_column(Numeric(14, 4))
 
     bank_account_id: Mapped[int | None] = mapped_column(

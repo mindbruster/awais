@@ -11,6 +11,8 @@ import { apiError } from "@/lib/api-error";
 interface Customer {
   id: number;
   name: string;
+  is_trade: boolean;
+  account_no: string | null;
   phone: string | null;
   phone2: string | null;
   email: string | null;
@@ -177,6 +179,8 @@ function CustomerForm({
 }) {
   const [name, setName] = useState("");
   const [phone, setPhone] = useState("");
+  const [accountNo, setAccountNo] = useState("");
+  const [isTrade, setIsTrade] = useState(false);
   const [phone2, setPhone2] = useState("");
   const [email, setEmail] = useState("");
   const [cnic, setCnic] = useState("");
@@ -196,6 +200,8 @@ function CustomerForm({
     if (open) {
       setName(existing?.name ?? "");
       setPhone(existing?.phone ?? "");
+      setAccountNo(existing?.account_no ?? "");
+      setIsTrade(existing?.is_trade ?? false);
       setPhone2(existing?.phone2 ?? "");
       setEmail(existing?.email ?? "");
       setCnic(existing?.cnic ?? "");
@@ -224,6 +230,8 @@ function CustomerForm({
     try {
       const body = {
         name,
+        is_trade: isTrade,
+        account_no: accountNo || null,
         phone: phone || null,
         phone2: phone2 || null,
         email: email || null,
@@ -262,7 +270,35 @@ function CustomerForm({
           value={name}
           onChange={(e) => setName(e.target.value)}
         />
+        {/* The single most consequential field on this form: it decides the
+            shape of every bill this customer is ever given. Set out on its own
+            with the consequence spelled out, rather than buried in the grid as
+            one more optional detail. */}
+        <label className="flex cursor-pointer items-start gap-3 rounded border border-slate-200 bg-slate-50 p-3">
+          <input
+            type="checkbox"
+            className="mt-0.5 h-4 w-4"
+            checked={isTrade}
+            onChange={(e) => setIsTrade(e.target.checked)}
+          />
+          <span className="text-sm">
+            <span className="font-medium text-slate-900">This is a jeweller, not a counter customer</span>
+            <span className="mt-0.5 block text-slate-500">
+              Their bills settle the gold in metal: the invoice states the fine grams to hand over
+              and never prices them, and cash is charged only for stones and making. Leave this off
+              and they are billed in rupees for everything.
+            </span>
+          </span>
+        </label>
         <div className="grid grid-cols-2 gap-3">
+          {/* The shop's own ledger number for this account. Prints on their
+              bills, so trade customers get one and walk-ins do not. */}
+          <TextField
+            label="Account no"
+            hint="Printed on this customer's bills"
+            value={accountNo}
+            onChange={(e) => setAccountNo(e.target.value)}
+          />
           <TextField label="Phone" value={phone} onChange={(e) => setPhone(e.target.value)} />
           <TextField
             label="Second phone"

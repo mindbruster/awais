@@ -1,6 +1,6 @@
 from datetime import date
 
-from sqlalchemy import Date, ForeignKey, Numeric, String, Text
+from sqlalchemy import Boolean, Date, ForeignKey, Numeric, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -22,6 +22,25 @@ class Customer(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(150), nullable=False, index=True)
+    # The shop's own ledger number for this account, printed on their bills.
+    # Free text and optional: it comes off whatever book the business kept
+    # before this system, and half the retail customers will never have one.
+    account_no: Mapped[str | None] = mapped_column(String(30), index=True)
+    # Another jeweller, rather than somebody buying across the counter.
+    #
+    # This single flag decides the shape of every bill they are given. A trade
+    # buyer settles the metal in metal — the invoice tells him how many fine
+    # grams to hand over and never prices them — and pays cash only for stones
+    # and making. A counter customer pays rupees for the lot.
+    #
+    # Held on the customer rather than asked per bill because the shop was clear
+    # that it never varies: always grams for jewellers, always rupees at the
+    # counter. Asking every time would be a question with one right answer and
+    # a way to get it wrong. Each invoice still snapshots the resulting choice,
+    # so reclassifying a customer never rewrites their old bills.
+    is_trade: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False, index=True
+    )
     phone: Mapped[str | None] = mapped_column(String(30), index=True)
     phone2: Mapped[str | None] = mapped_column(String(30))
     email: Mapped[str | None] = mapped_column(String(255), index=True)

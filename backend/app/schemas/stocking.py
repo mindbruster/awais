@@ -143,6 +143,10 @@ class StockDesign(BaseModel):
     material cost. An explicit empty list means the operator is saying this piece
     carries no stones, which is a different statement and is honoured.
     """
+    # Which shop this belongs to. Optional: left unset it falls back to the
+    # user's own branch, then to the default, so a single-shop business
+    # never sees the field and a multi-shop one can be explicit.
+    branch_id: int | None = None
 
     name: str = Field(min_length=1, max_length=200)
     category: str | None = Field(default=None, max_length=80)

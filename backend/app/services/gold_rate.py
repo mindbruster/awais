@@ -18,6 +18,7 @@ from datetime import date, datetime, timezone
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import clock
 from app.models.currency import Currency
 from app.models.gold_rate import GoldRate
 
@@ -36,7 +37,7 @@ async def rate_in_force(
     on the same date fall to the highest id, so the last rate keyed that day
     wins — which is what the shop means when it updates the rate at noon.
     """
-    effective = as_of or datetime.now(timezone.utc).date()
+    effective = as_of or clock.today()
     stmt = (
         select(GoldRate)
         .where(

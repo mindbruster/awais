@@ -11,10 +11,10 @@ const WASTAGE_BASES = [
 export function DepartmentsPage() {
   return (
     <MasterTable
-      title="Departments"
-      description="The stages a piece passes through on the workshop floor. Order them the way work actually flows; a piece can still revisit a stage or skip one."
+      title="Stages and their terms"
+      description="The stages a piece passes through, and the wastage and labour each one is agreed on. A worker inherits the terms of the stage he handles unless he has his own."
       endpoint="/departments"
-      noun="department"
+      noun="stage"
       searchPlaceholder="Search by name or code…"
       fields={[
         { key: "name", label: "Name", required: true, half: true },
@@ -47,7 +47,7 @@ export function DepartmentsPage() {
           label: "Wastage basis",
           type: "select",
           options: WASTAGE_BASES,
-          hint: "Setting works per 100 stones; casting and goldsmithing on a percentage",
+          hint: "The stone fixer works per 100 stones; the maker on a percentage",
           render: (r) =>
             WASTAGE_BASES.find((b) => b.value === r.default_wastage_basis)?.label ??
             String(r.default_wastage_basis ?? "—"),

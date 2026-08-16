@@ -175,6 +175,84 @@ class StatementReport(BaseModel):
 
 
 # --------------------------------------------------------------------------
+# Party statement — the wholesale account, in metal and money at once
+# --------------------------------------------------------------------------
+class PartyStatementRow(BaseModel):
+    """
+    One document's effect on a trade party's account, in both units.
+
+    A row carries a metal side and a cash side because a single document
+    routinely moves both and moves them by unrelated amounts: a bill for twelve
+    rings adds fine grams to what the jeweller owes in metal and rupees to what
+    he owes in making. Splitting that across two statements would mean reading
+    two pages to find out where one document left the account.
+
+    Either side may be zero. Metal-only rows are ordinary — a jeweller dropping
+    off 500g for job work moves no money at all — and so are cash-only ones.
+    """
+
+    entry_id: int
+    entry_no: str
+    entry_date: date
+    memo: str | None = None
+    # What kind of document this was — 'invoice', 'payment', 'gold_purchase'.
+    # Taken from the entry's own source_type so the statement names the
+    # document rather than describing the posting.
+    source_type: str | None = None
+    source_id: int | None = None
+
+    # Fine grams. Positive is metal the party has taken on — it increases what
+    # they owe. Negative is metal received from them.
+    metal_in_g: Decimal = Decimal("0")
+    metal_out_g: Decimal = Decimal("0")
+    metal_balance_g: Decimal = Decimal("0")
+    # As weighed, when the document said. Display only.
+    native_weight_g: Decimal | None = None
+    native_purity: int | None = None
+    native_tunch_pct: Decimal | None = None
+
+    cash_debit: Decimal = Decimal("0")
+    cash_credit: Decimal = Decimal("0")
+    cash_balance: Decimal = Decimal("0")
+
+
+class PartyStatementReport(BaseModel):
+    """
+    A trade party's whole position: what they owe in gold, and what in rupees.
+
+    The two balances are reported separately and are never netted. Converting
+    the metal side to money to produce a single figure would price grams the
+    party has not agreed to sell yet — the entire point of settling in metal is
+    that the rate is decided on the day the metal moves, not on the day the
+    bill was written.
+    """
+
+    party_type: PartyType
+    party_id: int
+    party_name: str | None = None
+    date_from: date | None = None
+    date_to: date | None = None
+
+    opening_metal_g: Decimal = Decimal("0")
+    opening_cash: Decimal = Decimal("0")
+
+    rows: list[PartyStatementRow]
+
+    metal_in_total_g: Decimal = Decimal("0")
+    metal_out_total_g: Decimal = Decimal("0")
+    cash_debit_total: Decimal = Decimal("0")
+    cash_credit_total: Decimal = Decimal("0")
+
+    # Positive means the party owes the shop. Negative on the metal side means
+    # the shop is holding their gold, which is the normal state during job work.
+    closing_metal_g: Decimal = Decimal("0")
+    closing_cash: Decimal = Decimal("0")
+
+    total_rows: int = 0
+    truncated: bool = False
+
+
+# --------------------------------------------------------------------------
 # Trial balance / position
 # --------------------------------------------------------------------------
 class TrialBalanceRow(BaseModel):

@@ -368,6 +368,8 @@ function NewInvoiceModal({
   const [discountWeight, setDiscountWeight] = useState("0");
   const [tax, setTax] = useState("0");
   const [billBookNo, setBillBookNo] = useState("");
+  // Days of credit. 0 — due on issue — is a counter sale and the common case.
+  const [termDays, setTermDays] = useState("0");
   const [roundOff, setRoundOff] = useState("0");
   const [notes, setNotes] = useState("");
   const [items, setItems] = useState<DraftItem[]>([blankItem()]);
@@ -462,6 +464,7 @@ function NewInvoiceModal({
         discount_weight_g: discountWeight || "0",
         tax_amount: tax || "0",
         bill_book_no: billBookNo || null,
+        term_days: Number(termDays || 0),
         round_off: roundOff || "0",
         notes: notes || null,
         items: items.map((it) => ({
@@ -753,6 +756,16 @@ function NewInvoiceModal({
             onChange={(e) => setBillBookNo(e.target.value)}
             placeholder="e.g. 441"
             hint="The paper bill this matches"
+          />
+          {/* Prints on the bill as Term Days, with the due date worked out
+              from it. Zero is a counter sale — money now. */}
+          <TextField
+            label="Term days"
+            type="number"
+            min="0"
+            value={termDays}
+            onChange={(e) => setTermDays(e.target.value)}
+            hint="Days of credit — 0 is due on issue"
           />
           <TextField
             label="Round off"

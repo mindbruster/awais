@@ -15,6 +15,11 @@ class Settings(BaseSettings):
     )
 
     app_name: str = "Jewelry ERP"
+    # The shop's own timezone, which is what "today" means everywhere in the
+    # system: today's gold rate, today's takings, whether a memo is overdue.
+    # Timestamps are still stored in UTC — this only decides where a day
+    # begins. See app/core/clock.py for why it cannot be left to the server's.
+    shop_timezone: str = "Asia/Karachi"
     environment: str = "development"
     api_v1_prefix: str = "/api/v1"
     debug: bool = True

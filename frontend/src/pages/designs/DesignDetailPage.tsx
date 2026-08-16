@@ -1,55 +1,42 @@
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+/**
+ * One piece, and everywhere it has been.
+ *
+ * The page is laid out in the order the floor asks its questions: what is this
+ * and where is it now (the job card), what has it cost so far (the strip), how
+ * did it get here (the route), and what happens next (the action rail). The
+ * route collapses because a piece running nine stages was previously a mile of
+ * scrolling in which the one leg that mattered — the open one — looked exactly
+ * like the eight that were already settled.
+ */
+import { FormEvent, useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api } from "@/api/client";
-import { SelectField, TextArea, TextField } from "@/components/Field";
+import { TextArea, TextField } from "@/components/Field";
 import { PasswordConfirm } from "@/components/PasswordConfirm";
 import { toast } from "@/components/Toast";
 import { apiError } from "@/lib/api-error";
 import { fmtMoney } from "@/lib/money";
-import { statusPill } from "@/pages/designs/DesignsPage";
-
-type WastageBasis = "percent_of_issued" | "per_100_pieces";
-
-interface LegStone {
-  id: number;
-  stone_id: number;
-  stone_name: string | null;
-  quantity_issued: number;
-  weight_issued_ct: string;
-  quantity_returned: number;
-  weight_returned_ct: string;
-  rate_per_ct: string;
-}
-
-interface Leg {
-  id: number;
-  sequence: number;
-  department_id: number;
-  department_name: string | null;
-  worker_id: number | null;
-  worker_name: string | null;
-  status: "issued" | "received" | "cancelled";
-  issued_at: string | null;
-  gold_issued_g: string;
-  gold_issued_purity: number | null;
-  stones_issued_ct: string;
-  received_at: string | null;
-  gold_received_g: string;
-  stones_used_ct: string;
-  stones_returned_ct: string;
-  piece_count: number;
-  wastage_basis: WastageBasis;
-  wastage_per_100_pcs_g: string | null;
-  wastage_allowed_pct: string | null;
-  wastage_allowed_g: string;
-  wastage_actual_g: string;
-  wastage_excess_g: string;
-  labour_basis: string;
-  labour_rate: string;
-  labour_amount: string;
-  notes: string | null;
-  stones: LegStone[];
-}
+import { staticUrl } from "@/lib/url";
+import { IssueSheet } from "@/pages/designs/IssueSheet";
+import {
+  DesignStatusChip,
+  Figure,
+  Leg,
+  LegStatusChip,
+  Metric,
+  Settlement,
+  Terms,
+  allowanceOf,
+  allowanceWorking,
+  designStatusLabel,
+  labourOn,
+  labourWorking,
+  round4,
+  settle,
+  termsOf,
+  when,
+  wt,
+} from "@/pages/designs/parts";
 
 interface DesignDetail {
   id: number;
@@ -59,7 +46,9 @@ interface DesignDetail {
   customer_name: string | null;
   current_department_name: string | null;
   status: string;
+  image_url: string | null;
   notes: string | null;
+  product_id: number | null;
   legs: Leg[];
 }
 
@@ -84,127 +73,28 @@ interface Trace {
   };
 }
 
-interface Department {
-  id: number;
-  name: string;
-  consumes_stones: boolean;
-  default_wastage_basis: WastageBasis;
-  default_wastage_per_100_pcs_g: string | null;
-  default_rate_per_piece: string | null;
-}
-
-interface Worker {
-  id: number;
-  name: string;
-  department_id: number | null;
-  effective_wastage_pct: string | null;
-  is_active: boolean;
-}
-
-interface InvItem {
-  id: number;
-  label: string;
-  weight_g: string;
-  weight_ct: string;
-  purity: number | null;
-}
-
-interface Stone {
-  id: number;
-  name: string;
-  default_rate_per_ct: string | null;
-}
-
-const LABOUR_BASES = [
-  { value: "per_gram", label: "Per gram received" },
-  { value: "per_piece", label: "Per piece" },
-  { value: "flat", label: "Flat amount" },
-];
-
-// The backend quantises every weight to four places before it settles wastage;
-// a preview that rounds differently would show the operator one number and
-// commit another.
-const round4 = (n: number) => Math.round(n * 1e4) / 1e4;
-
-function wt(v: string | number | null | undefined, unit: "g" | "ct" = "g"): string {
-  if (v === null || v === undefined || v === "") return "—";
-  const n = Number(v);
-  if (Number.isNaN(n)) return String(v);
-  return `${n.toLocaleString(undefined, { maximumFractionDigits: 4 })} ${unit}`;
-}
-
-function when(iso: string | null): string {
-  if (!iso) return "—";
-  return new Date(iso).toLocaleDateString(undefined, {
-    day: "2-digit",
-    month: "short",
-    year: "numeric",
-  });
-}
-
-/** The terms a leg settles on, read off the leg — never off the department. */
-interface Terms {
-  basis: WastageBasis;
-  allowedPct: number;
-  per100: number;
-  pieces: number;
-}
-
-function termsOf(leg: Leg): Terms {
-  return {
-    basis: leg.wastage_basis,
-    allowedPct: Number(leg.wastage_allowed_pct ?? 0),
-    per100: Number(leg.wastage_per_100_pcs_g ?? 0),
-    pieces: leg.piece_count,
-  };
-}
-
-function settle(issued: number, received: number, t: Terms) {
-  const allowed =
-    t.basis === "per_100_pieces"
-      ? round4((t.per100 * t.pieces) / 100)
-      : round4((issued * t.allowedPct) / 100);
-  const actual = round4(issued - received);
-  return { allowed, actual, excess: Math.max(round4(actual - allowed), 0) };
-}
-
-// Grams are quoted to three places on the floor — 0.400 per 100, not 0.4.
-const g3 = (n: number) =>
-  n.toLocaleString(undefined, { minimumFractionDigits: 3, maximumFractionDigits: 4 });
-
 /**
- * The allowance spelled out as the shop works it out, so the operator can check
- * the arithmetic rather than trust the number.
+ * Whether the piece can be put into stock, and why not when it can't.
+ *
+ * These are the same four refusals `stocking.ensure_stockable` makes on the
+ * server. They are restated here so the button can say what is standing in the
+ * way instead of offering an action that will 409 — and, more importantly, so
+ * the action exists at all: the stock form was reachable only by typing its URL.
  */
-function allowanceWorking(t: Terms, allowed: number): string {
-  return t.basis === "per_100_pieces"
-    ? `${t.pieces} pcs × ${g3(t.per100)}g/100 = ${g3(allowed)} g allowed`
-    : `${t.allowedPct}% of issued`;
-}
-
-/** The same terms in a phrase, for "X beyond the … agreed with him". */
-function termsPhrase(t: Terms): string {
-  return t.basis === "per_100_pieces"
-    ? `${g3(t.per100)}g per 100 pieces`
-    : `${t.allowedPct}%`;
-}
-
-/** What the worker earns, on the basis this leg was issued under. */
-function labourOn(leg: Leg, receivedG: number): number {
-  const rate = Number(leg.labour_rate);
-  if (leg.labour_basis === "per_gram") return rate * receivedG;
-  if (leg.labour_basis === "per_piece") return rate * leg.piece_count;
-  return rate;
-}
-
-/**
- * The per-piece charge as a sum: "350 stones × ₨ 5.00 = ₨ 1,750.00". Anything
- * else is shown as the plain amount — there is nothing to show a working for.
- */
-function labourWorking(leg: Leg, amount: number): string | undefined {
-  if (leg.labour_basis !== "per_piece") return undefined;
-  const noun = leg.stones.length > 0 ? "stones" : "pcs";
-  return `${leg.piece_count} ${noun} × ${fmtMoney(leg.labour_rate)} = ${fmtMoney(amount)}`;
+function stockability(design: DesignDetail): { ok: boolean; reason?: string } {
+  if (design.product_id !== null || design.status === "stocked")
+    return { ok: false, reason: "already stocked" };
+  if (design.status === "sold" || design.status === "cancelled")
+    return { ok: false, reason: `${designStatusLabel(design.status).toLowerCase()} — nothing to stock` };
+  const out = design.legs.find((l) => l.status === "issued");
+  if (out)
+    return {
+      ok: false,
+      reason: `still out at ${out.department_name ?? "a department"} — receive leg #${out.sequence} first`,
+    };
+  if (!design.legs.some((l) => l.status === "received"))
+    return { ok: false, reason: "nothing has come back yet" };
+  return { ok: true };
 }
 
 export function DesignDetailPage() {
@@ -213,6 +103,7 @@ export function DesignDetailPage() {
   const [design, setDesign] = useState<DesignDetail | null>(null);
   const [trace, setTrace] = useState<Trace | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [issuing, setIssuing] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -237,31 +128,54 @@ export function DesignDetailPage() {
   const openLeg = design.legs.find((l) => l.status === "issued") ?? null;
   const closed = design.status === "sold" || design.status === "cancelled";
   const daysHeld = new Map(trace.hops.map((h) => [h.leg_id, h.days_held]));
+  const stock = stockability(design);
+  const railed = Boolean(openLeg) || !closed;
 
   return (
-    <div className="space-y-6">
-      <Header design={design} trace={trace} reload={load} />
-      <Totals totals={trace.totals} />
-      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_22rem]">
-        <Route legs={design.legs} daysHeld={daysHeld} />
-        <div className="space-y-4 lg:sticky lg:top-6 lg:self-start">
-          {closed ? (
-            <div className="card text-sm text-slate-500">
-              {design.design_no} is {design.status.replace("_", " ")}. No further work can be
-              issued.
-            </div>
-          ) : openLeg ? (
-            <ReceivePanel leg={openLeg} designNo={design.design_no} reload={load} />
-          ) : (
-            <IssuePanel designId={design.id} reload={load} />
-          )}
-        </div>
+    <div className="space-y-5">
+      <JobCard design={design} trace={trace} reload={load} />
+      <LedgerStrip totals={trace.totals} />
+
+      <div className={railed ? "grid gap-5 lg:grid-cols-[minmax(0,1fr)_21rem]" : ""}>
+        <Timeline legs={design.legs} daysHeld={daysHeld} />
+
+        {railed && (
+          <div className="space-y-4 lg:sticky lg:top-6 lg:self-start">
+            {openLeg ? (
+              <ReceivePanel leg={openLeg} designNo={design.design_no} reload={load} />
+            ) : (
+              <NextStep
+                designId={design.id}
+                designNo={design.design_no}
+                stock={stock}
+                onIssue={() => setIssuing(true)}
+              />
+            )}
+          </div>
+        )}
       </div>
+
+      {closed && (
+        <div className="card text-sm text-slate-500">
+          {design.design_no} is {designStatusLabel(design.status).toLowerCase()}. No further work
+          can be issued.
+        </div>
+      )}
+
+      <IssueSheet
+        open={issuing}
+        onClose={() => setIssuing(false)}
+        designId={design.id}
+        designNo={design.design_no}
+        onIssued={load}
+      />
     </div>
   );
 }
 
-function Header({
+/* ------------------------------------------------------------------ header */
+
+function JobCard({
   design,
   trace,
   reload,
@@ -286,62 +200,83 @@ function Header({
   };
 
   return (
-    <div className="card">
-      <Link to="/designs" className="text-sm text-slate-500 hover:underline">
-        ← Designs
-      </Link>
-      <div className="mt-2 flex flex-wrap items-start justify-between gap-4">
-        <div>
-          <h1 className="font-mono text-3xl font-semibold text-slate-900">{design.design_no}</h1>
-          <p className="mt-1 text-sm text-slate-600">
-            {design.item_name ?? "—"} · {design.customer_name ?? "Stock"}
-          </p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <span className={`rounded-full px-3 py-1 text-sm ${statusPill(design.status)}`}>
-            {design.status.replace("_", " ")}
-          </span>
-          {design.current_department_name ? (
-            <span className="rounded-full bg-amber-100 px-3 py-1 text-sm text-amber-800">
-              Out at {design.current_department_name}
-            </span>
-          ) : (
-            <span className="rounded-full bg-slate-100 px-3 py-1 text-sm text-slate-600">
-              In house
-            </span>
+    <div className="card-flush">
+      <div className="border-b border-slate-100 px-5 pb-4 pt-4">
+        <Link to="/designs" className="text-xs text-slate-500 hover:text-slate-700 hover:underline">
+          ← Designs
+        </Link>
+
+        <div className="mt-3 flex flex-wrap items-start gap-4">
+          {design.image_url && (
+            <img
+              src={staticUrl(design.image_url)}
+              alt={design.design_no}
+              className="h-20 w-20 flex-none rounded-xl border border-slate-200 object-cover"
+            />
+          )}
+          <div className="min-w-0 flex-1">
+            <h1 className="num text-3xl font-semibold tracking-tight text-slate-900">
+              {design.design_no}
+            </h1>
+            <p className="mt-1 text-sm text-slate-600">
+              {design.item_name ?? "—"} ·{" "}
+              {design.customer_name ? (
+                <span className="text-slate-900">{design.customer_name}</span>
+              ) : (
+                "for stock"
+              )}
+            </p>
+            <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
+              <DesignStatusChip status={design.status} />
+              {design.current_department_name ? (
+                <span className="chip-out">
+                  <span className="dot bg-amber-500" aria-hidden />
+                  Out at {design.current_department_name}
+                </span>
+              ) : (
+                <span className="chip-idle">In house</span>
+              )}
+              {design.tag_no ? (
+                <span className="chip-gold num">{design.tag_no}</span>
+              ) : (
+                <button
+                  onClick={generateTag}
+                  disabled={busy}
+                  className="chip border border-dashed border-slate-300 text-slate-500 hover:border-brand-400 hover:text-brand-700 disabled:opacity-60"
+                >
+                  {busy ? "Generating…" : "+ Generate tag"}
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Only the onward link lives up here. What to *do* with the piece is
+              the rail's job, and offering the same two buttons in both places
+              makes the reader decide which one is the real one. */}
+          {design.product_id !== null && (
+            <Link className="btn-outline flex-none" to={`/products/${design.product_id}`}>
+              View product →
+            </Link>
           )}
         </div>
       </div>
-      <dl className="mt-5 grid gap-4 border-t border-slate-100 pt-4 text-sm sm:grid-cols-4">
-        <div>
-          <dt className="text-xs uppercase tracking-wide text-slate-500">Tag</dt>
-          <dd className="mt-1 font-mono">
-            {design.tag_no ?? (
-              <button
-                className="rounded-md bg-slate-100 px-2 py-1 font-sans text-xs text-slate-700 hover:bg-slate-200 disabled:opacity-60"
-                onClick={generateTag}
-                disabled={busy}
-              >
-                {busy ? "Generating…" : "Generate tag"}
-              </button>
-            )}
-          </dd>
-        </div>
-        <div>
-          <dt className="text-xs uppercase tracking-wide text-slate-500">Started</dt>
-          <dd className="mt-1">{when(trace.started_at)}</dd>
-        </div>
-        <div>
-          <dt className="text-xs uppercase tracking-wide text-slate-500">Completed</dt>
-          <dd className="mt-1">{when(trace.completed_at)}</dd>
-        </div>
-        <div>
-          <dt className="text-xs uppercase tracking-wide text-slate-500">Days in production</dt>
-          <dd className="mt-1">{trace.days_in_production ?? "—"}</dd>
-        </div>
+
+      <dl className="grid grid-cols-2 divide-x divide-slate-100 sm:grid-cols-4">
+        <Stat label="Started" value={when(trace.started_at)} />
+        <Stat label="Completed" value={when(trace.completed_at)} />
+        <Stat
+          label="Days in production"
+          value={trace.days_in_production !== null ? String(trace.days_in_production) : "—"}
+        />
+        <Stat
+          label="Legs"
+          value={String(trace.totals.hops)}
+          sub={trace.totals.open_hops ? `${trace.totals.open_hops} open` : "all closed"}
+        />
       </dl>
+
       {design.notes && (
-        <p className="mt-4 whitespace-pre-line border-t border-slate-100 pt-3 text-xs text-slate-500">
+        <p className="whitespace-pre-line border-t border-slate-100 px-5 py-3 text-xs leading-relaxed text-slate-500">
           {design.notes}
         </p>
       )}
@@ -349,321 +284,379 @@ function Header({
   );
 }
 
-function Totals({ totals }: { totals: Trace["totals"] }) {
+function Stat({ label, value, sub }: { label: string; value: string; sub?: string }) {
+  return (
+    <div className="px-5 py-3">
+      <dt className="eyebrow">{label}</dt>
+      <dd className="num mt-0.5 text-sm text-slate-900">
+        {value}
+        {sub && <span className="ml-1.5 text-xs font-normal text-slate-400">{sub}</span>}
+      </dd>
+    </div>
+  );
+}
+
+function LedgerStrip({ totals }: { totals: Trace["totals"] }) {
   const excess = Number(totals.wastage_excess_g);
   return (
-    <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
-      <Tile label="Gold issued" value={wt(totals.gold_issued_g)} sub={`${totals.hops} legs`} />
-      <Tile
-        label="Gold received"
-        value={wt(totals.gold_received_g)}
-        sub={totals.open_hops ? `${totals.open_hops} still out` : "all legs closed"}
-      />
-      <Tile
-        label="Wastage"
-        value={wt(totals.wastage_actual_g)}
-        sub={`${wt(totals.wastage_allowed_g)} allowed`}
-      />
-      <Tile
-        label="Owed by workers"
-        value={wt(totals.wastage_excess_g)}
-        sub="beyond allowance"
-        tone={excess > 0 ? "bad" : "good"}
-      />
-      <Tile
-        label="Labour"
-        value={fmtMoney(totals.labour_amount)}
-        sub={
-          totals.pieces
-            ? `${totals.pieces} pcs handled · accrued on closed legs`
-            : "accrued on closed legs"
-        }
-      />
+    <div className="card-flush grid grid-cols-2 divide-slate-100 sm:grid-cols-3 lg:grid-cols-5 lg:divide-x">
+      <div className="border-b border-slate-100 px-5 py-4 sm:border-b-0">
+        <Metric label="Gold issued" value={wt(totals.gold_issued_g)} sub={`${totals.hops} legs`} />
+      </div>
+      <div className="border-b border-slate-100 px-5 py-4 sm:border-b-0">
+        <Metric
+          label="Gold received"
+          value={wt(totals.gold_received_g)}
+          sub={totals.open_hops ? `${totals.open_hops} still out` : "all legs closed"}
+        />
+      </div>
+      <div className="border-b border-slate-100 px-5 py-4 lg:border-b-0">
+        <Metric
+          label="Wastage"
+          value={wt(totals.wastage_actual_g)}
+          sub={`${wt(totals.wastage_allowed_g)} allowed`}
+        />
+      </div>
+      <div className="border-b border-slate-100 px-5 py-4 lg:border-b-0">
+        <Metric
+          label="Owed by workers"
+          value={wt(totals.wastage_excess_g)}
+          sub="beyond allowance"
+          tone={excess > 0 ? "bad" : "good"}
+        />
+      </div>
+      <div className="px-5 py-4">
+        <Metric
+          label="Labour"
+          value={fmtMoney(totals.labour_amount)}
+          sub={
+            totals.pieces
+              ? `${totals.pieces} pcs handled · accrued on closed legs`
+              : "accrued on closed legs"
+          }
+        />
+      </div>
     </div>
   );
 }
 
-function Tile({
-  label,
-  value,
-  sub,
-  tone,
+/* ---------------------------------------------------------------- the route */
+
+function Timeline({
+  legs,
+  daysHeld,
 }: {
-  label: string;
-  value: string;
-  sub: string;
-  tone?: "good" | "bad";
+  legs: Leg[];
+  daysHeld: Map<number, number | null>;
 }) {
-  return (
-    <div className="card p-4">
-      <p className="text-xs uppercase tracking-wide text-slate-500">{label}</p>
-      <p
-        className={`mt-1 text-xl font-semibold ${
-          tone === "bad" ? "text-red-600" : tone === "good" ? "text-emerald-700" : "text-slate-900"
-        }`}
-      >
-        {value}
-      </p>
-      <p className="mt-0.5 text-xs text-slate-500">{sub}</p>
-    </div>
+  // Open first, then the leg that closed most recently. A settled leg from six
+  // weeks ago is history; it opens when it is asked for.
+  const lastReceived = [...legs].reverse().find((l) => l.status === "received");
+  const [expanded, setExpanded] = useState<Set<number>>(
+    () =>
+      new Set(
+        legs
+          .filter((l) => l.status === "issued" || l.id === lastReceived?.id)
+          .map((l) => l.id),
+      ),
   );
-}
 
-function Route({ legs, daysHeld }: { legs: Leg[]; daysHeld: Map<number, number | null> }) {
+  // A leg that has just been issued is the one the operator is about to act on,
+  // so it opens itself when it appears. Legs he has closed by hand stay closed:
+  // this only ever adds.
+  const openIds = legs
+    .filter((l) => l.status === "issued")
+    .map((l) => l.id)
+    .join(",");
+  useEffect(() => {
+    if (!openIds) return;
+    setExpanded((s) => {
+      const next = new Set(s);
+      openIds.split(",").forEach((v) => next.add(Number(v)));
+      return next;
+    });
+  }, [openIds]);
+
+  const toggle = (id: number) =>
+    setExpanded((s) => {
+      const next = new Set(s);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+
   if (legs.length === 0) {
     return (
-      <div className="card text-sm text-slate-500">
-        Nothing has been issued yet. The route builds itself as the piece moves.
+      <div className="card py-10 text-center">
+        <p className="text-sm font-medium text-slate-700">Nothing has been issued yet.</p>
+        <p className="mx-auto mt-1 max-w-sm text-sm text-slate-500">
+          The route builds itself as the piece moves. Issue it to its first department to start.
+        </p>
       </div>
     );
   }
-  return (
-    <ol className="space-y-3">
-      {legs.map((leg, i) => (
-        <li key={leg.id} className="relative pl-10">
-          {i < legs.length - 1 && (
-            <span className="absolute left-[15px] top-8 h-full w-px bg-slate-200" aria-hidden />
-          )}
-          <span
-            className={`absolute left-0 top-1 flex h-8 w-8 items-center justify-center rounded-full text-xs font-semibold ${
-              leg.status === "issued"
-                ? "bg-amber-100 text-amber-800 ring-4 ring-amber-50"
-                : leg.status === "received"
-                ? "bg-emerald-100 text-emerald-800"
-                : "bg-slate-200 text-slate-500"
-            }`}
-          >
-            {leg.sequence}
-          </span>
-          <LegCard leg={leg} daysHeld={daysHeld.get(leg.id) ?? null} />
-        </li>
-      ))}
-    </ol>
-  );
-}
 
-function LegCard({ leg, daysHeld }: { leg: Leg; daysHeld: number | null }) {
-  const cancelled = leg.status === "cancelled";
-  const open = leg.status === "issued";
-  const terms = termsOf(leg);
-  const labourSub =
-    labourWorking(leg, Number(leg.labour_amount)) ??
-    `${leg.labour_basis.replace("_", " ")} @ ${Number(leg.labour_rate)}`;
-  return (
-    <div className={`card ${cancelled ? "opacity-60" : ""}`}>
-      <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div>
-          <h3 className="text-base font-semibold text-slate-900">
-            {leg.department_name ?? "—"}
-            <span className="ml-2 text-sm font-normal text-slate-600">
-              {leg.worker_name ?? "unassigned"}
-            </span>
-          </h3>
-          <p className="mt-0.5 text-xs text-slate-500">
-            Issued {when(leg.issued_at)}
-            {leg.received_at ? ` · received ${when(leg.received_at)}` : ""}
-            {daysHeld !== null ? ` · ${daysHeld} day${daysHeld === 1 ? "" : "s"} held` : ""}
-          </p>
-        </div>
-        <span
-          className={`rounded-full px-2 py-0.5 text-xs ${
-            open
-              ? "bg-amber-100 text-amber-800"
-              : cancelled
-              ? "bg-slate-200 text-slate-600"
-              : "bg-emerald-100 text-emerald-800"
-          }`}
-        >
-          {open ? "out with worker" : leg.status}
-        </span>
-      </div>
+  const allOpen = expanded.size === legs.length;
 
-      <div className="mt-4 grid grid-cols-2 gap-x-6 gap-y-3 text-sm sm:grid-cols-4">
-        <Figure
-          label="Gold issued"
-          value={wt(leg.gold_issued_g)}
-          sub={leg.gold_issued_purity ? `${leg.gold_issued_purity}k` : undefined}
-        />
-        <Figure label="Gold received" value={open ? "pending" : wt(leg.gold_received_g)} />
-        <Figure
-          label="Labour"
-          value={fmtMoney(open ? null : leg.labour_amount)}
-          sub={
-            open && leg.labour_basis === "per_piece"
-              ? `${leg.piece_count} × ${fmtMoney(leg.labour_rate)} on receive`
-              : labourSub
-          }
-        />
-        <Figure
-          label="Stones"
-          value={Number(leg.stones_issued_ct) ? wt(leg.stones_used_ct, "ct") : "—"}
-          sub={
-            Number(leg.stones_issued_ct)
-              ? `${wt(leg.stones_issued_ct, "ct")} issued, ${wt(
-                  leg.stones_returned_ct,
-                  "ct",
-                )} back`
-              : undefined
-          }
-        />
-        {leg.piece_count > 0 && (
-          <Figure
-            label="Pieces"
-            value={String(leg.piece_count)}
-            sub={leg.stones.length > 0 ? "stones set" : "items handled"}
-          />
-        )}
-      </div>
-
-      {!open && !cancelled && (
-        <Settlement
-          className="mt-4"
-          allowed={Number(leg.wastage_allowed_g)}
-          actual={Number(leg.wastage_actual_g)}
-          excess={Number(leg.wastage_excess_g)}
-          terms={terms}
-          worker={leg.worker_name}
-        />
-      )}
-      {open && (
-        <p className="mt-4 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-800">
-          {wt(leg.gold_issued_g)} is with {leg.worker_name ?? "this worker"}. Wastage is settled
-          when the piece comes back —{" "}
-          {terms.basis === "per_100_pieces"
-            ? `${allowanceWorking(terms, round4((terms.per100 * terms.pieces) / 100))}`
-            : `${terms.allowedPct}% is allowed on this leg`}
-          .
-        </p>
-      )}
-
-      {leg.stones.length > 0 && (
-        <table className="mt-4 w-full border-t border-slate-100 pt-2 text-xs">
-          <thead className="text-left uppercase text-slate-400">
-            <tr>
-              <th className="py-1">Stone</th>
-              <th className="py-1 text-right">Issued</th>
-              <th className="py-1 text-right">Returned</th>
-              <th className="py-1 text-right">Used</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-slate-100">
-            {leg.stones.map((s) => (
-              <tr key={s.id}>
-                <td className="py-1">{s.stone_name ?? `#${s.stone_id}`}</td>
-                <td className="py-1 text-right font-mono">
-                  {s.quantity_issued} · {wt(s.weight_issued_ct, "ct")}
-                </td>
-                <td className="py-1 text-right font-mono">
-                  {s.quantity_returned} · {wt(s.weight_returned_ct, "ct")}
-                </td>
-                <td className="py-1 text-right font-mono">
-                  {wt(round4(Number(s.weight_issued_ct) - Number(s.weight_returned_ct)), "ct")}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
-
-      {leg.notes && (
-        <p className="mt-3 whitespace-pre-line border-t border-slate-100 pt-3 text-xs text-slate-500">
-          {leg.notes}
-        </p>
-      )}
-    </div>
-  );
-}
-
-function Figure({ label, value, sub }: { label: string; value: string; sub?: string }) {
   return (
     <div>
-      <p className="text-xs uppercase tracking-wide text-slate-500">{label}</p>
-      <p className="mt-0.5 font-mono text-slate-900">{value}</p>
-      {sub && <p className="text-xs text-slate-500">{sub}</p>}
+      <div className="mb-2 flex items-baseline justify-between">
+        <h2 className="text-sm font-semibold text-slate-900">
+          Route <span className="font-normal text-slate-400">· {legs.length} legs</span>
+        </h2>
+        <button
+          className="text-xs text-slate-500 hover:text-slate-800 hover:underline"
+          onClick={() => setExpanded(allOpen ? new Set() : new Set(legs.map((l) => l.id)))}
+        >
+          {allOpen ? "Collapse all" : "Expand all"}
+        </button>
+      </div>
+
+      <ol className="space-y-2">
+        {legs.map((leg, i) => (
+          <li key={leg.id} className="relative pl-9">
+            {i < legs.length - 1 && (
+              <span
+                className="absolute left-[13px] top-9 h-[calc(100%-1rem)] w-px bg-slate-200"
+                aria-hidden
+              />
+            )}
+            <span
+              className={`num absolute left-0 top-2.5 flex h-7 w-7 items-center justify-center rounded-full text-xs font-semibold ${
+                leg.status === "issued"
+                  ? "bg-amber-100 text-amber-800 ring-4 ring-amber-50"
+                  : leg.status === "received"
+                  ? "bg-emerald-100 text-emerald-800"
+                  : "bg-slate-200 text-slate-500"
+              }`}
+            >
+              {leg.sequence}
+            </span>
+            <LegCard
+              leg={leg}
+              daysHeld={daysHeld.get(leg.id) ?? null}
+              open={expanded.has(leg.id)}
+              onToggle={() => toggle(leg.id)}
+            />
+          </li>
+        ))}
+      </ol>
     </div>
   );
 }
 
-/**
- * Allowed vs actual vs excess, drawn the same way whether it is a settled leg
- * or a live preview — the operator should recognise the number he approved.
- */
-function Settlement({
-  allowed,
-  actual,
-  excess,
-  terms,
-  worker,
-  className = "",
+function LegCard({
+  leg,
+  daysHeld,
+  open,
+  onToggle,
 }: {
-  allowed: number;
-  actual: number;
-  excess: number;
-  terms: Terms;
-  worker: string | null;
-  className?: string;
+  leg: Leg;
+  daysHeld: number | null;
+  open: boolean;
+  onToggle: () => void;
 }) {
-  const gain = actual < 0;
-  const span = Math.max(allowed, actual, 0.0001);
-  const pct = (v: number) => `${Math.min(100, Math.max(0, (v / span) * 100))}%`;
-  const within = Math.min(Math.max(actual, 0), allowed);
+  const cancelled = leg.status === "cancelled";
+  const live = leg.status === "issued";
+  const terms = termsOf(leg);
+  const excess = Number(leg.wastage_excess_g);
+  const labourSub =
+    labourWorking(leg, Number(leg.labour_amount)) ??
+    `${leg.labour_basis.replace(/_/g, " ")} @ ${Number(leg.labour_rate)}`;
 
   return (
-    <div className={`rounded-lg border border-slate-200 p-3 ${className}`}>
-      <div className="grid grid-cols-3 gap-3 text-sm">
-        <div>
-          <p className="text-xs uppercase tracking-wide text-slate-500">Allowed</p>
-          <p className="mt-0.5 font-mono">{wt(allowed)}</p>
-          <p className="text-xs text-slate-500">{allowanceWorking(terms, allowed)}</p>
-        </div>
-        <div>
-          <p className="text-xs uppercase tracking-wide text-slate-500">
-            {gain ? "Gain" : "Actual"}
-          </p>
-          <p className={`mt-0.5 font-mono ${gain ? "text-sky-700" : ""}`}>
-            {wt(gain ? -actual : actual)}
-          </p>
-          <p className="text-xs text-slate-500">{gain ? "came back heavier" : "issued − received"}</p>
-        </div>
-        <div>
-          <p className="text-xs uppercase tracking-wide text-slate-500">Excess</p>
-          <p className={`mt-0.5 font-mono ${excess > 0 ? "text-red-600" : "text-emerald-700"}`}>
-            {wt(excess)}
-          </p>
-          <p className="text-xs text-slate-500">{excess > 0 ? "worker's liability" : "within allowance"}</p>
-        </div>
-      </div>
-
-      {gain ? (
-        <p className="mt-3 rounded-md bg-sky-50 px-3 py-2 text-xs text-sky-900">
-          The piece came back {wt(-actual)} heavier than it went out — solder, alloy and findings do
-          that. Nothing is owed.
-        </p>
-      ) : (
-        <>
-          <div className="relative mt-3 h-2 rounded-full bg-slate-100">
-            <div
-              className="absolute inset-y-0 left-0 rounded-l-full bg-emerald-400"
-              style={{ width: pct(within) }}
-            />
-            <div
-              className="absolute inset-y-0 rounded-r-full bg-red-500"
-              style={{ left: pct(within), width: pct(excess) }}
-            />
-            <div
-              className="absolute -inset-y-1 w-px bg-slate-600"
-              style={{ left: pct(allowed) }}
-              title="Allowance"
-            />
+    <div
+      className={`card-flush ${cancelled ? "opacity-70" : ""} ${
+        live ? "ring-1 ring-amber-200" : ""
+      }`}
+    >
+      {/* The collapsed line has to carry enough that opening it is a choice,
+          not the only way to find out what happened. */}
+      <button
+        onClick={onToggle}
+        aria-expanded={open}
+        className="flex w-full items-center gap-3 px-4 py-3 text-left transition hover:bg-slate-50"
+      >
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-baseline gap-x-2">
+            <h3 className="text-sm font-semibold text-slate-900">{leg.department_name ?? "—"}</h3>
+            <span className="text-xs text-slate-500">
+              {leg.worker_name ?? "in-house"}
+            </span>
           </div>
-          {excess > 0 && (
-            <p className="mt-3 rounded-md bg-red-50 px-3 py-2 text-xs text-red-800">
-              {wt(excess)} beyond the {termsPhrase(terms)} agreed with {worker ?? "this worker"} —
-              charged back to him, not to the shop.
+          <p className="num mt-0.5 text-xs text-slate-500">
+            {wt(leg.gold_issued_g)} out
+            {!live && !cancelled && <> · {wt(leg.gold_received_g)} back</>}
+            {daysHeld !== null && (
+              <> · {daysHeld} day{daysHeld === 1 ? "" : "s"}</>
+            )}
+          </p>
+        </div>
+        <div className="flex flex-none items-center gap-2">
+          {excess > 0 && !live && (
+            <span className="chip-owed num">{wt(excess)} owed</span>
+          )}
+          <LegStatusChip status={leg.status} />
+          <svg
+            width="16"
+            height="16"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            className={`flex-none text-slate-400 transition-transform ${open ? "rotate-180" : ""}`}
+            aria-hidden
+          >
+            <polyline points="6 9 12 15 18 9" />
+          </svg>
+        </div>
+      </button>
+
+      {open && (
+        <div className="border-t border-slate-100 px-4 py-4">
+          <p className="mb-3 text-xs text-slate-500">
+            Issued {when(leg.issued_at)}
+            {leg.received_at ? ` · received ${when(leg.received_at)}` : ""}
+          </p>
+
+          <div className="grid grid-cols-2 gap-x-6 gap-y-3 sm:grid-cols-4">
+            <Figure
+              label="Gold issued"
+              value={wt(leg.gold_issued_g)}
+              sub={leg.gold_issued_purity ? `${leg.gold_issued_purity}k` : undefined}
+            />
+            <Figure
+              label="Gold received"
+              value={live ? "pending" : wt(leg.gold_received_g)}
+              muted={live}
+            />
+            <Figure
+              label="Labour"
+              value={fmtMoney(live ? null : leg.labour_amount)}
+              muted={live}
+              sub={
+                live && leg.labour_basis === "per_piece"
+                  ? `${leg.piece_count} × ${fmtMoney(leg.labour_rate)} on receive`
+                  : labourSub
+              }
+            />
+            <Figure
+              label="Stones"
+              value={Number(leg.stones_issued_ct) ? wt(leg.stones_used_ct, "ct") : "—"}
+              muted={!Number(leg.stones_issued_ct)}
+              sub={
+                Number(leg.stones_issued_ct)
+                  ? `${wt(leg.stones_issued_ct, "ct")} issued, ${wt(
+                      leg.stones_returned_ct,
+                      "ct",
+                    )} back`
+                  : undefined
+              }
+            />
+            {leg.piece_count > 0 && (
+              <Figure
+                label="Pieces"
+                value={String(leg.piece_count)}
+                sub={leg.stones.length > 0 ? "stones set" : "items handled"}
+              />
+            )}
+          </div>
+
+          {!live && !cancelled && (
+            <Settlement
+              className="mt-4"
+              allowed={Number(leg.wastage_allowed_g)}
+              actual={Number(leg.wastage_actual_g)}
+              excess={excess}
+              terms={terms}
+              worker={leg.worker_name}
+            />
+          )}
+          {live && (
+            <p className="mt-4 rounded-lg bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-900">
+              {wt(leg.gold_issued_g)} is with {leg.worker_name ?? "the shop's own bench"}. Wastage
+              is settled when the piece comes back —{" "}
+              {allowanceWorking(terms, allowanceOf(terms, Number(leg.gold_issued_g)))}.
             </p>
           )}
-        </>
+
+          {leg.stones.length > 0 && (
+            <div className="mt-4 overflow-x-auto">
+              <table className="w-full min-w-[24rem] border-t border-slate-100 pt-2 text-xs">
+                <thead className="text-left text-slate-400">
+                  <tr className="eyebrow">
+                    <th className="py-1.5 font-semibold">Stone</th>
+                    <th className="py-1.5 text-right font-semibold">Issued</th>
+                    <th className="py-1.5 text-right font-semibold">Returned</th>
+                    <th className="py-1.5 text-right font-semibold">Used</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {leg.stones.map((s) => (
+                    <tr key={s.id}>
+                      <td className="py-1.5 text-slate-700">{s.stone_name ?? `#${s.stone_id}`}</td>
+                      <td className="num py-1.5 text-right">
+                        {s.quantity_issued} · {wt(s.weight_issued_ct, "ct")}
+                      </td>
+                      <td className="num py-1.5 text-right">
+                        {s.quantity_returned} · {wt(s.weight_returned_ct, "ct")}
+                      </td>
+                      <td className="num py-1.5 text-right font-medium">
+                        {wt(round4(Number(s.weight_issued_ct) - Number(s.weight_returned_ct)), "ct")}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {leg.notes && (
+            <p className="mt-3 whitespace-pre-line border-t border-slate-100 pt-3 text-xs leading-relaxed text-slate-500">
+              {leg.notes}
+            </p>
+          )}
+        </div>
       )}
+    </div>
+  );
+}
+
+/* ----------------------------------------------------------- the action rail */
+
+/** What to do with a piece that is sitting in the shop. */
+function NextStep({
+  designId,
+  designNo,
+  stock,
+  onIssue,
+}: {
+  designId: number;
+  designNo: string;
+  stock: { ok: boolean; reason?: string };
+  onIssue: () => void;
+}) {
+  return (
+    <div className="card">
+      <h3 className="text-sm font-semibold text-slate-900">{designNo} is in the shop</h3>
+      <p className="mt-1 text-xs leading-relaxed text-slate-500">
+        Nobody is holding it. Send it on to the next department, or — when it's finished — put it
+        into stock as a sellable piece.
+      </p>
+      <div className="mt-4 space-y-2">
+        <button className="btn-primary w-full" onClick={onIssue}>
+          Issue to department
+        </button>
+        {stock.ok ? (
+          <Link className="btn-outline w-full" to={`/designs/${designId}/stock`}>
+            Stock this piece
+          </Link>
+        ) : (
+          <p className="rounded-lg bg-slate-50 px-3 py-2 text-center text-xs text-slate-500">
+            Can't be stocked yet — {stock.reason}.
+          </p>
+        )}
+      </div>
     </div>
   );
 }
@@ -687,11 +680,12 @@ function ReceivePanel({
   const [cancelReason, setCancelReason] = useState("");
 
   const issued = Number(leg.gold_issued_g);
-  const terms = termsOf(leg);
+  const terms: Terms = termsOf(leg);
   // Typed weight, not the committed one: this is what makes the settlement
   // visible before the operator signs off on it.
   const preview = settle(issued, Number(received || 0), terms);
   const labour = labourOn(leg, Number(received || 0));
+  const holder = leg.worker_name ?? "the bench";
 
   const setReturn = (id: number, patch: Partial<{ qty: string; ct: string }>) =>
     setReturns((r) => ({ ...r, [id]: { ...(r[id] ?? { qty: "", ct: "" }), ...patch } }));
@@ -738,13 +732,17 @@ function ReceivePanel({
   };
 
   return (
-    <div className="card">
-      <h3 className="text-sm font-semibold text-slate-700">
-        Receive from {leg.worker_name ?? "worker"}
-      </h3>
-      <p className="mt-1 text-xs text-slate-500">
-        Leg #{leg.sequence} at {leg.department_name} · {wt(leg.gold_issued_g)} out
-      </p>
+    <div className="card border-amber-200 ring-1 ring-amber-100">
+      <div className="flex items-start gap-2">
+        <span className="dot mt-1.5 flex-none bg-amber-500" aria-hidden />
+        <div className="min-w-0">
+          <h3 className="text-sm font-semibold text-slate-900">Receive from {holder}</h3>
+          <p className="num mt-0.5 text-xs text-slate-500">
+            Leg #{leg.sequence} · {leg.department_name} · {wt(leg.gold_issued_g)} out
+          </p>
+        </div>
+      </div>
+
       <form onSubmit={submit} className="mt-4 space-y-3">
         <TextField
           label="Gold received (g)"
@@ -752,19 +750,16 @@ function ReceivePanel({
           step="0.0001"
           min={0}
           required
+          autoFocus
           value={received}
           onChange={(e) => setReceived(e.target.value)}
           hint="Heavier than issued is fine — solder and findings add weight"
         />
 
         {received === "" ? (
-          <p className="rounded-lg border border-dashed border-slate-300 px-3 py-4 text-center text-xs text-slate-500">
+          <p className="rounded-xl border border-dashed border-slate-300 px-3 py-4 text-center text-xs leading-relaxed text-slate-500">
             Weigh the piece and enter it above — the wastage settlement appears here before you
-            commit it.{" "}
-            {terms.basis === "per_100_pieces"
-              ? allowanceWorking(terms, round4((terms.per100 * terms.pieces) / 100))
-              : `${terms.allowedPct}% of ${wt(leg.gold_issued_g)} is allowed`}
-            .
+            commit it. {allowanceWorking(terms, allowanceOf(terms, issued))}.
           </p>
         ) : (
           <>
@@ -775,22 +770,23 @@ function ReceivePanel({
               terms={terms}
               worker={leg.worker_name}
             />
-            <p className="text-xs text-slate-500">
-              Labour on this leg: <span className="font-mono">{fmtMoney(labour)}</span>
-              {labourWorking(leg, labour) && (
-                <span className="mt-0.5 block font-mono text-slate-400">
-                  {labourWorking(leg, labour)}
-                </span>
-              )}
-            </p>
+            <div className="flex items-baseline justify-between gap-2 text-xs">
+              <span className="text-slate-500">Labour on this leg</span>
+              <span className="text-right">
+                <span className="num block font-medium text-slate-900">{fmtMoney(labour)}</span>
+                {labourWorking(leg, labour) && (
+                  <span className="num block text-[11px] text-slate-400">
+                    {labourWorking(leg, labour)}
+                  </span>
+                )}
+              </span>
+            </div>
           </>
         )}
 
         {leg.stones.length > 0 && (
           <div className="space-y-2 border-t border-slate-100 pt-3">
-            <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-              Stones returned
-            </p>
+            <p className="eyebrow">Stones returned</p>
             {leg.stones.map((s) => (
               <div key={s.id} className="grid grid-cols-2 gap-2">
                 <TextField
@@ -821,9 +817,12 @@ function ReceivePanel({
         </button>
       </form>
 
-      <div className="mt-4 border-t border-slate-100 pt-3">
-        <button className="text-xs text-red-600 hover:underline" onClick={() => setAskCancel(true)}>
-          Cancel this leg
+      <div className="mt-4 border-t border-slate-100 pt-3 text-center">
+        <button
+          className="text-xs text-slate-500 hover:text-red-600 hover:underline"
+          onClick={() => setAskCancel(true)}
+        >
+          The piece isn't coming back — cancel this leg
         </button>
       </div>
 
@@ -877,398 +876,5 @@ function ReceivePanel({
         onConfirm={confirmCancel}
       />
     </div>
-  );
-}
-
-interface StoneLine {
-  key: number;
-  stone_id: string;
-  qty: string;
-  ct: string;
-  rate: string;
-}
-
-let nextStoneKey = 1;
-
-function IssuePanel({ designId, reload }: { designId: number; reload: () => void }) {
-  const [departments, setDepartments] = useState<Department[]>([]);
-  const [workers, setWorkers] = useState<Worker[]>([]);
-  const [goldSources, setGoldSources] = useState<InvItem[]>([]);
-  const [stoneSources, setStoneSources] = useState<InvItem[]>([]);
-  const [stones, setStones] = useState<Stone[]>([]);
-
-  const [deptId, setDeptId] = useState("");
-  const [workerId, setWorkerId] = useState("");
-  const [goldSrc, setGoldSrc] = useState("");
-  const [gold, setGold] = useState("");
-  const [purity, setPurity] = useState("22");
-  const [basis, setBasis] = useState("per_gram");
-  const [rate, setRate] = useState("0");
-  const [pieces, setPieces] = useState("");
-  const [per100, setPer100] = useState("");
-  const [lines, setLines] = useState<StoneLine[]>([]);
-  const [stoneSrc, setStoneSrc] = useState("");
-  const [notes, setNotes] = useState("");
-  const [busy, setBusy] = useState(false);
-
-  useEffect(() => {
-    Promise.all([
-      api.get<Department[]>("/departments", { params: { is_active: true } }),
-      api.get<Worker[]>("/vendors", { params: { limit: 500 } }),
-      api.get<InvItem[]>("/inventory", { params: { type: "raw_gold" } }),
-      api.get<InvItem[]>("/inventory", { params: { type: "raw_stone" } }),
-      api.get<Stone[]>("/stones", { params: { limit: 500 } }),
-    ])
-      .then(([d, w, ig, is, s]) => {
-        setDepartments(d.data);
-        setWorkers(w.data);
-        setGoldSources(ig.data);
-        setStoneSources(is.data);
-        setStones(s.data);
-        setDeptId((prev) => prev || String(d.data[0]?.id ?? ""));
-        setGoldSrc((prev) => prev || String(ig.data[0]?.id ?? ""));
-        setStoneSrc((prev) => prev || String(is.data[0]?.id ?? ""));
-      })
-      .catch((e) => toast("error", apiError(e, "Could not load workshop data")));
-  }, []);
-
-  // The API refuses a worker who belongs to another department, so the choice
-  // is narrowed here rather than explained after the fact.
-  const eligible = useMemo(
-    () => workers.filter((w) => w.is_active && String(w.department_id ?? "") === deptId),
-    [workers, deptId],
-  );
-
-  useEffect(() => {
-    setWorkerId((prev) =>
-      eligible.some((w) => String(w.id) === prev) ? prev : String(eligible[0]?.id ?? ""),
-    );
-  }, [eligible]);
-
-  const worker = eligible.find((w) => String(w.id) === workerId);
-  const dept = departments.find((d) => String(d.id) === deptId);
-  const perPieces = dept?.default_wastage_basis === "per_100_pieces";
-
-  // The department's standing terms are the shop's own numbers, so they are
-  // filled in rather than asked for again. They stay editable: what is sent is
-  // what the leg is frozen on, and one job can legitimately be off the norm.
-  useEffect(() => {
-    if (!dept) return;
-    setPer100(dept.default_wastage_per_100_pcs_g ?? "");
-    if (dept.default_rate_per_piece !== null && dept.default_rate_per_piece !== undefined) {
-      setBasis("per_piece");
-      setRate(dept.default_rate_per_piece);
-    }
-  }, [dept]);
-
-  const submit = async (e: FormEvent) => {
-    e.preventDefault();
-    setBusy(true);
-    try {
-      await api.post(`/designs/${designId}/legs`, {
-        department_id: Number(deptId),
-        worker_id: workerId ? Number(workerId) : null,
-        gold_issued_g: gold || "0",
-        gold_issued_purity: purity ? parseInt(purity, 10) : null,
-        gold_source_inventory_id: Number(goldSrc),
-        stones: lines
-          .filter((l) => l.stone_id && Number(l.ct) > 0)
-          .map((l) => ({
-            stone_id: Number(l.stone_id),
-            quantity_issued: Number(l.qty || 0),
-            weight_issued_ct: l.ct,
-            rate_per_ct: l.rate || "0",
-          })),
-        stone_source_inventory_id: lines.length ? Number(stoneSrc) : null,
-        piece_count: Number(pieces || 0),
-        // Sent explicitly rather than left to the server's fallback so the leg
-        // is frozen on exactly the terms shown on this form.
-        wastage_basis: dept?.default_wastage_basis ?? "percent_of_issued",
-        wastage_per_100_pcs_g: perPieces ? per100 || "0" : null,
-        labour_basis: basis,
-        labour_rate: rate || "0",
-        notes: notes || null,
-      });
-      toast("success", `Issued to ${worker?.name ?? "worker"}`);
-      setGold("");
-      setNotes("");
-      setPieces("");
-      setLines([]);
-      reload();
-    } catch (err) {
-      toast("error", apiError(err, "Could not issue"));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <form onSubmit={submit} className="card space-y-3">
-      <h3 className="text-sm font-semibold text-slate-700">Issue to department</h3>
-      <SelectField
-        label="Department"
-        required
-        value={deptId}
-        onChange={(e) => setDeptId(e.target.value)}
-        options={departments.map((d) => ({ value: d.id, label: d.name }))}
-      />
-      {/* Not required. Several stages — cleaning, burning, rhodium, finish —
-          are done on the shop's own bench, where there is no outside karigar
-          holding the metal and nobody to charge a shortfall to. Leaving this
-          blank tracks the metal through the leg without inventing a worker. */}
-      <SelectField
-        label="Worker"
-        value={workerId}
-        onChange={(e) => setWorkerId(e.target.value)}
-        options={[
-          { value: "", label: "In-house — no outside worker" },
-          ...eligible.map((w) => ({ value: w.id, label: w.name })),
-        ]}
-        hint={
-          !workerId
-            ? "In-house: the metal stays the shop's, and any shortfall is its own cost."
-            : `Wastage allowance frozen onto this leg: ${Number(
-                worker?.effective_wastage_pct ?? 0,
-              )}%`
-        }
-      />
-      {eligible.length === 0 && (
-        <p className="text-xs text-slate-500">
-          No worker is assigned to {dept?.name ?? "this department"}. That is fine for a
-          stage the shop does itself — otherwise add one under Workers and set their
-          department.
-        </p>
-      )}
-      <SelectField
-        label="Gold from"
-        required
-        value={goldSrc}
-        onChange={(e) => setGoldSrc(e.target.value)}
-        options={goldSources.map((g) => ({
-          value: g.id,
-          label: `${g.label} (${wt(g.weight_g)}${g.purity ? `, ${g.purity}k` : ""})`,
-        }))}
-      />
-      <div className="grid grid-cols-2 gap-3">
-        <TextField
-          label="Gold (g)"
-          type="number"
-          step="0.0001"
-          required
-          min={0.0001}
-          value={gold}
-          onChange={(e) => setGold(e.target.value)}
-        />
-        <TextField
-          label="Purity (k)"
-          type="number"
-          min={1}
-          max={24}
-          value={purity}
-          onChange={(e) => setPurity(e.target.value)}
-        />
-      </div>
-      <div className="grid grid-cols-2 gap-3">
-        <SelectField
-          label="Labour basis"
-          value={basis}
-          onChange={(e) => setBasis(e.target.value)}
-          options={LABOUR_BASES}
-        />
-        <TextField
-          label="Labour rate"
-          type="number"
-          step="0.01"
-          min={0}
-          value={rate}
-          onChange={(e) => setRate(e.target.value)}
-        />
-      </div>
-
-      <div className="grid grid-cols-2 gap-3">
-        <TextField
-          label="Pieces"
-          type="number"
-          min={0}
-          required={perPieces}
-          value={pieces}
-          onChange={(e) => setPieces(e.target.value)}
-          hint={
-            perPieces
-              ? "Stones to be set — the allowance is worked out from this"
-              : dept?.consumes_stones
-              ? "Stones to be set on this leg"
-              : "Items handled on this leg"
-          }
-        />
-        {perPieces && (
-          <TextField
-            label="Waste per 100 pcs (g)"
-            type="number"
-            step="0.0001"
-            min={0}
-            value={per100}
-            onChange={(e) => setPer100(e.target.value)}
-            hint={`${dept?.name} standard`}
-          />
-        )}
-      </div>
-      {perPieces && (
-        <p className="rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-600">
-          {Number(pieces || 0) > 0 ? (
-            <>
-              Allowance frozen onto this leg:{" "}
-              <span className="font-mono">
-                {Number(pieces)} pcs × {g3(Number(per100 || 0))}g/100 ={" "}
-                {g3(round4((Number(per100 || 0) * Number(pieces)) / 100))} g
-              </span>
-              {basis === "per_piece" && (
-                <>
-                  {" · "}
-                  <span className="font-mono">
-                    {Number(pieces)} × {fmtMoney(rate || 0)} ={" "}
-                    {fmtMoney(Number(rate || 0) * Number(pieces))}
-                  </span>
-                </>
-              )}
-            </>
-          ) : (
-            <>
-              {dept?.name} allows wastage per 100 pieces. Without a piece count the allowance is
-              zero and the worker carries the whole loss, so the count is required.
-            </>
-          )}
-        </p>
-      )}
-
-      <div className="border-t border-slate-100 pt-3">
-        <div className="flex items-center justify-between">
-          <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Stones</p>
-          <button
-            type="button"
-            className="text-xs text-brand-700 hover:underline"
-            onClick={() =>
-              setLines((l) => [
-                ...l,
-                {
-                  key: nextStoneKey++,
-                  stone_id: String(stones[0]?.id ?? ""),
-                  qty: "0",
-                  ct: "",
-                  rate: stones[0]?.default_rate_per_ct ?? "0",
-                },
-              ])
-            }
-            disabled={stones.length === 0}
-          >
-            Add stone
-          </button>
-        </div>
-        {lines.length === 0 ? (
-          <p className="mt-1 text-xs text-slate-400">
-            {dept?.consumes_stones
-              ? "This department sets stones — add the lines going out with the piece."
-              : "None."}
-          </p>
-        ) : (
-          <div className="mt-2 space-y-3">
-            {lines.map((l) => (
-              <div key={l.key} className="rounded-lg border border-slate-200 p-2">
-                <SelectField
-                  label="Stone"
-                  value={l.stone_id}
-                  onChange={(e) =>
-                    setLines((ls) =>
-                      ls.map((x) =>
-                        x.key === l.key
-                          ? {
-                              ...x,
-                              stone_id: e.target.value,
-                              rate:
-                                stones.find((s) => String(s.id) === e.target.value)
-                                  ?.default_rate_per_ct ?? x.rate,
-                            }
-                          : x,
-                      ),
-                    )
-                  }
-                  options={stones.map((s) => ({ value: s.id, label: s.name }))}
-                />
-                <div className="mt-2 grid grid-cols-3 gap-2">
-                  <TextField
-                    label="Qty"
-                    type="number"
-                    min={0}
-                    value={l.qty}
-                    onChange={(e) =>
-                      setLines((ls) =>
-                        ls.map((x) => (x.key === l.key ? { ...x, qty: e.target.value } : x)),
-                      )
-                    }
-                  />
-                  <TextField
-                    label="Carats"
-                    type="number"
-                    step="0.0001"
-                    min={0.0001}
-                    value={l.ct}
-                    onChange={(e) =>
-                      setLines((ls) =>
-                        ls.map((x) => (x.key === l.key ? { ...x, ct: e.target.value } : x)),
-                      )
-                    }
-                  />
-                  <TextField
-                    label="Rate / ct"
-                    type="number"
-                    step="0.01"
-                    min={0}
-                    value={l.rate}
-                    onChange={(e) =>
-                      setLines((ls) =>
-                        ls.map((x) => (x.key === l.key ? { ...x, rate: e.target.value } : x)),
-                      )
-                    }
-                  />
-                </div>
-                <button
-                  type="button"
-                  className="mt-2 text-xs text-red-600 hover:underline"
-                  onClick={() => setLines((ls) => ls.filter((x) => x.key !== l.key))}
-                >
-                  Remove
-                </button>
-              </div>
-            ))}
-            <SelectField
-              label="Stones from"
-              required
-              value={stoneSrc}
-              onChange={(e) => setStoneSrc(e.target.value)}
-              options={stoneSources.map((s) => ({
-                value: s.id,
-                label: `${s.label} (${wt(s.weight_ct, "ct")})`,
-              }))}
-            />
-          </div>
-        )}
-      </div>
-
-      <TextArea label="Notes" value={notes} onChange={(e) => setNotes(e.target.value)} />
-      <button
-        className="btn-primary w-full"
-        disabled={
-          busy ||
-          !workerId ||
-          !goldSrc ||
-          !gold ||
-          (lines.length > 0 && !stoneSrc) ||
-          // The API refuses this too; blocking it here saves the round trip.
-          (perPieces && Number(pieces || 0) <= 0)
-        }
-      >
-        {busy ? "Issuing…" : "Issue (deducts stock)"}
-      </button>
-    </form>
   );
 }

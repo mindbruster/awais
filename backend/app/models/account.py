@@ -26,12 +26,32 @@ class SystemAccount(str, enum.Enum):
     FINISHED_GOODS = "1150"
     GOLD_WITH_WORKERS = "1160"
     CUSTOMERS = "1210"
+    # The running metal account with a trade party, in fine grams.
+    #
+    # Deliberately one account that swings both ways rather than an asset for
+    # metal owed to the shop and a liability for metal the shop is holding. In
+    # this trade the same jeweller is on both sides of that line in the same
+    # week — he settles a bill in bullion on Tuesday and drops off 500g for job
+    # work on Thursday — and a split would need reclassifying constantly. The
+    # bazaar itself keeps one running account with a direction, so the ledger
+    # does too: positive means they owe the shop metal, negative means the shop
+    # is holding theirs.
+    PARTY_METAL = "1215"
     SUPPLIERS = "2110"
     WORKERS_PAYABLE = "2120"
     CAPITAL = "3100"
     OPENING_BALANCE_EQUITY = "3200"
     SALES = "4100"
     WASTAGE_RECOVERED = "4200"
+    # What the shop charges for making a piece, as income.
+    #
+    # `5100 Labour Cost` is what the karigar is paid; this is its opposite and
+    # there was no account for it, so making charges billed to a customer fell
+    # into `4100 Sales` alongside the metal. For a retailer that is untidy. For
+    # a wholesaler it hides the business: making and wastage *are* the margin,
+    # the metal largely passes through at cost, and a profit report that cannot
+    # separate the two cannot say whether the month was any good.
+    MAKING_INCOME = "4300"
     LABOUR_COST = "5100"
     WASTAGE_EXPENSE = "5200"
     COST_OF_GOODS_SOLD = "5400"

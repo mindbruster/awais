@@ -25,6 +25,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import clock
 from app.models.currency import Currency
 from app.models.exchange_rate import ExchangeRate
 
@@ -48,7 +49,7 @@ async def rate_in_force(
     if currency is Currency.PKR:
         return Decimal("1")
 
-    effective = as_of or datetime.now(timezone.utc).date()
+    effective = as_of or clock.today()
     row = (
         await db.execute(
             select(ExchangeRate)

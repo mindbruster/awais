@@ -1,8 +1,11 @@
 from fastapi import APIRouter
 
 from app.api.v1 import (
+    approvals,
+    dashboard,
     audit_log,
     auth,
+    branches,
     customers,
     designs,
     gold_rates,
@@ -11,11 +14,14 @@ from app.api.v1 import (
     invoices,
     ledger,
     masters,
+    notifications,
+    orders,
     payments,
     purchasing,
     product_stones,
     products,
     reports,
+    setup,
     stock_movements,
     stocking,
     stones,
@@ -49,9 +55,34 @@ api_router.include_router(masters.cities_router, prefix="/cities", tags=["master
 api_router.include_router(masters.banks_router, prefix="/banks", tags=["masters"])
 api_router.include_router(masters.bank_accounts_router, prefix="/bank-accounts", tags=["masters"])
 
+# What still needs configuring, computed from the shop's own data rather than
+# stored — a stored checklist drifts from reality the moment something is deleted.
+api_router.include_router(setup.router, prefix="/setup", tags=["setup"])
+
+# Where the business trades from, and the goods moving between those places.
+# Transfers are mounted separately so a transfer id can never be read as a
+# branch id.
+api_router.include_router(branches.router, prefix="/branches", tags=["branches"])
+api_router.include_router(branches.transfers_router, prefix="/transfers", tags=["branches"])
+
 # The books, and the workshop floor that posts into them.
 api_router.include_router(ledger.router, prefix="/ledger", tags=["ledger"])
 api_router.include_router(designs.router, prefix="/designs", tags=["designs"])
+
+# Work promised to a customer. A front door onto the routing engine above:
+# an order mints a design and lets that machinery do the tracking.
+api_router.include_router(orders.router, prefix="/orders", tags=["orders"])
+
+# Pieces let out on approval. Not a sale — the goods are still the shop's,
+# merely somewhere else — so nothing here posts to the ledger.
+api_router.include_router(approvals.router, prefix="/approvals", tags=["approvals"])
+api_router.include_router(dashboard.router, prefix="/dashboard", tags=["dashboard"])
+
+# Telling customers things. Nothing here fires on a schedule — every message
+# is somebody at the counter deciding to send it.
+api_router.include_router(
+    notifications.router, prefix="/notifications", tags=["notifications"]
+)
 
 # Analysis over the books. Degrades to plain statistics when no model provider
 # is configured — nothing here is allowed to be load-bearing.

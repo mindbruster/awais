@@ -141,9 +141,25 @@ export function MasterTable({
       <div className="card mt-4 overflow-x-auto p-0">
         {loading && <div className="p-6 text-sm text-slate-500">Loading…</div>}
         {error && <div className="p-6 text-sm text-red-600">{error}</div>}
+        {/* Seven settings screens share this component, so an empty state
+            written once here is an empty state on all of them. A blank panel
+            saying "No departments yet" tells a new user nothing they cannot
+            already see — the screen's own description says what the thing is
+            for, so it is repeated here where they are actually looking, next
+            to the button that fixes it. */}
         {!loading && !error && rows.length === 0 && (
-          <div className="p-6 text-sm text-slate-500">
-            {q ? `No ${noun}s matching “${q}”.` : `No ${noun}s yet.`}
+          <div className="px-6 py-12 text-center">
+            <p className="text-sm font-medium text-slate-700">
+              {q ? `Nothing matches “${q}”.` : `No ${noun}s yet.`}
+            </p>
+            <p className="mx-auto mt-1.5 max-w-md text-sm leading-relaxed text-slate-500">
+              {q ? "Try a different search, or clear it to see everything." : description}
+            </p>
+            {!q && (
+              <button className="btn-primary mt-5" onClick={() => setCreating(true)}>
+                Add {noun}
+              </button>
+            )}
           </div>
         )}
         {rows.length > 0 && (

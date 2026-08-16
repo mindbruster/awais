@@ -7,13 +7,17 @@ Run: python -m tests.e2e
 from __future__ import annotations
 
 import io
+import os
 import sys
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
 import httpx
 
-BASE = "http://127.0.0.1:8000"
+# Overridable so the suite can be pointed at a throwaway instance. It rebuilds
+# the database it runs against, and a shop's live data is not a thing to find
+# out about afterwards.
+BASE = os.environ.get("E2E_BASE_URL", "http://127.0.0.1:8000")
 API = f"{BASE}/api/v1"
 
 PASS = "PASS"
@@ -62,6 +66,11 @@ def preflight(client: httpx.Client, auth: dict[str, str]) -> str | None:
 
 def main() -> int:
     client = httpx.Client(base_url=API, timeout=30)
+    # The AI endpoints wait on a third party and the free models are slow — a
+    # large one on a free tier can sit in a queue for a minute before it starts.
+    # They get their own client rather than a raised global timeout, so a real
+    # endpoint that starts taking 30s still fails the suite the way it should.
+    ai_client = httpx.Client(base_url=API, timeout=240)
 
     # ----- AUTH -----
     section("Auth")
@@ -166,42 +175,54 @@ def main() -> int:
 
     # ----- VENDORS -----
     section("Vendors")
-    # Every worker belongs to a department. That is what the worker dropdown on
-    # a design filters by, so one saved without a department can never be given
-    # work — he is simply absent from every screen that matters.
+    # Every worker handles a stage. That is what the worker dropdown on a design
+    # filters by, so one saved without a stage can never be given work — he is
+    # simply absent from every screen that matters.
     depts_by_code = {d["code"]: d["id"] for d in client.get("/departments", headers=auth).json()}
+    check(
+        "the floor is the three stages the shop runs",
+        set(depts_by_code) == {"MAKE", "SET", "LAC"},
+        f"got {sorted(depts_by_code)}",
+    )
     karigar = client.post(
-        "/vendors", headers=auth,
-        json={"name": "Ravi Karigar", "type": "karigar", "department_id": depts_by_code["CAST"]},
+        "/vendors", headers=auth, json={"name": "Ravi Karigar", "department_id": depts_by_code["MAKE"]},
     ).json()
     fixer = client.post(
-        "/vendors", headers=auth,
-        json={"name": "Stone Master", "type": "stone_fixer", "department_id": depts_by_code["SET"]},
+        "/vendors", headers=auth, json={"name": "Stone Master", "department_id": depts_by_code["SET"]},
     ).json()
-    polisher = client.post(
-        "/vendors", headers=auth,
-        json={"name": "Glow Polish", "type": "polish", "department_id": depts_by_code["POL"]},
+    lacker = client.post(
+        "/vendors", headers=auth, json={"name": "Coating Wala", "department_id": depts_by_code["LAC"]},
     ).json()
-    check("create karigar / fixer / polisher", all(v.get("id") for v in (karigar, fixer, polisher)))
+    check("create maker / stone fixer / lacker", all(v.get("id") for v in (karigar, fixer, lacker)))
 
-    r = client.post("/vendors", headers=auth, json={"name": "Nobody's Worker", "type": "karigar"})
+    r = client.post("/vendors", headers=auth, json={"name": "Nobody's Worker"})
     check(
-        "a worker without a department is refused → 422",
+        "a worker without a stage is refused → 422",
         r.status_code == 422,
         f"got {r.status_code} — one saved this way can never be picked on a design",
     )
     r = client.post(
         "/vendors", headers=auth,
-        json={"name": "Untyped Worker", "department_id": depts_by_code["POL"]},
+        json={"name": "Second Maker", "department_id": depts_by_code["MAKE"], "type": "polish"},
     )
     check(
-        "the legacy type is optional now → 201",
-        r.status_code == 201 and r.json()["type"] == "other",
-        f"got {r.status_code}: {r.json().get('type')} — the department is the routing key, not the type",
+        "the legacy type follows the stage, not the payload",
+        r.status_code == 201 and r.json()["type"] == "karigar",
+        f"got {r.status_code}: {r.json().get('type')} — the stage is the routing key",
+    )
+    check(
+        "the stone fixer's legacy type is derived too",
+        fixer["type"] == "stone_fixer" and lacker["type"] == "other",
+        f"got {fixer.get('type')} / {lacker.get('type')}",
     )
 
-    r = client.get("/vendors", headers=auth, params={"type": "karigar"})
-    check("filter vendors by type", r.status_code == 200 and all(v["type"] == "karigar" for v in r.json()))
+    r = client.get("/vendors", headers=auth, params={"department_id": depts_by_code["SET"]})
+    check(
+        "filter workers by stage",
+        r.status_code == 200
+        and r.json()
+        and all(v["department_id"] == depts_by_code["SET"] for v in r.json()),
+    )
 
     # ----- INVENTORY (raw) -----
     section("Inventory (raw)")
@@ -358,6 +379,9 @@ def main() -> int:
         "discount_amount": "100",
         "discount_weight_g": "0",
         "tax_amount": "50",
+        # Credit terms. The printed bill carries them and works the due date
+        # out from them, so both have to survive the round trip.
+        "term_days": 30,
         "items": [
             {
                 "product_id": finished_product_id,
@@ -386,6 +410,19 @@ def main() -> int:
 
     invoice_id = inv["id"]
 
+    # --- what the printed bill needs ---
+    check("credit terms stored", inv["term_days"] == 30, str(inv.get("term_days")))
+    check(
+        "a draft has no due date",
+        inv["due_date"] is None,
+        f"got {inv.get('due_date')} — nothing is due from a bill that was never issued",
+    )
+    check(
+        "the bill knows which shop raised it",
+        (inv.get("letterhead") or {}).get("print_name") == "Main Shop",
+        str(inv.get("letterhead")),
+    )
+
     # Issue → must deduct stock. Now requires password (Phase 8 alignment).
     r = client.post(f"/invoices/{invoice_id}/issue", headers=auth)
     check("issue without password → 401", r.status_code == 401)
@@ -401,6 +438,21 @@ def main() -> int:
     # Verify product status = sold
     r = client.get(f"/products/{finished_product_id}", headers=auth)
     check("product marked sold", r.json()["status"] == "sold")
+
+    # The due date only exists once there is an issue date to count from, and
+    # it is derived rather than stored, so it always agrees with the terms.
+    issued = client.get(f"/invoices/{invoice_id}", headers=auth).json()
+    # Counted from the shop's day, not the server's or the database's. Between
+    # local midnight and dawn those disagree, and a due date a day out is a
+    # payment chased on the wrong morning — so the expected value is derived
+    # from what the shop itself thinks today is.
+    shop_today = client.get("/dashboard", headers=auth, params={"days": 7}).json()["as_of"]
+    expected_due = (date.fromisoformat(shop_today) + timedelta(days=30)).isoformat()
+    check(
+        "due date = the shop's day + term days",
+        issued["due_date"] == expected_due,
+        f"got {issued['due_date']}, expected {expected_due}",
+    )
 
     # Mark paid
     r = client.post(f"/invoices/{invoice_id}/mark-paid", headers=auth)
@@ -689,7 +741,7 @@ def main() -> int:
     check("delete customer (no FK) → 204", r.status_code == 204)
 
     vend = client.post("/vendors", headers=auth, json={
-        "name": "ToDelete Vend", "type": "other", "department_id": depts_by_code["POL"],
+        "name": "ToDelete Vend", "department_id": depts_by_code["MAKE"],
     }).json()
     r = client.delete(f"/vendors/{vend['id']}", headers=auth)
     check("delete vendor → 204", r.status_code == 204)
@@ -1068,17 +1120,22 @@ def main() -> int:
     # ----- MASTER DATA (phase 2) -----
     section("Master data")
 
-    # Departments ship seeded so a fresh install is usable immediately.
+    # Departments ship seeded so a fresh install is usable immediately: the
+    # three stages this shop runs, in the order work flows through them.
     r = client.get("/departments", headers=auth)
     depts = r.json()
-    check("9 departments seeded", r.status_code == 200 and len(depts) == 9, f"got {len(depts)}")
+    check("3 stages seeded", r.status_code == 200 and len(depts) == 3, f"got {len(depts)}")
     check(
-        "departments ordered by sequence",
-        [d["code"] for d in depts][:3] == ["RP", "CAST", "CLEAN"],
-        str([d["code"] for d in depts][:3]),
+        "stages ordered by sequence",
+        [d["code"] for d in depts] == ["MAKE", "SET", "LAC"],
+        str([d["code"] for d in depts]),
     )
     setting = next((d for d in depts if d["code"] == "SET"), None)
-    check("setting is the stone-consuming stage", setting and setting["consumes_stones"] is True)
+    check(
+        "the stone fixer is the stone-consuming stage",
+        setting and setting["consumes_stones"] is True and setting["name"] == "Stone Fixer",
+        str(setting),
+    )
 
     r = client.post("/departments", headers=auth, json={"name": "Enamel", "code": "enml", "sequence": 95})
     check("create department → 201", r.status_code == 201, f"got {r.status_code}")
@@ -1180,23 +1237,22 @@ def main() -> int:
     r = client.post("/customers", headers=auth, json={"name": "Bare Minimum"})
     check("name alone is still enough to create a customer", r.status_code == 201, f"got {r.status_code}")
 
-    # Workers gained a department, agreed wastage and opening balances.
-    casting_id = next(d["id"] for d in depts if d["code"] == "CAST")
+    # Workers gained a stage, agreed wastage and opening balances.
+    maker_id = next(d["id"] for d in depts if d["code"] == "MAKE")
     r = client.post(
         "/vendors",
         headers=auth,
         json={
             "name": "Zahid Bhai",
-            "type": "karigar",
-            "department_id": casting_id,
+            "department_id": maker_id,
             "default_wastage_pct": "3.5",
             "opening_gold_g": "12.5",
             "cnic": "42101-7654321-9",
         },
     )
-    check("create worker with department → 201", r.status_code == 201, f"got {r.status_code}")
+    check("create worker with a stage → 201", r.status_code == 201, f"got {r.status_code}")
     w = r.json()
-    check("worker department name resolved", w["department_name"] == "Casting", str(w))
+    check("worker stage name resolved", w["department_name"] == "Maker", str(w))
     check("worker opening gold stored", Decimal(str(w["opening_gold_g"])) == Decimal("12.5"))
     check(
         "worker's own wastage wins",
@@ -1207,15 +1263,20 @@ def main() -> int:
     r = client.post(
         "/vendors",
         headers=auth,
-        json={"name": "Inherits Dept Rate", "type": "other", "department_id": enamel_id},
+        json={"name": "Inherits Dept Rate", "department_id": enamel_id},
     )
     check(
-        "worker with no rate inherits the department's",
+        "worker with no rate inherits the stage's",
         Decimal(str(r.json()["effective_wastage_pct"])) == Decimal("2.0"),
         str(r.json().get("effective_wastage_pct")),
     )
-    r = client.delete(f"/departments/{casting_id}", headers=pwd_h)
-    check("delete department with workers → 409", r.status_code == 409, f"got {r.status_code}")
+    check(
+        "a stage outside the three legacy roles leaves the worker unlabelled",
+        r.json()["type"] == "other",
+        f"got {r.json().get('type')} — better absent from the old roll-up than filed wrong",
+    )
+    r = client.delete(f"/departments/{maker_id}", headers=pwd_h)
+    check("delete a stage with workers → 409", r.status_code == 409, f"got {r.status_code}")
 
     # Stones gained category / abbreviation / quality.
     r = client.post(
@@ -1251,10 +1312,27 @@ def main() -> int:
     r = client.get("/ledger/accounts", headers=auth)
     accounts = r.json()
     by_code = {a["code"]: a for a in accounts}
+    # Every code the posting services resolve by name must be present. Asserted
+    # as a set rather than a count on purpose: a count has to be edited every
+    # time the chart grows, and an off-by-one edit to make a test pass is
+    # exactly how a genuinely missing account gets waved through.
+    required = {
+        "1110", "1120", "1130", "1140", "1150", "1160",
+        "1210", "1215",
+        "2110", "2120",
+        "3100", "3200",
+        "4100", "4200", "4300",
+        "5100", "5200", "5300", "5400",
+    }
+    missing = sorted(required - set(by_code))
     check(
-        "chart of accounts seeded",
-        r.status_code == 200 and len(accounts) == 25,
-        f"got {len(accounts)}",
+        "chart of accounts has every system account",
+        r.status_code == 200 and not missing,
+        f"missing {missing}" if missing else f"got {len(accounts)}",
+    )
+    check(
+        "party metal and making income are postable system accounts",
+        all(by_code[c]["is_system"] and by_code[c]["is_postable"] for c in ("1215", "4300")),
     )
     check(
         "there is a head to relieve the cost of a sale to",
@@ -1430,6 +1508,188 @@ def main() -> int:
     r = client.get("/ledger/statement", headers=auth)
     check("statement without an account → 400", r.status_code == 400, f"got {r.status_code}")
 
+    # --- trade billing: gold charged in grams, not rupees ---
+    # A jeweller settles the metal in metal. The bill must state the fine grams
+    # to hand over and must NOT also price that same gold in rupees, or he is
+    # invoiced for it twice in two different units.
+    r = client.post(
+        "/customers", headers=auth, json={"name": "Sarafa Trading Co", "is_trade": True}
+    )
+    check("create a trade customer → 201", r.status_code == 201, f"got {r.status_code}")
+    jeweller = r.json()
+    check("the customer is marked as trade", jeweller.get("is_trade") is True, str(jeweller.get("is_trade")))
+
+    r = client.post(
+        "/invoices",
+        headers=auth,
+        json={
+            "customer_id": jeweller["id"],
+            "sale_type": "normal",
+            "currency": "PKR",
+            "gold_rate_per_g": "6500",
+            "items": [
+                {
+                    "description": "Trade ring",
+                    "quantity": 1,
+                    "gold_weight_g": "10",
+                    "gold_purity": 22,
+                    "stone_weight_ct": "0.5",
+                    "stone_rate_per_ct": "80000",
+                    "labor_amount": "5000",
+                }
+            ],
+        },
+    )
+    check("bill a trade customer → 201", r.status_code == 201, f"got {r.status_code}: {r.text[:200]}")
+    tb = r.json()
+    check(
+        "a trade customer's bill charges gold in grams",
+        tb["gold_charged_in"] == "grams",
+        str(tb.get("gold_charged_in")),
+    )
+    check(
+        "the gold is not priced on a trade bill",
+        Decimal(str(tb["items"][0]["gold_amount"])) == 0,
+        str(tb["items"][0]["gold_amount"]),
+    )
+    check(
+        "the cash total is stones and making only",
+        Decimal(str(tb["total"])) == Decimal("45000.00"),
+        str(tb["total"]),
+    )
+    check(
+        "the bill states the fine grams to hand over",
+        Decimal(str(tb["metal_due_fine_g"])) == Decimal("9.1667"),
+        str(tb["metal_due_fine_g"]),
+    )
+    r = client.post(f"/invoices/{tb['id']}/issue", headers=pwd_h)
+    check("issue a trade bill → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:200]}")
+    # The metal obligation has to reach the party's metal account, or the shop
+    # has sold gold it will never chase.
+    r = client.get(
+        "/ledger/party-statement",
+        headers=auth,
+        params={"party_type": "customer", "party_id": jeweller["id"]},
+    )
+    tps = r.json()
+    check(
+        "issuing a trade bill puts metal on the jeweller's account",
+        Decimal(str(tps["closing_metal_g"])) == Decimal("9.1667"),
+        str(tps.get("closing_metal_g")),
+    )
+    check(
+        "and the cash side carries only the stones and making",
+        Decimal(str(tps["closing_cash"])) == Decimal("45000.00"),
+        str(tps.get("closing_cash")),
+    )
+
+    # The counter path must be untouched by all of this.
+    r = client.post(
+        "/invoices",
+        headers=auth,
+        json={
+            "customer_id": customer_id,
+            "sale_type": "normal",
+            "currency": "PKR",
+            "gold_rate_per_g": "6500",
+            "items": [
+                {
+                    "description": "Counter ring",
+                    "quantity": 1,
+                    "gold_weight_g": "10",
+                    "gold_purity": 22,
+                    "stone_weight_ct": "0.5",
+                    "stone_rate_per_ct": "80000",
+                    "labor_amount": "5000",
+                }
+            ],
+        },
+    )
+    cb = r.json()
+    check(
+        "a counter customer's bill still charges gold in rupees",
+        cb["gold_charged_in"] == "rupees",
+        str(cb.get("gold_charged_in")),
+    )
+    check(
+        "the counter bill prices the gold and owes no metal",
+        Decimal(str(cb["items"][0]["gold_amount"])) > 0
+        and Decimal(str(cb["metal_due_fine_g"])) == 0,
+        f"gold={cb['items'][0]['gold_amount']} metal={cb['metal_due_fine_g']}",
+    )
+    check(
+        "the two bills differ by exactly the priced gold",
+        Decimal(str(cb["total"])) - Decimal(str(tb["total"]))
+        == Decimal(str(cb["items"][0]["gold_amount"])),
+        f"{cb['total']} - {tb['total']} vs {cb['items'][0]['gold_amount']}",
+    )
+
+    # --- party statement: the wholesale account, in metal and money at once ---
+    # The document a jeweller dealing with other jewellers actually keeps. The
+    # two columns must never be netted: the metal side is unpriced on purpose,
+    # because the rate is agreed on the day the gold moves and not on the day
+    # the bill was written.
+    r = client.get(
+        "/ledger/party-statement",
+        headers=auth,
+        params={"party_type": "customer", "party_id": customer_id},
+    )
+    check("party statement → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:200]}")
+    ps = r.json()
+    check("party statement names the party", bool(ps.get("party_name")), str(ps.get("party_name")))
+    check(
+        "metal and cash are reported as separate closing figures",
+        "closing_metal_g" in ps and "closing_cash" in ps,
+        str(list(ps)),
+    )
+    check(
+        "the cash column foots against its opening and period totals",
+        Decimal(str(ps["closing_cash"]))
+        == Decimal(str(ps["opening_cash"]))
+        + Decimal(str(ps["cash_debit_total"]))
+        - Decimal(str(ps["cash_credit_total"])),
+        f"{ps['opening_cash']} + {ps['cash_debit_total']} - {ps['cash_credit_total']} "
+        f"!= {ps['closing_cash']}",
+    )
+    check(
+        "the metal column foots independently of the cash one",
+        Decimal(str(ps["closing_metal_g"]))
+        == Decimal(str(ps["opening_metal_g"]))
+        + Decimal(str(ps["metal_in_total_g"]))
+        - Decimal(str(ps["metal_out_total_g"])),
+        f"{ps['opening_metal_g']} + {ps['metal_in_total_g']} - {ps['metal_out_total_g']} "
+        f"!= {ps['closing_metal_g']}",
+    )
+    check(
+        "one row per document, not one per posting",
+        len({row["entry_id"] for row in ps["rows"]}) == len(ps["rows"]),
+        f"{len(ps['rows'])} rows, {len({row['entry_id'] for row in ps['rows']})} entries",
+    )
+    if ps["rows"]:
+        check(
+            "the running cash balance continues down the page",
+            Decimal(str(ps["rows"][-1]["cash_balance"])) == Decimal(str(ps["closing_cash"])),
+            f"{ps['rows'][-1]['cash_balance']} vs {ps['closing_cash']}",
+        )
+        check(
+            "each row names the document that caused it",
+            all(row["entry_no"] for row in ps["rows"]),
+        )
+    # A party with nothing against them is an empty account, not an error — the
+    # screen has to open before the first trade, or it can never show the first.
+    r = client.get(
+        "/ledger/party-statement",
+        headers=auth,
+        params={"party_type": "salesman", "party_id": 999999},
+    )
+    check("statement for a party with no activity → 200", r.status_code == 200, f"got {r.status_code}")
+    empty = r.json()
+    check(
+        "an untraded account opens at zero on both columns",
+        Decimal(str(empty["closing_metal_g"])) == 0 and Decimal(str(empty["closing_cash"])) == 0,
+        str(empty.get("closing_metal_g")),
+    )
+
     # --- trial balance ---
     r = client.get("/ledger/trial-balance", headers=auth)
     tb = r.json()
@@ -1533,7 +1793,7 @@ def main() -> int:
         f"/designs/{design['id']}/legs",
         headers=auth,
         json={
-            "department_id": casting_id,
+            "department_id": maker_id,
             "worker_id": w["id"],
             "gold_issued_g": "100",
             "gold_issued_purity": 22,
@@ -1542,7 +1802,7 @@ def main() -> int:
             "labour_rate": "150",
         },
     )
-    check("issue to casting → 201", r.status_code == 201, f"got {r.status_code}: {r.text[:250]}")
+    check("issue to the maker → 201", r.status_code == 201, f"got {r.status_code}: {r.text[:250]}")
     leg = r.json()
     check(
         "agreed wastage snapshotted onto the leg at issue",
@@ -1550,30 +1810,31 @@ def main() -> int:
         str(leg.get("wastage_allowed_pct")),
     )
     r = client.get(f"/designs/{design['id']}", headers=auth)
-    check("design now sits in casting", r.json()["current_department_id"] == casting_id)
+    check("design now sits with the maker", r.json()["current_department_id"] == maker_id)
 
     # One pair of hands at a time.
     r = client.post(
         f"/designs/{design['id']}/legs",
         headers=auth,
         json={
-            "department_id": casting_id, "worker_id": w["id"], "gold_issued_g": "5",
+            "department_id": maker_id, "worker_id": w["id"], "gold_issued_g": "5",
             "gold_source_inventory_id": raw_gold["id"],
         },
     )
     check("second open leg refused → 409", r.status_code == 409, f"got {r.status_code}")
 
-    # A worker from the wrong department must be refused.
-    polish_dept_id = next(d_["id"] for d_ in depts if d_["code"] == "POL")
+    # A worker from the wrong stage must be refused: the maker cannot be handed
+    # a stone-setting leg.
+    fixer_dept_id = next(d_["id"] for d_ in depts if d_["code"] == "SET")
     r = client.post(
         f"/designs/{d2['id']}/legs",
         headers=auth,
         json={
-            "department_id": polish_dept_id, "worker_id": w["id"], "gold_issued_g": "5",
+            "department_id": fixer_dept_id, "worker_id": w["id"], "gold_issued_g": "5",
             "gold_source_inventory_id": raw_gold["id"],
         },
     )
-    check("worker from another department refused → 400", r.status_code == 400, f"got {r.status_code}")
+    check("worker from another stage refused → 400", r.status_code == 400, f"got {r.status_code}")
 
     # --- the settlement that matters ---
     # 100g out, 94g back. Actual loss 6g; allowed 3.5g; so 2.5g is Zahid's.
@@ -1600,7 +1861,7 @@ def main() -> int:
         f"got {worker_gold(w['id'])}, expected 104.1667",
     )
     r = client.post(f"/designs/legs/{leg['id']}/receive", headers=auth, json={"gold_received_g": "94"})
-    check("receive from casting → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:250]}")
+    check("receive from the maker → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:250]}")
     settled = r.json()
     check(
         "actual wastage = issued - received",
@@ -1651,25 +1912,25 @@ def main() -> int:
     r = client.post(f"/designs/legs/{leg['id']}/receive", headers=auth, json={"gold_received_g": "94"})
     check("receiving a leg twice refused → 409", r.status_code == 409, f"got {r.status_code}")
 
-    # --- an in-house stage has no worker, and no one to charge a shortfall to ---
-    # Cleaning, burning, rhodium and finish are done on the shop's own bench.
-    # Requiring a worker there would mean inventing a record for the shop
-    # itself, which then shows up in the wastage reports as a party losing you
-    # metal. The leg still tracks the gram; it just carries no ledger party.
-    fin_dept_id = next(d_["id"] for d_ in depts if d_["code"] == "FIN")
+    # --- a stage done in-house has no worker, and no one to charge a shortfall to ---
+    # Lacquering is the one the shop does on its own bench. Requiring a worker
+    # there would mean inventing a record for the shop itself, which then shows
+    # up in the wastage reports as a party losing you metal. The leg still
+    # tracks the gram; it just carries no ledger party.
+    lac_dept_id = next(d_["id"] for d_ in depts if d_["code"] == "LAC")
     inhouse_design = client.post("/designs", headers=auth, json={"item_id": taka_id}).json()
     r = client.post(
         f"/designs/{inhouse_design['id']}/legs",
         headers=auth,
         json={
-            "department_id": fin_dept_id, "gold_issued_g": "10",
+            "department_id": lac_dept_id, "gold_issued_g": "10",
             "gold_issued_purity": 22, "gold_source_inventory_id": raw_gold["id"],
         },
     )
     check(
         "issue to an in-house stage with no worker → 201",
         r.status_code == 201,
-        f"got {r.status_code}: {r.text[:220]} — five of eleven departments have no worker",
+        f"got {r.status_code}: {r.text[:220]} — a stage the shop does itself has nobody to name",
     )
     inhouse_leg = r.json()
     check("the leg carries no worker", inhouse_leg.get("worker_id") is None, str(inhouse_leg.get("worker_id")))
@@ -1699,15 +1960,14 @@ def main() -> int:
     )
 
     # --- a heavier return is legitimate, not an error ---
-    # The polisher was created before departments existed on workers, so give
-    # him one — the routing engine refuses a worker from the wrong department.
-    client.patch(f"/vendors/{polisher['id']}", headers=auth, json={"department_id": polish_dept_id})
+    # Lacquer adds weight. A piece that comes back heavier is the normal
+    # outcome of that stage, not a data-entry mistake.
     r = client.post(
         f"/designs/{design['id']}/legs",
         headers=auth,
         json={
-            "department_id": polish_dept_id,
-            "worker_id": polisher["id"],
+            "department_id": lac_dept_id,
+            "worker_id": lacker["id"],
             "gold_issued_g": "94",
             "gold_issued_purity": 22,
             "gold_source_inventory_id": raw_gold["id"],
@@ -1715,10 +1975,10 @@ def main() -> int:
             "labour_rate": "500",
         },
     )
-    check("issue to polish → 201", r.status_code == 201, f"got {r.status_code}: {r.text[:200]}")
-    polish_leg = r.json()
+    check("issue to the lacker → 201", r.status_code == 201, f"got {r.status_code}: {r.text[:200]}")
+    coat_leg = r.json()
     r = client.post(
-        f"/designs/legs/{polish_leg['id']}/receive", headers=auth, json={"gold_received_g": "95"}
+        f"/designs/legs/{coat_leg['id']}/receive", headers=auth, json={"gold_received_g": "95"}
     )
     check("a heavier return is accepted → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:200]}")
     check(
@@ -1745,8 +2005,8 @@ def main() -> int:
     check(
         "trace lists both hops in order",
         len(hops) == 2
-        and hops[0]["department"] == "Casting"
-        and hops[1]["department"] == "Polish",
+        and hops[0]["department"] == "Maker"
+        and hops[1]["department"] == "Lacker",
         str([h.get("department") for h in hops]),
     )
     check(
@@ -1761,7 +2021,7 @@ def main() -> int:
         f"/designs/{d2['id']}/legs",
         headers=auth,
         json={
-            "department_id": casting_id, "worker_id": w["id"], "gold_issued_g": "20",
+            "department_id": maker_id, "worker_id": w["id"], "gold_issued_g": "20",
             "gold_issued_purity": 22, "gold_source_inventory_id": raw_gold["id"],
         },
     )
@@ -1989,24 +2249,21 @@ def main() -> int:
     check("books balance after a per-100 settlement", r.json()["balanced"] is True)
 
     # --- lacker: weight out, weight in, difference, charge per item ---
-    r = client.post(
-        "/departments",
-        headers=auth,
-        json={"name": "Lacker", "code": "LAC", "sequence": 85, "default_rate_per_piece": "500"},
+    # The stage ships seeded; the shop only has to put its own rate on it.
+    r = client.patch(
+        f"/departments/{lac_dept_id}", headers=auth, json={"default_rate_per_piece": "500"}
     )
-    check("create the lacker department → 201", r.status_code == 201, f"got {r.status_code}")
-    lac_dept = r.json()
-    lacquerer = client.post(
-        "/vendors",
-        headers=auth,
-        json={"name": "Coating Wala", "type": "other", "department_id": lac_dept["id"]},
-    ).json()
+    check(
+        "the lacker's per-item rate is agreed once on the stage → 200",
+        r.status_code == 200 and Decimal(str(r.json()["default_rate_per_piece"])) == Decimal("500"),
+        f"got {r.status_code}: {r.text[:150]}",
+    )
     r = client.post(
         f"/designs/{set_design['id']}/legs",
         headers=auth,
         json={
-            "department_id": lac_dept["id"],
-            "worker_id": lacquerer["id"],
+            "department_id": lac_dept_id,
+            "worker_id": lacker["id"],
             "gold_issued_g": "48",
             "gold_issued_purity": 22,
             "gold_source_inventory_id": raw_gold["id"],
@@ -2054,43 +2311,66 @@ def main() -> int:
 
     # ----- AI INSIGHTS (degrade-without-a-provider contract) -----
     section("AI insights")
-    r = client.get("/insights/wastage-anomalies", headers=auth, params={"days": 90})
+    r = ai_client.get("/insights/wastage-anomalies", headers=auth, params={"days": 90})
     check(
         "wastage analysis returns figures with no model configured",
         r.status_code == 200,
         f"got {r.status_code}: {r.text[:200]}",
     )
-    r = client.get("/insights/margin-watch", headers=auth, params={"days": 90})
+    r = ai_client.get("/insights/margin-watch", headers=auth, params={"days": 90})
     check(
         "margin watch returns figures with no model configured",
         r.status_code == 200,
         f"got {r.status_code}: {r.text[:200]}",
     )
-    r = client.post("/insights/ask", headers=auth, json={"question": "kitna sona Zahid ke paas hai"})
-    check(
-        "ask returns a clean 503 when no model is configured",
-        r.status_code == 503,
-        f"got {r.status_code}: {r.text[:200]}",
+    # Whether a model is configured is a property of the machine, not of the
+    # code, so the assertions below adapt rather than encoding one setup. What
+    # is invariant either way is that the AI layer never 500s: unconfigured it
+    # explains itself, configured it either answers or fails with the
+    # provider's own reason. A traceback is the one unacceptable outcome, and
+    # is exactly what an out-of-credit key used to produce.
+    ai_on = ai_client.get("/insights/margin-watch", headers=auth, params={"days": 90}).json().get(
+        "ai_enabled", False
     )
+    r = ai_client.post("/insights/ask", headers=auth, json={"question": "kitna sona Zahid ke paas hai"})
+    if ai_on:
+        check(
+            "ask does not fall over when a model is configured",
+            r.status_code in (200, 400, 502),
+            f"got {r.status_code}: {r.text[:200]}",
+        )
+    else:
+        check(
+            "ask returns a clean 503 when no model is configured",
+            r.status_code == 503,
+            f"got {r.status_code}: {r.text[:200]}",
+        )
     r = client.get("/insights/wastage-anomalies", headers=staff_auth, params={"days": 90})
     check("staff cannot read the wastage analysis → 403", r.status_code == 403, f"got {r.status_code}")
 
     # --- the assistant ---
     # A data question here takes exactly the /ask path, so it is exactly as
     # sensitive and fails exactly as cleanly.
-    r = client.post("/insights/chat", headers=auth, json={
+    r = ai_client.post("/insights/chat", headers=auth, json={
         "messages": [{"role": "user", "content": "kitna sona Zahid ke paas hai"}],
     })
-    check(
-        "the assistant returns a clean 503 when no model is configured",
-        r.status_code == 503,
-        f"got {r.status_code}: {r.text[:200]} — an unconfigured model must not 500",
-    )
-    check(
-        "and the 503 says how to configure it",
-        "AI_PROVIDER" in r.text,
-        "a 503 nobody can act on is the same as a crash",
-    )
+    if ai_on:
+        check(
+            "the assistant answers or fails cleanly, never with a traceback",
+            r.status_code in (200, 400, 502),
+            f"got {r.status_code}: {r.text[:200]}",
+        )
+    else:
+        check(
+            "the assistant returns a clean 503 when no model is configured",
+            r.status_code == 503,
+            f"got {r.status_code}: {r.text[:200]} — an unconfigured model must not 500",
+        )
+        check(
+            "and the 503 says how to configure it",
+            "AI_PROVIDER" in r.text,
+            "a 503 nobody can act on is the same as a crash",
+        )
     r = client.post("/insights/chat", headers=staff_auth, json={
         "messages": [{"role": "user", "content": "what is the margin"}],
     })
@@ -2103,16 +2383,25 @@ def main() -> int:
     check("an empty conversation is rejected → 422", r.status_code == 422, f"got {r.status_code}")
 
     # --- generated images ---
-    r = client.post(
+    r = ai_client.post(
         f"/products/{finished_product_id}/image/generate",
         headers=auth,
         data={"prompt": "a 22k gold taka pendant with a floral border", "attach": "false"},
     )
     check(
-        "image generation returns a clean 503 when unconfigured",
-        r.status_code == 503,
-        f"got {r.status_code}: {r.text[:200]}",
+        "image generation never 500s, configured or not",
+        r.status_code in (200, 502, 503),
+        f"got {r.status_code}: {r.text[:220]}",
     )
+    if r.status_code == 502:
+        # Worth its own assertion: the provider's own words are what tell the
+        # operator whether to top up, fix a model name, or wait — and those are
+        # three different actions.
+        check(
+            "and a provider refusal carries the provider's reason",
+            len(r.text) > 40,
+            f"got {r.text[:160]}",
+        )
     r = client.post(
         "/products/999999/image/generate", headers=auth, data={"prompt": "anything at all"}
     )
@@ -2528,10 +2817,22 @@ def main() -> int:
         - Decimal(str(total["round_off"]))
         - Decimal(str(total["making_cost"]))
     )
+    # Paisa-level drift per line, plus a gram-level allowance per bill.
+    #
+    # The levers decompose an unrounded weight; a trade bill's metal obligation
+    # is stored to four decimal places because that is the figure the customer
+    # is actually handed and the ledger actually posts. At a four-figure gold
+    # rate the fourth decimal of a gram is worth most of a rupee, so a bill that
+    # settles in metal can differ from its own decomposition by more than the
+    # per-line paisa tolerance — without anything being wrong. Bounded and
+    # named rather than widened silently.
+    tolerance = Decimal("0.05") * max(total["lines"], 1) + Decimal("1.00") * max(
+        total["invoices"], 1
+    )
     check(
         "the levers add up to gross profit",
-        abs(attributed - Decimal(str(total["gross_profit"]))) <= Decimal("0.05") * max(total["lines"], 1),
-        f"levers {attributed} vs gross {total['gross_profit']}",
+        abs(attributed - Decimal(str(total["gross_profit"]))) <= tolerance,
+        f"levers {attributed} vs gross {total['gross_profit']} (tolerance {tolerance})",
     )
     check(
         "wastage charged to customers is reported as its own lever",
@@ -2586,6 +2887,37 @@ def main() -> int:
 
     r = client.get("/reports/margin", headers=staff_auth)
     check("staff cannot read the margin report → 403", r.status_code == 403, f"got {r.status_code}")
+
+    # ----- DASHBOARD -----
+    section("Dashboard")
+    r = client.get("/dashboard", headers=auth, params={"days": 14})
+    check("dashboard → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:200]}")
+    dash = r.json()
+    check(
+        "one day per day asked for, with none missing",
+        len(dash["series"]) == 14,
+        f"got {len(dash['series'])} — a gap in the series draws as a crash in the chart",
+    )
+    check(
+        "the series ends today",
+        dash["series"][-1]["day"] == date.today().isoformat(),
+        f"got {dash['series'][-1]['day']}",
+    )
+    check(
+        "the position on the dashboard is the position in the ledger",
+        Decimal(str(dash["today"]["gold_in_hand_g"]))
+        == Decimal(str(client.get("/ledger/position", headers=auth).json()["gold_in_hand_g"])),
+        "two screens showing different metal is worse than one showing none",
+    )
+    check(
+        "an alert carries somewhere to go and fix it",
+        all(a_.get("to") and a_.get("label") for a_ in dash["alerts"]),
+        str(dash["alerts"]),
+    )
+    # The screen shows the cash position, so it is gated like the sales report
+    # rather than being readable by anyone who can log in.
+    r = client.get("/dashboard", headers=staff_auth)
+    check("staff cannot read the dashboard figures → 403", r.status_code == 403, f"got {r.status_code}")
 
     # ----- MULTI-CURRENCY: a dollar bill, end to end -----
     section("Multi-currency")

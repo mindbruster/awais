@@ -23,6 +23,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import Integer, case, cast, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import clock
 from app.core import lock_keys
 from app.models.account import SystemAccount
 from app.models.currency import Currency
@@ -32,6 +33,7 @@ from app.models.journal import Commodity, JournalEntry, PartyType
 from app.models.payment import Payment, PaymentDirection, PaymentMethod
 from app.models.product import Product
 from app.services import fx
+from app.services import gold_rate as gold_rate_svc
 from app.services.ledger import (
     EntryDraft,
     Posting,
@@ -102,7 +104,7 @@ async def _invoice_fx(db: AsyncSession, invoice: Invoice) -> Decimal:
     if invoice.fx_rate_to_pkr is not None:
         return d(invoice.fx_rate_to_pkr)
     rate = await fx.require_rate(
-        db, invoice.currency, as_of=(invoice.issued_at.date() if invoice.issued_at else None)
+        db, invoice.currency, as_of=clock.shop_date(invoice.issued_at)
     )
     invoice.fx_rate_to_pkr = rate
     return rate
@@ -138,7 +140,11 @@ async def post_invoice_issued(
     commodity = Commodity.USD if foreign else Commodity.PKR
 
     total = d(invoice.total).quantize(_PKR)
-    if total == 0:
+    # Fine grams the buyer owes in metal. Non-zero only on a trade bill, where
+    # the gold was never priced — so a bill can legitimately have no money on it
+    # at all and still be a real debt.
+    metal_due = d(invoice.metal_due_fine_g).quantize(Decimal("0.0001"))
+    if total == 0 and metal_due == 0:
         return None
 
     draft = EntryDraft(
@@ -146,26 +152,97 @@ async def post_invoice_issued(
         source_type=INVOICE_SOURCE,
         source_id=invoice.id,
     )
-    draft.add(
-        Posting(
-            account_code=SystemAccount.CUSTOMERS.value,
-            quantity=total,
-            commodity=commodity,
-            rate=fx_rate,
-            party_type=PartyType.customer,
-            party_id=invoice.customer_id,
-            memo=f"Invoice {invoice.invoice_no}",
+
+    # The money side. On a trade bill this is stones and making only; the metal
+    # is the separate obligation below.
+    if total != 0:
+        draft.add(
+            Posting(
+                account_code=SystemAccount.CUSTOMERS.value,
+                quantity=total,
+                commodity=commodity,
+                rate=fx_rate,
+                party_type=PartyType.customer,
+                party_id=invoice.customer_id,
+                memo=f"Invoice {invoice.invoice_no}",
+            )
         )
-    )
-    draft.add(
-        Posting(
-            account_code=SystemAccount.SALES.value,
-            quantity=-total,
-            commodity=commodity,
-            rate=fx_rate,
-            memo=f"Invoice {invoice.invoice_no}",
+
+    # The metal side, in fine grams against the party's running metal account.
+    # Valued at the day's rate purely so the entry balances and the trial
+    # balance has a number — the *obligation* is the grams, and the rate the
+    # jeweller eventually settles at is agreed on the day the metal moves.
+    metal_value = Decimal("0")
+    if metal_due != 0:
+        gold_rate = d(invoice.gold_rate_per_g)
+        if gold_rate <= 0:
+            # A trade bill needs no rate to be *written* — the metal is settled
+            # in metal — but the books cannot carry an asset with no value at
+            # all, or the trial balance reports the shop is owed nothing. Fall
+            # back to the day's rate, and refuse rather than post at zero.
+            row = await gold_rate_svc.rate_in_force(
+                db, currency=Currency.PKR, purity=24, as_of=clock.shop_date(invoice.issued_at)
+            )
+            if row is None:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "No gold rate is on record, so the metal on this bill cannot be "
+                    "valued for the books. Set today's rate and issue it again.",
+                )
+            gold_rate = d(row.rate_per_g)
+            # Snapshotted onto the bill, exactly as the FX rate is. Everything
+            # downstream — the margin report above all — reads the metal's value
+            # back off `gold_rate_per_g`, and if the posting quietly used a rate
+            # the invoice never recorded, the books and the profit report would
+            # value the same gold differently and neither would say why.
+            invoice.gold_rate_per_g = gold_rate
+        metal_value = (metal_due * gold_rate).quantize(_PKR)
+        draft.add(
+            Posting(
+                account_code=SystemAccount.PARTY_METAL.value,
+                quantity=metal_due,
+                commodity=Commodity.GOLD,
+                rate=gold_rate,
+                party_type=PartyType.customer,
+                party_id=invoice.customer_id,
+                memo=f"Invoice {invoice.invoice_no} — gold to take",
+            )
         )
-    )
+
+    # Making is its own income line. It is the wholesaler's actual margin —
+    # metal largely passes through at cost — and folding it into Sales is what
+    # made the profit report unable to say where a month's money came from.
+    # Converted to rupees like everything else on the entry: `labor_amount` is
+    # in the bill's own currency, and crediting a dollar figure straight into a
+    # rupee income account would understate making by the exchange rate.
+    labour = (
+        sum(
+            (d(it.labor_amount) * (it.quantity or 1) for it in invoice.items),
+            Decimal("0"),
+        )
+        * fx_rate
+    ).quantize(_PKR)
+    # Clamped to what was actually billed. Discounts come off Sales rather than
+    # off Making, and without the clamp a heavily discounted bill would credit
+    # more making income than the customer was charged in total.
+    revenue = (total * fx_rate).quantize(_PKR) + metal_value
+    labour = min(max(labour, Decimal("0")), revenue)
+    if labour != 0:
+        draft.add(
+            Posting(
+                account_code=SystemAccount.MAKING_INCOME.value,
+                quantity=-labour,
+                memo=f"Invoice {invoice.invoice_no} — making",
+            )
+        )
+    if revenue - labour != 0:
+        draft.add(
+            Posting(
+                account_code=SystemAccount.SALES.value,
+                quantity=-(revenue - labour),
+                memo=f"Invoice {invoice.invoice_no}",
+            )
+        )
 
     for item in invoice.items:
         if item.product_id is None:
@@ -328,7 +405,7 @@ async def post_payment(
     if invoice is not None and payment.currency is invoice.currency:
         fx_rate = await _invoice_fx(db, invoice)
     else:
-        fx_rate = await fx.require_rate(db, payment.currency, as_of=payment.paid_at.date())
+        fx_rate = await fx.require_rate(db, payment.currency, as_of=clock.shop_date(payment.paid_at))
     payment.fx_rate_to_pkr = fx_rate
     commodity = Commodity.USD if payment.currency is not Currency.PKR else Commodity.PKR
 

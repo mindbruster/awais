@@ -18,6 +18,10 @@ class InventoryItemBase(BaseModel):
 
 
 class InventoryItemCreate(InventoryItemBase):
+    # Which shop this belongs to. Optional: left unset it falls back to the
+    # user's own branch, then to the default, so a single-shop business
+    # never sees the field and a multi-shop one can be explicit.
+    branch_id: int | None = None
     pass
 
 
@@ -33,4 +37,7 @@ class InventoryItemUpdate(BaseModel):
 
 
 class InventoryItemRead(TimestampedRead, InventoryItemBase):
-    pass
+    # Which shop holds this. Always set on a stored row, so the client can
+    # show and filter by it without a second lookup.
+    branch_id: int | None = None
+

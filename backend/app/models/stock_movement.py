@@ -16,6 +16,13 @@ class MovementType(str, enum.Enum):
     sale_return_in = "sale_return_in"
     approval_out = "approval_out"         # left for on-approval (tracked, but stock stays per business rule? we still record)
     approval_return_in = "approval_return_in"
+    # Stock leaving one branch for another, and arriving. Kept apart from
+    # `adjustment` because nothing was corrected — the same metal is still the
+    # shop's, it has only moved — and a stock report that reads a transfer as
+    # an adjustment shows every branch-to-branch move as an unexplained
+    # write-off at one end and a windfall at the other.
+    transfer_out = "transfer_out"
+    transfer_in = "transfer_in"
     adjustment = "adjustment"             # manual correction
 
 

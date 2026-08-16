@@ -1,5 +1,6 @@
 """
-Purchasing: old gold over the counter, and stones from suppliers.
+Purchasing: bullion from a dealer, old gold over the counter, and stones from
+suppliers.
 
 Two channels the shop lives on that the system could not previously see. Both
 move real material and real money, so each one writes stock *and* books in a
@@ -10,19 +11,25 @@ The stone-stock report at the bottom is the reason the stone side exists at
 all: it is what finally answers "how much 12 PTR commercial do I have left",
 which no screen in this system could answer before.
 """
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import desc, select
 
+from app.core import clock
 from app.api.deps import CurrentUser, DbSession, require_password_confirm, require_perm
 from app.api.v1.masters import make_master_router
 from app.models.currency import Currency
 from app.models.customer import Customer
 from app.models.journal import JournalEntry
+from app.models.branch import Branch
+from app.models.bank import BankAccount
 from app.models.purchase import (
     GoldKind,
+    GoldPaymentMode,
+    GoldPurchase,
+    GoldPurchaseItem,
     OldGoldPurchase,
     StonePurchase,
     StonePurchaseItem,
@@ -31,6 +38,10 @@ from app.models.purchase import (
 from app.models.stock_movement import MovementType
 from app.models.stone import Stone, StoneCategory
 from app.schemas.purchase import (
+    GoldPurchaseCreate,
+    GoldPurchaseDetail,
+    GoldPurchaseItemRead,
+    GoldPurchaseRead,
     OldGoldCreate,
     OldGoldRead,
     StonePurchaseCreate,
@@ -43,7 +54,7 @@ from app.schemas.purchase import (
     SupplierRead,
     SupplierUpdate,
 )
-from app.services import fx, purchasing
+from app.services import branches, fx, purchasing
 from app.services.audit import log_action
 from app.services.gold_rate import rate_in_force
 from app.services.inventory import post_movement
@@ -207,7 +218,7 @@ async def buy_old_gold(
     # loud. No rate on record is not an obstacle — a buy-back is priced by
     # negotiation, not by the board — so the check simply does not run.
     paid_per_fine = purchasing.effective_fine_rate(amount, fine)
-    market = await rate_in_force(db, currency=Currency.PKR, purity=24, as_of=purchased_at.date())
+    market = await rate_in_force(db, currency=Currency.PKR, purity=24, as_of=clock.shop_date(purchased_at))
     if (
         market is not None
         and d(market.rate_per_g) > 0
@@ -221,7 +232,8 @@ async def buy_old_gold(
             "the margin. Lower the rate, or send allow_above_market to book it anyway.",
         )
 
-    item = await purchasing.raw_gold_item(db, purity=purity)
+    buy_branch = await branches.resolve_branch(db, requested_id=payload.branch_id, user=current)
+    item = await purchasing.raw_gold_item(db, purity=purity, branch_id=buy_branch.id)
     purchase = OldGoldPurchase(
         purchase_no=await purchasing.next_old_gold_no(db),
         customer_id=payload.customer_id,
@@ -435,6 +447,10 @@ async def create_stone_purchase(
     if supplier is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Supplier not found")
 
+    # Stones land in the packet at the branch that bought them, so that a bill
+    # taken at one shop cannot silently top up another shop's shelf.
+    buy_branch = await branches.resolve_branch(db, requested_id=payload.branch_id, user=current)
+
     stone_ids = {i.stone_id for i in payload.items}
     stones = {
         s.id: s
@@ -485,7 +501,8 @@ async def create_stone_purchase(
         subtotal += amount
 
         item = await purchasing.raw_stone_item(
-            db, stone=stone, quality=quality, cut=cut, color=color, clarity=clarity
+            db, stone=stone, quality=quality, cut=cut, color=color, clarity=clarity,
+            branch_id=buy_branch.id,
         )
         row = StonePurchaseItem(
             purchase_id=purchase.id,
@@ -668,4 +685,331 @@ async def stone_stock(
         total_purchased_weight_ct=sum((r.purchased_weight_ct for r in rows), _ZERO),
         total_used_weight_ct=sum((r.used_weight_ct for r in rows), _ZERO),
         total_available_weight_ct=sum((r.available_weight_ct for r in rows), _ZERO),
+    )
+
+
+# --------------------------------------------------------------------------
+# Gold purchases (from a dealer)
+# --------------------------------------------------------------------------
+def _gold_item_read(i: GoldPurchaseItem) -> GoldPurchaseItemRead:
+    return GoldPurchaseItemRead(
+        id=i.id,
+        created_at=i.created_at,
+        updated_at=i.updated_at,
+        purchase_id=i.purchase_id,
+        description=i.description,
+        purity=i.purity,
+        weight_g=d(i.weight_g),
+        rate_per_g=d(i.rate_per_g),
+        currency=i.currency,
+        fx_rate_to_pkr=d(i.fx_rate_to_pkr),
+        amount=d(i.amount),
+        fine_weight_g=fine_grams(i.weight_g, i.purity),
+        inventory_item_id=i.inventory_item_id,
+        notes=i.notes,
+    )
+
+
+def _gold_purchase_read(
+    p: GoldPurchase, *, entry_no: str | None = None, reversal_no: str | None = None
+) -> GoldPurchaseRead:
+    total = d(p.total)
+    fine = sum((fine_grams(i.weight_g, i.purity) for i in p.items), _ZERO)
+    return GoldPurchaseRead(
+        id=p.id,
+        created_at=p.created_at,
+        updated_at=p.updated_at,
+        purchase_no=p.purchase_no,
+        supplier_id=p.supplier_id,
+        supplier_name=p.supplier.name if p.supplier else None,
+        branch_id=p.branch_id,
+        branch_name=None,
+        purchased_at=p.purchased_at,
+        reference=p.reference,
+        payment_mode=p.payment_mode,
+        bank_account_id=p.bank_account_id,
+        subtotal=d(p.subtotal),
+        extra_cost_pct=d(p.extra_cost_pct),
+        extra_cost_amount=(total - d(p.subtotal)).quantize(Decimal("0.01")),
+        total=total,
+        item_count=len(p.items),
+        total_weight_g=sum((d(i.weight_g) for i in p.items), _ZERO),
+        total_fine_g=fine,
+        # Loading included, against fine grams — the only figure that can
+        # honestly be held up against the day's rate.
+        effective_rate_per_fine_g=(
+            purchasing.effective_fine_rate(total, fine) if fine > 0 else _ZERO
+        ),
+        journal_entry_id=p.journal_entry_id,
+        journal_entry_no=entry_no,
+        is_reversed=reversal_no is not None,
+        reversal_entry_no=reversal_no,
+        notes=p.notes,
+    )
+
+
+async def _load_gold_purchase(db: DbSession, purchase_id: int) -> GoldPurchase:
+    purchase = (
+        await db.execute(
+            select(GoldPurchase)
+            .where(GoldPurchase.id == purchase_id)
+            .execution_options(populate_existing=True)
+        )
+    ).unique().scalar_one_or_none()
+    if purchase is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Gold purchase not found")
+    return purchase
+
+
+async def _decorate_gold(db: DbSession, rows: list[GoldPurchase]) -> list[GoldPurchaseRead]:
+    """Entry numbers, reversal status and branch names in three queries, not three per row."""
+    entry_ids = [r.journal_entry_id for r in rows if r.journal_entry_id is not None]
+    numbers: dict[int, str] = {}
+    if entry_ids:
+        numbers = {
+            int(eid): no
+            for eid, no in (
+                await db.execute(
+                    select(JournalEntry.id, JournalEntry.entry_no).where(
+                        JournalEntry.id.in_(entry_ids)
+                    )
+                )
+            ).all()
+        }
+    reversals = await _reversals_for(db, entry_ids)
+    branch_ids = {r.branch_id for r in rows}
+    branch_names = (
+        {
+            int(bid): name
+            for bid, name in (
+                await db.execute(select(Branch.id, Branch.name).where(Branch.id.in_(branch_ids)))
+            ).all()
+        }
+        if branch_ids
+        else {}
+    )
+    out = []
+    for r in rows:
+        read = _gold_purchase_read(
+            r,
+            entry_no=numbers.get(r.journal_entry_id or -1),
+            reversal_no=reversals.get(r.journal_entry_id or -1),
+        )
+        read.branch_name = branch_names.get(r.branch_id)
+        out.append(read)
+    return out
+
+
+@router.post(
+    "/gold-purchases",
+    response_model=GoldPurchaseDetail,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[write],
+)
+async def create_gold_purchase(
+    payload: GoldPurchaseCreate, db: DbSession, current: CurrentUser
+) -> GoldPurchaseDetail:
+    """
+    Record a dealer's bill and put the metal in the safe.
+
+    Each lot goes into the melt pot for its purity as a `purchase_in`, and the
+    bill posts once: debit 1130 Gold in Hand a line per lot in fine grams,
+    credit cash, bank or the supplier's account depending on how it was paid.
+
+    Deliberately *not* checked against the day's rate. That check exists on a
+    buy-back because the shop buys a customer's jewellery below rate and the
+    spread is the margin; a dealer sells bullion at or fractionally above the
+    board, and refusing that would block the ordinary way a workshop stocks up.
+    """
+    supplier = await db.get(Supplier, payload.supplier_id)
+    if supplier is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Supplier not found")
+
+    if payload.payment_mode is GoldPaymentMode.bank and payload.bank_account_id is not None:
+        if await db.get(BankAccount, payload.bank_account_id) is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Bank account not found")
+
+    # The metal lands in the safe at the shop that bought it, so a bill taken at
+    # one counter cannot silently top up another shop's melt pot.
+    buy_branch = await branches.resolve_branch(db, requested_id=payload.branch_id, user=current)
+
+    purchased_at = payload.purchased_at or datetime.now(timezone.utc)
+    purchase = GoldPurchase(
+        purchase_no=await purchasing.next_gold_purchase_no(db),
+        supplier_id=supplier.id,
+        branch_id=buy_branch.id,
+        purchased_at=purchased_at,
+        reference=payload.reference,
+        payment_mode=payload.payment_mode,
+        bank_account_id=(
+            payload.bank_account_id
+            if payload.payment_mode is GoldPaymentMode.bank
+            else None
+        ),
+        subtotal=_ZERO,
+        extra_cost_pct=d(payload.extra_cost_pct),
+        total=_ZERO,
+        notes=payload.notes,
+        created_by_user_id=current.id,
+    )
+    db.add(purchase)
+    await db.flush()
+
+    # Resolved once for the whole bill, not per lot: every lot on one dealer's
+    # invoice was quoted on the same day in the same currency, and looking the
+    # rate up per line would let two lots of the same bill convert differently
+    # if the rate changed mid-request.
+    line_currency = payload.currency
+    line_fx = (
+        Decimal("1")
+        if line_currency is Currency.PKR
+        else await fx.require_rate(db, line_currency, as_of=clock.shop_date(purchased_at))
+    )
+
+    subtotal = _ZERO
+    rows: list[GoldPurchaseItem] = []
+    for line in payload.items:
+        # The dealer quotes in their own currency and the books are kept in
+        # rupees, so the line value, the stock value and the journal entry are
+        # the same number rather than three that happen to look similar.
+        amount = (
+            purchasing.gold_line_amount(line.weight_g, line.rate_per_g) * line_fx
+        ).quantize(Decimal("0.01"))
+        subtotal += amount
+
+        pot = await purchasing.raw_gold_item(
+            db, purity=line.purity, branch_id=buy_branch.id
+        )
+        row = GoldPurchaseItem(
+            purchase_id=purchase.id,
+            description=(line.description or "").strip() or None,
+            purity=line.purity,
+            weight_g=d(line.weight_g),
+            rate_per_g=d(line.rate_per_g),
+            currency=line_currency,
+            fx_rate_to_pkr=line_fx,
+            amount=amount,
+            inventory_item_id=pot.id,
+            notes=line.notes,
+        )
+        db.add(row)
+        await db.flush()
+        rows.append(row)
+
+        await post_movement(
+            db,
+            item=pot,
+            type=MovementType.purchase_in,
+            weight_g_delta=d(line.weight_g),
+            reference_type=purchasing.GOLD_PURCHASE_SOURCE,
+            reference_id=purchase.id,
+            notes=(
+                f"{purchase.purchase_no} — {line.purity}k at {d(line.rate_per_g)}/g"
+                f" from {supplier.name}"
+            ),
+            user_id=current.id,
+        )
+
+    purchase.subtotal = subtotal.quantize(Decimal("0.01"))
+    purchase.total = purchasing.apply_extra_cost(purchase.subtotal, purchase.extra_cost_pct)
+    await db.flush()
+
+    entry = await purchasing.post_gold_purchase(
+        db, purchase, rows, supplier_name=supplier.name, user_id=current.id
+    )
+    purchase.journal_entry_id = entry.id
+
+    await log_action(
+        db,
+        user=current,
+        action="purchasing.gold_purchase.create",
+        resource_type="gold_purchase",
+        resource_id=purchase.id,
+        details={
+            "purchase_no": purchase.purchase_no,
+            "supplier": supplier.name,
+            "lots": len(rows),
+            "weight_g": str(sum((d(r.weight_g) for r in rows), _ZERO)),
+            "total": str(purchase.total),
+            "paid_by": purchase.payment_mode.value,
+            "entry_no": entry.entry_no,
+        },
+    )
+    await db.commit()
+    fresh = await _load_gold_purchase(db, purchase.id)
+    read = (await _decorate_gold(db, [fresh]))[0]
+    return GoldPurchaseDetail(
+        **read.model_dump(), items=[_gold_item_read(i) for i in fresh.items]
+    )
+
+
+@router.get("/gold-purchases", response_model=list[GoldPurchaseRead], dependencies=[read])
+async def list_gold_purchases(
+    db: DbSession,
+    supplier_id: int | None = Query(default=None),
+    branch_id: int | None = Query(default=None),
+    payment_mode: GoldPaymentMode | None = Query(default=None),
+    date_from: date | None = Query(default=None),
+    date_to: date | None = Query(default=None),
+    limit: int = Query(default=50, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> list[GoldPurchaseRead]:
+    stmt = select(GoldPurchase).order_by(GoldPurchase.id.desc()).limit(limit).offset(offset)
+    if supplier_id is not None:
+        stmt = stmt.where(GoldPurchase.supplier_id == supplier_id)
+    if branch_id is not None:
+        stmt = stmt.where(GoldPurchase.branch_id == branch_id)
+    if payment_mode is not None:
+        stmt = stmt.where(GoldPurchase.payment_mode == payment_mode)
+    if date_from is not None:
+        stmt = stmt.where(GoldPurchase.purchased_at >= datetime.combine(date_from, time.min))
+    if date_to is not None:
+        stmt = stmt.where(GoldPurchase.purchased_at <= datetime.combine(date_to, time.max))
+    rows = list((await db.execute(stmt)).unique().scalars().all())
+    return await _decorate_gold(db, rows)
+
+
+@router.get(
+    "/gold-purchases/{purchase_id}", response_model=GoldPurchaseDetail, dependencies=[read]
+)
+async def get_gold_purchase(purchase_id: int, db: DbSession) -> GoldPurchaseDetail:
+    purchase = await _load_gold_purchase(db, purchase_id)
+    read = (await _decorate_gold(db, [purchase]))[0]
+    return GoldPurchaseDetail(
+        **read.model_dump(), items=[_gold_item_read(i) for i in purchase.items]
+    )
+
+
+@router.post(
+    "/gold-purchases/{purchase_id}/reverse",
+    response_model=GoldPurchaseDetail,
+    dependencies=[write, confirm],
+)
+async def reverse_gold_purchase(
+    purchase_id: int, db: DbSession, current: CurrentUser
+) -> GoldPurchaseDetail:
+    """
+    Undo a bill: metal back out of the safe, the money back where it came from.
+
+    The row is not edited or deleted. The ledger is append-only, so the
+    correction is a reversing entry pointing at the original, and "was this
+    undone" stays a question the journal answers rather than a flag that can
+    drift out of step with it. A second attempt comes back 409, and so does a
+    bill whose metal has already gone to a worker.
+    """
+    purchase = await _load_gold_purchase(db, purchase_id)
+    reversal = await purchasing.reverse_gold_purchase(db, purchase, user_id=current.id)
+    await log_action(
+        db,
+        user=current,
+        action="purchasing.gold_purchase.reverse",
+        resource_type="gold_purchase",
+        resource_id=purchase.id,
+        details={"purchase_no": purchase.purchase_no, "reversal_no": reversal.entry_no},
+    )
+    await db.commit()
+    fresh = await _load_gold_purchase(db, purchase_id)
+    read = (await _decorate_gold(db, [fresh]))[0]
+    return GoldPurchaseDetail(
+        **read.model_dump(), items=[_gold_item_read(i) for i in fresh.items]
     )

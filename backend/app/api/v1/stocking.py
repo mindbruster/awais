@@ -35,7 +35,7 @@ from app.schemas.stocking import (
     StoneUseRead,
     WeightsRead,
 )
-from app.services import fx, stocking
+from app.services import branches, fx, stocking
 from app.services.audit import log_action
 from app.services.inventory import post_movement
 from app.services.ledger import d
@@ -303,8 +303,13 @@ async def stock_design(
         ((r.total_ct * r.rate_per_ct) for r in resolved), Decimal("0")
     ).quantize(_PKR)
 
+    # The showroom the finished piece goes into. The workshop may be central,
+    # but the piece has to land somewhere sellable.
+    shelf = await branches.resolve_branch(db, requested_id=payload.branch_id, user=current)
+
     product = Product(
         serial_no=await next_product_serial(db),
+        branch_id=shelf.id,
         name=payload.name,
         category=payload.category,
         description=payload.description,
@@ -355,6 +360,7 @@ async def stock_design(
         weight_ct=Decimal("0"),
         purity=weights.gold_purity,
         product_id=product.id,
+        branch_id=shelf.id,
     )
     db.add(inventory)
     await db.flush()

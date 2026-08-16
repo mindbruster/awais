@@ -14,6 +14,14 @@ class CustomerBase(BaseModel):
     """
 
     name: str = Field(min_length=1, max_length=150)
+    # Another jeweller rather than a walk-in buyer. Decides the shape of every
+    # bill they are given: a trade buyer settles the metal in fine grams and
+    # pays cash only for stones and making, a counter customer pays rupees for
+    # the lot. Defaults to the counter, so an unspecified customer is never
+    # silently handed a trade bill.
+    is_trade: bool = False
+    # The shop's own ledger number for this account. Printed on their bills.
+    account_no: str | None = Field(default=None, max_length=30)
     phone: str | None = Field(default=None, max_length=30)
     phone2: str | None = Field(default=None, max_length=30)
     email: EmailStr | None = None
@@ -36,6 +44,8 @@ class CustomerCreate(CustomerBase):
 
 class CustomerUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=150)
+    is_trade: bool | None = None
+    account_no: str | None = Field(default=None, max_length=30)
     phone: str | None = Field(default=None, max_length=30)
     phone2: str | None = Field(default=None, max_length=30)
     email: EmailStr | None = None

@@ -10,12 +10,12 @@ from app.api.v1.payments import decorate_payments
 from app.models.customer import Customer
 from app.models.gold_rate import GoldRate
 from app.models.inventory import InventoryItem
-from app.models.invoice import Invoice, InvoiceItem, InvoiceStatus, SaleType
+from app.models.invoice import GoldCharge, Invoice, InvoiceItem, InvoiceStatus, SaleType
 from app.models.payment import Payment, PaymentDirection, PaymentMethod
 from app.models.product import Product, ProductStatus
 from app.models.stock_movement import MovementType
 from app.schemas.invoice import InvoiceCreate, InvoiceDetail, InvoiceRead
-from app.services import sales
+from app.services import branches, sales
 from app.services.audit import log_action
 from app.services.inventory import post_movement
 from app.services.ledger import customer_balance
@@ -101,6 +101,11 @@ async def _detail(db, invoice: Invoice) -> InvoiceDetail:
 
 def _recompute(invoice: Invoice) -> None:
     line_totals: list[Decimal] = []
+    # On a trade bill this accumulates the metal the buyer must hand over. On a
+    # counter bill the same grams are already paid for in the money total, and
+    # the figure stays zero so nothing can bill for the gold twice.
+    charged_in = (invoice.gold_charged_in or GoldCharge.rupees).value
+    fine_total = Decimal("0")
     for it in invoice.items:
         # Line rate falls back to invoice rate when not set ( > 0 ). Persisted
         # column default is 0 so callers omitting the field still get the
@@ -110,9 +115,15 @@ def _recompute(invoice: Invoice) -> None:
             if it.gold_rate_per_g is not None and Decimal(str(it.gold_rate_per_g)) > 0
             else invoice.gold_rate_per_g
         )
-        gold_amount, stone_amount, line_total = price_line(
+        gold_amount, stone_amount, line_total, fine_g = price_line(
             gold_weight_g=Decimal(str(it.gold_weight_g)),
             gold_purity=it.gold_purity,
+            # The assayed fineness when the line carries one, so the money and
+            # the metal are worked out from the same number.
+            gold_tunch_pct=(
+                Decimal(str(it.gold_tunch_pct)) if it.gold_tunch_pct is not None else None
+            ),
+            gold_charged_in=charged_in,
             gold_rate_per_g=Decimal(str(rate)),
             stone_weight_ct=Decimal(str(it.stone_weight_ct)),
             stone_rate_per_ct=Decimal(str(it.stone_rate_per_ct)),
@@ -137,6 +148,7 @@ def _recompute(invoice: Invoice) -> None:
         it.stone_amount = stone_amount
         it.line_total = line_total
         line_totals.append(line_total)
+        fine_total += fine_g
 
     subtotal, total = invoice_totals(
         line_totals=line_totals,
@@ -144,6 +156,7 @@ def _recompute(invoice: Invoice) -> None:
         discount_amount=Decimal(str(invoice.discount_amount)),
         discount_weight_g=Decimal(str(invoice.discount_weight_g)),
         tax_amount=Decimal(str(invoice.tax_amount)),
+        gold_charged_in=charged_in,
     )
     # The round-off is applied here rather than inside invoice_totals because it
     # is not a pricing rule: it is the paisa the counter waives to reach a
@@ -154,6 +167,18 @@ def _recompute(invoice: Invoice) -> None:
     total = max(total - round_off, Decimal("0")).quantize(Decimal("0.01"))
     invoice.subtotal = subtotal
     invoice.total = total
+
+    if charged_in == GoldCharge.grams.value:
+        # A bill-level discount quoted in grams comes off the metal here rather
+        # than off the money, because on this kind of bill the metal is what was
+        # being discounted. Floored at nothing: a discount larger than the piece
+        # would otherwise have the shop handing metal back.
+        fine_total = max(
+            fine_total - Decimal(str(invoice.discount_weight_g or 0)), Decimal("0")
+        )
+        invoice.metal_due_fine_g = fine_total.quantize(Decimal("0.0001"))
+    else:
+        invoice.metal_due_fine_g = Decimal("0.0000")
 
 
 @router.get("", response_model=list[InvoiceRead], dependencies=[read])
@@ -190,7 +215,9 @@ async def list_invoices(
     status_code=status.HTTP_201_CREATED,
     dependencies=[write],
 )
-async def create_invoice(payload: InvoiceCreate, db: DbSession) -> InvoiceDetail:
+async def create_invoice(
+    payload: InvoiceCreate, db: DbSession, current: CurrentUser
+) -> InvoiceDetail:
     customer = await db.get(Customer, payload.customer_id)
     if customer is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid customer_id")
@@ -202,17 +229,29 @@ async def create_invoice(payload: InvoiceCreate, db: DbSession) -> InvoiceDetail
     if invoice_rate == 0:
         invoice_rate = await _current_gold_rate(db, payload.currency)
 
+    # Which counter took the sale. Every money report is sliced by this the
+    # moment a second shop opens.
+    till = await branches.resolve_branch(db, requested_id=payload.branch_id, user=current)
+
     invoice = Invoice(
         invoice_no=await next_invoice_no(db),
+        branch_id=till.id,
         sale_type=payload.sale_type,
         status=InvoiceStatus.draft,
         customer_id=payload.customer_id,
         currency=payload.currency,
         gold_rate_per_g=invoice_rate,
+        # Taken from the customer, not asked for. A jeweller always settles the
+        # metal in metal and a counter customer always pays rupees, so the shop
+        # has one right answer per buyer and no reason to be offered a choice
+        # it could get wrong. Snapshotted onto the bill so reclassifying the
+        # customer later cannot rewrite what this document already means.
+        gold_charged_in=GoldCharge.grams if customer.is_trade else GoldCharge.rupees,
         discount_amount=payload.discount_amount,
         discount_weight_g=payload.discount_weight_g,
         tax_amount=payload.tax_amount,
         bill_book_no=payload.bill_book_no,
+        term_days=payload.term_days,
         round_off=payload.round_off,
         notes=payload.notes,
     )
