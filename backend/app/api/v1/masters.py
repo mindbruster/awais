@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 
-from app.api.deps import DbSession, require_password_confirm, require_perm
+from app.api.deps import CurrentUser, DbSession, require_password_confirm, require_perm
 from app.models.attribute_option import AttributeKind, AttributeOption
 from app.models.bank import Bank, BankAccount
 from app.models.department import Department
@@ -44,6 +44,7 @@ from app.schemas.masters import (
     ItemRead,
     ItemUpdate,
 )
+from app.services.audit import changes, log_action, snapshot
 
 read_perm = Depends(require_perm("master:read"))
 write_perm = Depends(require_perm("master:write"))
@@ -112,10 +113,21 @@ def make_master_router(
         status_code=status.HTTP_201_CREATED,
         dependencies=[write_perm],
     )
-    async def create_row(payload: create_schema, db: DbSession) -> Any:  # type: ignore[valid-type]
+    async def create_row(
+        payload: create_schema, db: DbSession, current: CurrentUser  # type: ignore[valid-type]
+    ) -> Any:
         row = model(**payload.model_dump())
         db.add(row)
         try:
+            await db.flush()
+            await log_action(
+                db,
+                user=current,
+                action=f"{label}.create",
+                resource_type=label,
+                resource_id=row.id,
+                after=snapshot(row),
+            )
             await db.commit()
         except IntegrityError as exc:
             await db.rollback()
@@ -131,13 +143,31 @@ def make_master_router(
         return serialise(row)
 
     @router.patch("/{row_id}", response_model=read_schema, dependencies=[write_perm])
-    async def update_row(row_id: int, payload: update_schema, db: DbSession) -> Any:  # type: ignore[valid-type]
+    async def update_row(
+        row_id: int, payload: update_schema, db: DbSession, current: CurrentUser  # type: ignore[valid-type]
+    ) -> Any:
         row = await db.get(model, row_id)
         if row is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"{label.capitalize()} not found")
+        # Captured before the setattr loop, or "before" would be the new value.
+        was = snapshot(row)
         for k, v in payload.model_dump(exclude_unset=True).items():
             setattr(row, k, v)
+        before, after = changes(was, snapshot(row))
         try:
+            # An edit that altered nothing writes no line. "Somebody opened this
+            # and changed nothing" is a row that only makes the real edits
+            # harder to find.
+            if before or after:
+                await log_action(
+                    db,
+                    user=current,
+                    action=f"{label}.update",
+                    resource_type=label,
+                    resource_id=row.id,
+                    before=before,
+                    after=after,
+                )
             await db.commit()
         except IntegrityError as exc:
             await db.rollback()
@@ -150,12 +180,23 @@ def make_master_router(
         status_code=status.HTTP_204_NO_CONTENT,
         dependencies=[delete_perm, Depends(require_password_confirm)],
     )
-    async def delete_row(row_id: int, db: DbSession) -> None:
+    async def delete_row(row_id: int, db: DbSession, current: CurrentUser) -> None:
         row = await db.get(model, row_id)
         if row is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"{label.capitalize()} not found")
+        # The whole row, because after this there is nothing left to compare
+        # against. This is the one case where a full snapshot is the point.
+        was = snapshot(row)
         await db.delete(row)
         try:
+            await log_action(
+                db,
+                user=current,
+                action=f"{label}.delete",
+                resource_type=label,
+                resource_id=row_id,
+                before=was,
+            )
             await db.commit()
         except IntegrityError as exc:
             await db.rollback()

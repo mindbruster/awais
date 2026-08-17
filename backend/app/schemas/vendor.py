@@ -16,13 +16,12 @@ class VendorBase(BaseModel):
     which means creating one without a department produces a worker who is
     invisible everywhere and looks like a bug in the design screen.
 
-    `type` is the original three-role enum, from when the retired manufacturing
-    module routed on it. Only the legacy loss report still reads it, so it
-    carries a default now rather than being the field you must fill in.
+    `type`, the original three-role enum, is not writable. It is derived from
+    the department on save, because the two say the same thing and only one of
+    them can be the truth.
     """
 
     name: str = Field(min_length=1, max_length=150)
-    type: VendorType = VendorType.other
     # Optional on the model (historical rows predate departments) but required
     # here, so nothing new can be created unusable.
     department_id: int = Field(description="Which department this worker belongs to.")
@@ -47,7 +46,6 @@ class VendorCreate(VendorBase):
 
 class VendorUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=150)
-    type: VendorType | None = None
     department_id: int | None = None
     phone: str | None = Field(default=None, max_length=30)
     cnic: str | None = Field(default=None, max_length=20)
@@ -66,6 +64,10 @@ class VendorRead(TimestampedRead, VendorBase):
     # on exactly the records that need attention.
     department_id: int | None = None
     department_name: str | None = None
+    # Read-only: whatever the department implies. Still reported because the
+    # loss report groups on it and somebody comparing the two screens should be
+    # able to see the value rather than infer it.
+    type: VendorType = VendorType.other
     # The wastage percentage actually in force: this worker's own figure, or
     # the department's if he has none. Resolved server-side so the UI and the
     # manufacturing module can't drift on the fallback rule.

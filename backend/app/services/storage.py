@@ -253,6 +253,52 @@ def get_storage() -> Storage:
     )
 
 
+ALLOWED_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+
+
+async def read_image_upload(file, *, max_bytes: int = MAX_IMAGE_BYTES) -> tuple[bytes, str]:
+    """
+    Validate an uploaded image and return its bytes and extension.
+
+    Read in chunks and stop at the limit rather than pulling the whole body in
+    and measuring it. `await file.read()` on a 2 GB upload buys a 2 GB
+    allocation before the check can fire, which on a container with a memory cap
+    kills the process — one oversized POST takes the shop's till offline instead
+    of getting a 413.
+
+    Lives here rather than in a router because more than one thing is
+    photographed: a piece of jewellery, and the shop's own logo. What counts as
+    an acceptable image is one rule, and two copies of it drift.
+    """
+    # Imported here: this module is also loaded by scripts that have no reason
+    # to pull in the web framework.
+    from fastapi import HTTPException, status as http
+
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in ALLOWED_IMAGE_EXT:
+        raise HTTPException(
+            http.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            f"Unsupported file type: {ext or 'unknown'}",
+        )
+
+    chunks: list[bytes] = []
+    total = 0
+    while chunk := await file.read(64 * 1024):
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(
+                http.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                f"Image exceeds the {max_bytes // (1024 * 1024)}MB limit.",
+            )
+        chunks.append(chunk)
+
+    contents = b"".join(chunks)
+    if not contents:
+        raise HTTPException(http.HTTP_400_BAD_REQUEST, "The uploaded file is empty.")
+    return contents, ext
+
+
 # Resolve the backend at import time, which is application startup. A bucket
 # whose credentials are missing should fail in the deploy log next to the
 # migration output, not four hours later when someone photographs a bangle.

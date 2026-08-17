@@ -6,85 +6,9 @@ import { SelectField, TextArea, TextField } from "@/components/Field";
 import { PasswordConfirm } from "@/components/PasswordConfirm";
 import { toast } from "@/components/Toast";
 import { apiError } from "@/lib/api-error";
-import { Currency, fmtMoney } from "@/lib/money";
-
-interface InvoiceItem {
-  id: number;
-  description: string;
-  quantity: number;
-  gold_weight_g: string;
-  gold_purity: number | null;
-  gold_rate_per_g: string;
-  gold_amount: string;
-  stone_weight_ct: string;
-  stone_rate_per_ct: string;
-  stone_amount: string;
-  labor_amount: string;
-  line_discount: string;
-  discount_ratti: string;
-  ratti_base: number;
-  sale_wastage_pct: string;
-  sale_wastage_g: string;
-  // Both server-derived: charged = net + wastage, billable = charged less the
-  // ratti discount. Never recomputed here, so the printed document can only
-  // ever agree with what was billed.
-  charged_gold_weight_g: string;
-  billable_gold_weight_g: string;
-  line_total: string;
-  // The piece itself. `description` is typed at the counter and is often just
-  // "ring"; these identify the physical object the customer is holding.
-  product_id: number | null;
-  product_name: string | null;
-  product_serial_no: string | null;
-  product_image_url: string | null;
-}
-
-interface Payment {
-  id: number;
-  payment_no: string;
-  invoice_id: number | null;
-  customer_id: number;
-  method: string;
-  direction: string;
-  amount: string;
-  gold_weight_g: string | null;
-  gold_purity: number | null;
-  gold_rate_per_g: string | null;
-  gold_fine_g: string | null;
-  bank_account_label: string | null;
-  paid_at: string;
-  reference: string | null;
-  notes: string | null;
-  entry_no: string | null;
-  is_reversed: boolean;
-}
-
-interface Invoice {
-  id: number;
-  invoice_no: string;
-  sale_type: string;
-  status: string;
-  customer_id: number;
-  currency: Currency;
-  gold_rate_per_g: string;
-  subtotal: string;
-  discount_amount: string;
-  discount_weight_g: string;
-  tax_amount: string;
-  round_off: string;
-  total: string;
-  bill_book_no: string | null;
-  issued_at: string | null;
-  paid_at: string | null;
-  notes: string | null;
-  items: InvoiceItem[];
-  // Summed from the payment rows on the server every read — never stored, so
-  // it cannot drift from the money that was actually taken.
-  amount_paid: string;
-  balance_due: string;
-  customer_balance: string;
-  payments: Payment[];
-}
+import { fmtMoney } from "@/lib/money";
+import { Invoice, Payment } from "./invoices/parts";
+import { PrintableInvoice } from "./invoices/PrintableInvoice";
 
 const METHOD_LABEL: Record<string, string> = {
   cash: "Cash",
@@ -96,6 +20,7 @@ const METHOD_LABEL: Record<string, string> = {
 interface Customer {
   id: number;
   name: string;
+  account_no: string | null;
   phone: string | null;
   email: string | null;
   address: string | null;
@@ -255,14 +180,27 @@ export function InvoiceDetailPage() {
         </div>
       </div>
 
-      <div className="card print-page mx-auto max-w-3xl">
+      {/* The customer's copy, exactly as it will come off the printer. Shown on
+          screen too rather than hidden behind the Print button: the counter has
+          to be able to see what the customer is about to be handed. */}
+      <div className="print-page card-flush mx-auto w-full max-w-[820px] overflow-x-auto border border-slate-200 print:overflow-visible print:border-0">
+        <PrintableInvoice
+          invoice={invoice}
+          customerName={customer?.name ?? "—"}
+          accountNo={customer?.account_no}
+        />
+      </div>
+
+      {/* Everything below is the shop's own working-out and never prints. The
+          customer's copy says what was charged; this says how it was arrived
+          at. */}
+      <div className="no-print card mx-auto max-w-5xl">
         <header className="flex flex-wrap items-start justify-between gap-4 border-b border-slate-200 pb-4">
           <div>
-            <div className="text-2xl font-bold text-brand-700">Jewelry ERP</div>
-            <div className="text-xs text-slate-500">Tax Invoice / Receipt</div>
+            <div className="text-sm font-semibold text-slate-900">How this bill was worked out</div>
+            <div className="text-xs text-slate-500">Not printed on the customer's copy</div>
           </div>
           <div className="text-right">
-            <div className="text-sm text-slate-500">Invoice #</div>
             <div className="font-mono text-lg font-semibold">{invoice.invoice_no}</div>
             <span
               className={`mt-2 inline-block rounded-full px-2 py-0.5 text-xs ${
@@ -275,7 +213,7 @@ export function InvoiceDetailPage() {
           </div>
         </header>
 
-        <section className="mt-4 grid grid-cols-2 gap-6 text-sm">
+        <section className="mt-4 grid gap-6 text-sm sm:grid-cols-2">
           <div>
             <div className="mb-1 text-xs uppercase text-slate-500">Bill to</div>
             <div className="font-semibold">{customer?.name ?? "—"}</div>
@@ -286,8 +224,16 @@ export function InvoiceDetailPage() {
                 {customer.address}
               </div>
             )}
+            {/* Who the sale is credited to. Shown on the bill's own screen
+                because it is what drives their target, and a figure nobody can
+                trace back to a document is a figure nobody trusts. */}
+            {invoice.seller_name && (
+              <div className="mt-2 text-xs text-slate-500">
+                Sold by <span className="font-medium text-slate-700">{invoice.seller_name}</span>
+              </div>
+            )}
           </div>
-          <div className="text-right">
+          <div className="sm:text-right">
             <Row label="Issued">
               {invoice.issued_at
                 ? new Date(invoice.issued_at).toLocaleString()
@@ -307,10 +253,14 @@ export function InvoiceDetailPage() {
             off, what was actually billed — and prose forces them to re-derive
             it. Wide by nature, so it scrolls inside its own box and never makes
             the page scroll sideways. */}
+        {invoice.kind === "loose_material" ? (
+          <LooseMaterialLines invoice={invoice} />
+        ) : (
         <div className="mt-6 overflow-x-auto">
           <table className="w-full min-w-[64rem] text-sm tabular-nums">
             <thead className="border-b border-slate-200 text-left text-xs uppercase text-slate-500">
               <tr>
+                <th className="py-2 pr-2 font-medium">Sr</th>
                 <th className="py-2 pr-3 font-medium">Piece</th>
                 <th className="py-2 px-2 text-right font-medium">Qty</th>
                 <th className="py-2 px-2 text-right font-medium">Purity</th>
@@ -327,7 +277,7 @@ export function InvoiceDetailPage() {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 align-top">
-              {invoice.items.map((it) => {
+              {invoice.items.map((it, i) => {
                 const net = Number(it.gold_weight_g);
                 const charged = Number(it.charged_gold_weight_g);
                 const billable = Number(it.billable_gold_weight_g);
@@ -339,6 +289,7 @@ export function InvoiceDetailPage() {
                 const ct = Number(it.stone_weight_ct);
                 return (
                   <tr key={it.id}>
+                    <td className="py-3 pr-2 text-slate-400">{i + 1}</td>
                     <td className="py-3 pr-3">
                       <div className="flex items-start gap-3">
                         {it.product_image_url ? (
@@ -449,6 +400,7 @@ export function InvoiceDetailPage() {
             </tbody>
           </table>
         </div>
+        )}
 
         <section className="mt-4 ml-auto w-full max-w-xs space-y-1 border-t border-slate-200 pt-3 text-sm">
           <Row label="Subtotal">{fmtMoney(invoice.subtotal, invoice.currency)}</Row>
@@ -499,10 +451,6 @@ export function InvoiceDetailPage() {
             <p className="whitespace-pre-line">{invoice.notes}</p>
           </section>
         )}
-
-        <footer className="mt-6 border-t border-slate-200 pt-3 text-xs text-slate-400">
-          Thank you for your business.
-        </footer>
       </div>
 
       {/* Payments live outside the printed document: the customer's copy shows
@@ -668,6 +616,89 @@ interface BankAccount {
  * is stored — this is only so nobody is asked to agree to a number they cannot
  * see.
  */
+/**
+ * A parcel of loose stones, billed on its own terms.
+ *
+ * Its own table rather than the finished-product one with the gold columns
+ * emptied. Eight blank columns down the middle of a bill do not read as "no
+ * gold here" — they read as a form somebody failed to fill in, and the customer
+ * copy is the one document that has to be unambiguous at a glance.
+ *
+ * The discount also means something different. On a finished piece it is argued
+ * in ratti against the gold weight; here there is no weight to argue against,
+ * so it comes off the stone price. Showing the two in the same column would put
+ * a giveaway on metal beside a giveaway on stones and call them one thing.
+ */
+function LooseMaterialLines({ invoice }: { invoice: Invoice }) {
+  return (
+    <div className="mt-6 overflow-x-auto">
+      <table className="w-full min-w-[42rem] text-sm tabular-nums">
+        <thead className="border-b border-slate-200 text-left text-xs uppercase text-slate-500">
+          <tr>
+            <th className="py-2 pr-2 font-medium">Sr</th>
+            <th className="py-2 pr-3 font-medium">Code</th>
+            <th className="py-2 px-2 font-medium">Description</th>
+            <th className="py-2 px-2 text-right font-medium">Qty</th>
+            <th className="py-2 px-2 text-right font-medium">Carats</th>
+            <th className="py-2 px-2 text-right font-medium">Rate / ct</th>
+            <th className="py-2 px-2 text-right font-medium">Discount</th>
+            <th className="py-2 pl-2 text-right font-medium">Amount</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-slate-100 align-top">
+          {invoice.items.map((it, i) => {
+            const ct = Number(it.stone_weight_ct);
+            const discount = Number(it.line_discount);
+            return (
+              <tr key={it.id}>
+                <td className="py-3 pr-2 text-slate-400">{i + 1}</td>
+                <td className="py-3 pr-3 font-mono text-xs text-slate-500">
+                  {it.product_serial_no ? (
+                    it.product_id ? (
+                      <Link className="hover:underline" to={`/products/${it.product_id}`}>
+                        {it.product_serial_no}
+                      </Link>
+                    ) : (
+                      it.product_serial_no
+                    )
+                  ) : (
+                    "—"
+                  )}
+                </td>
+                <td className="py-3 px-2">
+                  <div className="font-medium text-slate-900">{it.description}</div>
+                  {it.product_name && it.product_name !== it.description && (
+                    <div className="text-xs text-slate-500">{it.product_name}</div>
+                  )}
+                </td>
+                <td className="py-3 px-2 text-right">{it.quantity}</td>
+                <td className="py-3 px-2 text-right">{ct ? ct.toFixed(2) : "—"}</td>
+                <td className="py-3 px-2 text-right">
+                  {Number(it.stone_rate_per_ct)
+                    ? fmtMoney(it.stone_rate_per_ct, invoice.currency)
+                    : "—"}
+                </td>
+                <td className="py-3 px-2 text-right">
+                  {discount > 0 ? (
+                    <span className="text-emerald-700">
+                      −{fmtMoney(discount, invoice.currency)}
+                    </span>
+                  ) : (
+                    "—"
+                  )}
+                </td>
+                <td className="py-3 pl-2 text-right font-medium text-slate-900">
+                  {fmtMoney(it.line_total, invoice.currency)}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function TakePaymentModal({
   open,
   onClose,

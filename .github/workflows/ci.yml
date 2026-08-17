@@ -76,6 +76,15 @@ jobs:
           python -m alembic upgrade head
           python -m app.seed
 
+      # Straight after the migrations and before anything runs against the
+      # schema. The bug this guards is a model column with no migration: it
+      # does not fail at import or at startup, only on the first request that
+      # touches it — so an entire module can be unreachable while every other
+      # step here stays green.
+      - name: Check the models match the migrations
+        working-directory: backend
+        run: python -m tools.check_schema_drift
+
       - name: Start API in background
         working-directory: backend
         run: |
@@ -94,6 +103,13 @@ jobs:
       - name: Run E2E suite
         working-directory: backend
         run: python -m tests.e2e
+
+      # Four-eyes approval is switched by configuration, so it cannot be
+      # exercised against the server the E2E suite talks to. This runs the
+      # guards directly, with the rule both off and on.
+      - name: Four-eyes approval rules
+        working-directory: backend
+        run: python -m tests.smoke_two_person
 
       - name: Dump uvicorn log on failure
         if: failure()

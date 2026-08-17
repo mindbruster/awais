@@ -16,6 +16,10 @@ from fastapi import HTTPException, status
 
 from app.core.config import settings
 
+# Mirrors app.models.currency.Currency. Kept as a plain map so this module
+# stays importable without pulling in the ORM.
+SYMBOLS = {"PKR": "₨", "USD": "$"}
+
 
 @dataclass
 class SendResult:
@@ -80,19 +84,27 @@ async def send_text(to_phone: str, body: str) -> SendResult:
 
 
 def render_invoice_message(invoice, customer) -> str:
-    """Plain-text invoice summary suitable for a WhatsApp body."""
+    """
+    Plain-text invoice summary suitable for a WhatsApp body.
+
+    The amounts carry the invoice's own currency symbol. This shipped hard-coded
+    to the Indian rupee sign in a shop that trades in Pakistani rupees — on a
+    bill sent to a customer that is not a typo, it is a wrong price, and one the
+    customer is entitled to hold the shop to.
+    """
+    symbol = SYMBOLS.get(getattr(invoice.currency, "value", invoice.currency), "₨")
     lines = [
         f"Hi {customer.name}, here's your invoice {invoice.invoice_no} from {settings.app_name}.",
         "",
     ]
     for item in invoice.items:
-        bits = [item.description, f"Qty {item.quantity}", f"₹{item.line_total}"]
+        bits = [item.description, f"Qty {item.quantity}", f"{symbol} {item.line_total}"]
         lines.append(" · ".join(bits))
     lines += [
         "",
-        f"Subtotal: ₹{invoice.subtotal}",
-        f"Discount: ₹{invoice.discount_amount}",
-        f"Tax: ₹{invoice.tax_amount}",
-        f"Total: ₹{invoice.total}",
+        f"Subtotal: {symbol} {invoice.subtotal}",
+        f"Discount: {symbol} {invoice.discount_amount}",
+        f"Tax: {symbol} {invoice.tax_amount}",
+        f"Total: {symbol} {invoice.total}",
     ]
     return "\n".join(lines)

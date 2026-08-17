@@ -1,5 +1,6 @@
 """
-The buying side: metal back over the counter, and stones from suppliers.
+The buying side: bullion from a dealer, metal back over the counter, stones
+from suppliers.
 
 Everything a purchase has to get right lives here rather than in the router,
 because both halves of a purchase have to agree and there is exactly one place
@@ -10,20 +11,33 @@ make impossible.
 """
 from __future__ import annotations
 
+import enum
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
 from fastapi import HTTPException, status
 from sqlalchemy import Integer, cast, func, select, text
+from sqlalchemy.orm import aliased
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import clock
 from app.core import lock_keys
 from app.models.account import SystemAccount
 from app.models.design import JobLeg, LegStatus, LegStone
 from app.models.inventory import InventoryItem, InventoryType
 from app.models.journal import Commodity, JournalEntry, PartyType
-from app.models.purchase import OldGoldPurchase, StonePurchase, StonePurchaseItem
+from app.models.metal import Metal
+from app.models.purchase import (
+    GoldPaymentMode,
+    GoldPurchase,
+    GoldPurchaseItem,
+    OldGoldPurchase,
+    StonePurchase,
+    StonePurchaseItem,
+    Supplier,
+    SupplierPayment,
+)
 from app.models.stock_movement import MovementType
 from app.models.stone import Stone, StoneCategory
 from app.services.inventory import post_movement
@@ -33,18 +47,24 @@ from app.services.ledger import EntryDraft, Posting, d, fine_grams, post_entry, 
 # a reversal knows what it is undoing.
 OLD_GOLD_SOURCE = "old_gold_purchase"
 STONE_PURCHASE_SOURCE = "stone_purchase"
+GOLD_PURCHASE_SOURCE = "gold_purchase"
+SUPPLIER_PAYMENT_SOURCE = "supplier_payment"
 
 _PKR = Decimal("0.01")
+_ZERO_PKR = Decimal("0")
 _CT = Decimal("0.0001")
 
 # Advisory-lock keys, in the same 7_3xx_xxx block the rest of the app uses so
 # nothing here can collide with a serial mint or the opening-balance run.
 _OLD_GOLD_NO_LOCK = lock_keys.OLD_GOLD_PURCHASE_NO
 _STONE_PURCHASE_NO_LOCK = lock_keys.STONE_PURCHASE_NO
+_GOLD_PURCHASE_NO_LOCK = lock_keys.GOLD_PURCHASE_NO
 _RAW_STONE_ITEM_LOCK = lock_keys.RAW_STONE_ITEM
 # Melt pots are per purity, so the lock is too — buying 22k must not serialise
 # against someone buying 21k at the next counter.
 _RAW_GOLD_ITEM_LOCK_BASE = lock_keys.RAW_GOLD_ITEM_BASE
+_RAW_SILVER_ITEM_LOCK_BASE = lock_keys.RAW_SILVER_ITEM_BASE
+_SUPPLIER_PAYMENT_NO_LOCK = lock_keys.SUPPLIER_PAYMENT_NO
 
 
 # --------------------------------------------------------------------------
@@ -90,10 +110,30 @@ async def next_stone_purchase_no(db: AsyncSession) -> str:
     )
 
 
+async def next_gold_purchase_no(db: AsyncSession, metal: Metal = Metal.gold) -> str:
+    # `GP`, not `OG`: a dealer's bill and a counter buy-back are different
+    # documents and the shop has to be able to tell them apart by number alone.
+    #
+    # Silver gets `SB` for the same reason — the two bills hit different control
+    # accounts, and one series covering both would mean reading the metal column
+    # to know which safe GP-26-00042 filled. Not `SP`, which is already stone
+    # purchases: a prefix that could mean either is worse than no prefix.
+    #
+    # `_next_no` scans only its own prefix, so the two series count independently
+    # and neither can hand out a number the other has taken.
+    return await _next_no(
+        db,
+        model=GoldPurchase,
+        column=GoldPurchase.purchase_no,
+        prefix="SB" if metal is Metal.silver else "GP",
+        lock_key=_GOLD_PURCHASE_NO_LOCK,
+    )
+
+
 # --------------------------------------------------------------------------
 # Where bought material lands in stock
 # --------------------------------------------------------------------------
-async def raw_gold_item(db: AsyncSession, *, purity: int) -> InventoryItem:
+async def raw_gold_item(db: AsyncSession, *, purity: int, branch_id: int) -> InventoryItem:
     """
     The melt pot for one purity, created on first use.
 
@@ -115,6 +155,10 @@ async def raw_gold_item(db: AsyncSession, *, purity: int) -> InventoryItem:
                 .where(
                     InventoryItem.type == InventoryType.raw_gold,
                     InventoryItem.purity == purity,
+                    # Per branch: 22k in the Anarkali safe is not 22k in the
+                    # Gulberg safe, and topping one up from the other's counter
+                    # would make both branch stock reports wrong at once.
+                    InventoryItem.branch_id == branch_id,
                 )
                 .order_by(InventoryItem.id)
                 .limit(1)
@@ -129,6 +173,7 @@ async def raw_gold_item(db: AsyncSession, *, purity: int) -> InventoryItem:
             type=InventoryType.raw_gold,
             label=f"Raw gold {purity}k",
             purity=purity,
+            branch_id=branch_id,
             quantity=0,
             weight_g=Decimal("0"),
             weight_ct=Decimal("0"),
@@ -136,6 +181,78 @@ async def raw_gold_item(db: AsyncSession, *, purity: int) -> InventoryItem:
         db.add(item)
         await db.flush()
     return item
+
+
+async def raw_silver_item(
+    db: AsyncSession, *, tunch_pct: Decimal, branch_id: int
+) -> InventoryItem:
+    """
+    The silver pot for one fineness, created on first use.
+
+    The gold twin of this keys on karat; silver keys on tunch, because silver
+    has no karat. Beyond that the reasoning is identical — 999 bought this
+    morning is the same metal as the 999 in the safe, and a row per purchase
+    leaves a shop with stock lines it can never weigh against.
+
+    Its own function rather than a `metal=` parameter on `raw_gold_item`: the
+    two look up on different columns, and the one shared thing — "find or make
+    the pot" — is four lines. A merged version would take a purity that means
+    karat sometimes and fineness other times, which is the exact confusion
+    `Metal` exists to prevent.
+    """
+    fineness = d(tunch_pct)
+    key = int((fineness * 10).to_integral_value())
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(:k)").bindparams(k=_RAW_SILVER_ITEM_LOCK_BASE + key)
+    )
+    item = (
+        (
+            await db.execute(
+                select(InventoryItem)
+                .where(
+                    InventoryItem.type == InventoryType.raw_silver,
+                    InventoryItem.tunch_pct == fineness,
+                    InventoryItem.branch_id == branch_id,
+                )
+                .order_by(InventoryItem.id)
+                .limit(1)
+            )
+        )
+        .unique()
+        .scalars()
+        .first()
+    )
+    if item is None:
+        item = InventoryItem(
+            type=InventoryType.raw_silver,
+            # "Raw silver 999", not "Raw silver 99.9%" — the trade names silver
+            # by its parts-per-thousand and that is what is stamped on the bar.
+            label=f"Raw silver {key}",
+            tunch_pct=fineness,
+            branch_id=branch_id,
+            quantity=0,
+            weight_g=Decimal("0"),
+            weight_ct=Decimal("0"),
+        )
+        db.add(item)
+        await db.flush()
+    return item
+
+
+def karat_from_tunch(tunch_pct: Decimal | float | None) -> int:
+    """
+    Which melt pot a gold lot quoted only by assay belongs in.
+
+    A pot is a physical bucket and buckets are labelled in karat, so a bar sold
+    as 99.5 tunch has to join one. It joins 24k, the pot it would physically be
+    tipped into — the rounding is of the *label*, not of the metal: the lot
+    keeps its exact tunch and every fine-gram figure is still computed from
+    that, so nothing is lost but the name on the bucket.
+    """
+    if not tunch_pct:
+        return 24
+    karat = int((d(tunch_pct) * Decimal("24") / Decimal("100")).to_integral_value())
+    return min(24, max(1, karat))
 
 
 def grade_label(
@@ -153,6 +270,7 @@ async def raw_stone_item(
     cut: str | None,
     color: str | None,
     clarity: str | None,
+    branch_id: int,
 ) -> InventoryItem:
     """
     The packet a graded lot goes into, created on first use.
@@ -174,6 +292,7 @@ async def raw_stone_item(
                 .where(
                     InventoryItem.type == InventoryType.raw_stone,
                     InventoryItem.label == label,
+                    InventoryItem.branch_id == branch_id,
                 )
                 .order_by(InventoryItem.id)
                 .limit(1)
@@ -187,6 +306,7 @@ async def raw_stone_item(
         item = InventoryItem(
             type=InventoryType.raw_stone,
             label=label,
+            branch_id=branch_id,
             quantity=0,
             weight_g=Decimal("0"),
             weight_ct=Decimal("0"),
@@ -259,7 +379,7 @@ async def post_old_gold_purchase(
             f"{purchase.purchase_no}: bought {d(purchase.weight_g)}g "
             f"{purchase.kind.value} gold from {who} at {d(purchase.rate_per_g)}/g"
         ),
-        entry_date=purchase.purchased_at.date(),
+        entry_date=clock.shop_date(purchase.purchased_at),
         source_type=OLD_GOLD_SOURCE,
         source_id=purchase.id,
     )
@@ -332,6 +452,225 @@ async def reverse_old_gold_purchase(
 
 
 # --------------------------------------------------------------------------
+# Gold purchases (from a dealer)
+# --------------------------------------------------------------------------
+def gold_line_amount(weight_g: Decimal, rate_per_g: Decimal) -> Decimal:
+    """
+    Quoted against the actual weight, not the fine weight.
+
+    That is how the trade quotes it, and it matches how a buy-back is recorded,
+    so the two documents can be compared without one of them being converted
+    first. Fine grams are derived once, at posting time, from the purity.
+    """
+    return (d(weight_g) * d(rate_per_g)).quantize(_PKR)
+
+
+async def lots_of(db: AsyncSession, purchase: GoldPurchase) -> list[GoldPurchaseItem]:
+    """The bill's lots, fetched rather than read off the relationship."""
+    return list(
+        (
+            await db.execute(
+                select(GoldPurchaseItem)
+                .where(GoldPurchaseItem.purchase_id == purchase.id)
+                .order_by(GoldPurchaseItem.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+# Which commodity a bullion bill moves, and which account holds it. Mirrors
+# `routing._METAL_LEDGER`, which does the same job for job legs; kept separate
+# because that one also carries the with-workers account, which a purchase has
+# no business touching.
+_PURCHASE_LEDGER: dict[Metal, tuple[Commodity, SystemAccount]] = {
+    Metal.gold: (Commodity.GOLD, SystemAccount.GOLD_IN_HAND),
+    Metal.silver: (Commodity.SILVER, SystemAccount.SILVER_IN_HAND),
+}
+
+
+def purity_label(purity: int | None, tunch_pct: Decimal | float | None) -> str:
+    """
+    How a lot's purity reads on a journal line or a stock note.
+
+    Tunch leads when present because it is what `fine_grams` actually used, and
+    a memo naming the karat beside a figure derived from the assay is a memo
+    that cannot be checked by hand.
+    """
+    if tunch_pct:
+        return f"{d(tunch_pct).normalize()} tunch"
+    return f"{purity}k" if purity else "unstated purity"
+
+
+_CREDIT_ACCOUNT = {
+    GoldPaymentMode.cash: SystemAccount.CASH_IN_HAND,
+    GoldPaymentMode.bank: SystemAccount.BANK,
+    GoldPaymentMode.credit: SystemAccount.SUPPLIERS,
+}
+
+
+async def post_gold_purchase(
+    db: AsyncSession,
+    purchase: GoldPurchase,
+    items: list[GoldPurchaseItem],
+    *,
+    supplier_name: str,
+    user_id: int | None = None,
+) -> JournalEntry:
+    """
+    Metal in at what it cost; money out of wherever it came from.
+
+    Debit the metal's own in-hand account once per lot — 1130 for gold, 1135
+    for silver — in *fine* grams, carrying that lot's own actual weight and
+    purity. One aggregate posting would lose the purity breakdown the metal
+    ledger reads, and a bill with 22k and 24k bars on it would become an
+    untraceable blended figure.
+
+    Which account is read from the *bill*, so no arrangement of lots can send
+    half a silver invoice into the gold account. `Commodity` moves with it:
+    grams of silver in a GOLD-commodity line would be added to the gold balance
+    by every report that sums it, and the two differ a hundredfold in value.
+
+    Carriage and assay are capitalised into the metal rather than expensed:
+    they are part of what the gold cost, and expensing them would understate
+    stock and overstate this month's costs at the same time. They are spread
+    across the lots in proportion to value, which is why the rate per fine gram
+    is derived from the loaded total rather than from what the dealer quoted.
+
+    The credit side follows how it was paid. Only `credit` tags the supplier —
+    the party fields say *whose balance this line is part of*, and cash out of
+    the shop's own till is not the dealer's balance, however it got to them.
+    """
+    total = d(purchase.total)
+    if total <= 0:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "A bill of zero rupees has nothing to post."
+        )
+    subtotal = d(purchase.subtotal)
+    if subtotal <= 0:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "A bill with no metal on it has nothing to post."
+        )
+
+    metal = purchase.metal or Metal.gold
+    commodity, in_hand = _PURCHASE_LEDGER[metal]
+
+    draft = EntryDraft(
+        memo=f"{purchase.purchase_no}: raw {metal.value} from {supplier_name}"
+        + (f" ({purchase.reference})" if purchase.reference else ""),
+        entry_date=clock.shop_date(purchase.purchased_at),
+        source_type=GOLD_PURCHASE_SOURCE,
+        source_id=purchase.id,
+    )
+
+    # Loading is apportioned by value, and the last lot absorbs the rounding —
+    # otherwise the debits and the credit differ by a paisa and the entry will
+    # not balance.
+    booked = _ZERO_PKR
+    for index, item in enumerate(items):
+        amount = d(item.amount)
+        if index == len(items) - 1:
+            loaded = total - booked
+        else:
+            loaded = (total * amount / subtotal).quantize(_PKR)
+        booked += loaded
+
+        fine = fine_grams(item.weight_g, item.purity, item.tunch_pct)
+        if fine <= 0:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"Lot {index + 1} weighs nothing, so there is no metal to book.",
+            )
+        draft.add(
+            Posting(
+                account_code=in_hand.value,
+                quantity=fine,
+                commodity=commodity,
+                rate=effective_fine_rate(loaded, fine),
+                native_weight_g=d(item.weight_g),
+                # Karat only. A silver lot has none, and writing one here would
+                # put a gold-scale number on the line every statement prints.
+                native_purity=item.purity,
+                memo=(
+                    f"{d(item.weight_g)}g {purity_label(item.purity, item.tunch_pct)}"
+                    f" = {fine}g fine"
+                ),
+            )
+        )
+
+    account = _CREDIT_ACCOUNT[purchase.payment_mode]
+    on_credit = purchase.payment_mode is GoldPaymentMode.credit
+    draft.add(
+        Posting(
+            account_code=account.value,
+            quantity=-total,
+            party_type=PartyType.supplier if on_credit else None,
+            party_id=purchase.supplier_id if on_credit else None,
+            memo=(
+                f"Payable to {supplier_name}"
+                if on_credit
+                else f"Paid to {supplier_name} by {purchase.payment_mode.value}"
+            ),
+        )
+    )
+    return await post_entry(db, draft, user_id=user_id)
+
+
+async def reverse_gold_purchase(
+    db: AsyncSession, purchase: GoldPurchase, *, user_id: int | None = None
+) -> JournalEntry:
+    """
+    Undo both halves, or neither.
+
+    The books go first because `reverse_entry` is what refuses a second
+    attempt — doing the stock first would let a double-click take the metal out
+    twice before the ledger objected. If a bar has already been issued to a
+    worker, `post_movement` refuses and the whole transaction rolls back, which
+    is the right answer: you cannot un-buy metal that is no longer there.
+    """
+    if purchase.journal_entry_id is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"{purchase.purchase_no} never posted to the ledger, so there is nothing to reverse.",
+        )
+    original = await db.get(JournalEntry, purchase.journal_entry_id)
+    if original is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"The journal entry behind {purchase.purchase_no} is missing.",
+        )
+    reversal = await reverse_entry(
+        db,
+        original,
+        memo=f"Reversal of {(purchase.metal or Metal.gold).value} purchase {purchase.purchase_no}",
+        user_id=user_id,
+    )
+
+    # Selected rather than read off `purchase.items`. The relationship is only
+    # populated when the parent was loaded by a query that eager-loaded it;
+    # rows added earlier in the same session leave it stale, and touching it
+    # then triggers a lazy load, which async SQLAlchemy refuses outright.
+    for item in await lots_of(db, purchase):
+        if item.inventory_item_id is None:
+            continue
+        pot = await db.get(InventoryItem, item.inventory_item_id)
+        if pot is None:
+            continue
+        await post_movement(
+            db,
+            item=pot,
+            type=MovementType.adjustment,
+            weight_g_delta=-d(item.weight_g),
+            reference_type=GOLD_PURCHASE_SOURCE,
+            reference_id=purchase.id,
+            notes=f"Reversal of {purchase.purchase_no}",
+            user_id=user_id,
+        )
+    return reversal
+
+
+# --------------------------------------------------------------------------
 # Stone purchases
 # --------------------------------------------------------------------------
 def stone_line_amount(weight_ct: Decimal, rate_per_ct: Decimal) -> Decimal:
@@ -373,7 +712,7 @@ async def post_stone_purchase(
     draft = EntryDraft(
         memo=f"{purchase.purchase_no}: stones from {who}"
         + (f" ({purchase.reference})" if purchase.reference else ""),
-        entry_date=purchase.purchased_at.date(),
+        entry_date=clock.shop_date(purchase.purchased_at),
         source_type=STONE_PURCHASE_SOURCE,
         source_id=purchase.id,
     )
@@ -587,4 +926,327 @@ async def stone_stock(
     return sorted(
         (ln for ln in lines.values() if ln.stone_name),
         key=lambda ln: (ln.stone_name.lower(), grade_label(ln.quality, ln.cut, ln.color, ln.clarity)),
+    )
+
+
+# --------------------------------------------------------------------------
+# Paying a dealer, and which bills that settles
+# --------------------------------------------------------------------------
+async def next_supplier_payment_no(db: AsyncSession) -> str:
+    # `VP` — vendor payment. Money out to a dealer and a receipt from a
+    # customer (`PMT`) sit on opposite sides of the books, and a shop has to be
+    # able to tell them apart by number alone.
+    return await _next_no(
+        db,
+        model=SupplierPayment,
+        column=SupplierPayment.payment_no,
+        prefix="VP",
+        lock_key=_SUPPLIER_PAYMENT_NO_LOCK,
+    )
+
+
+_PAYMENT_SOURCE = {
+    GoldPaymentMode.cash: SystemAccount.CASH_IN_HAND,
+    GoldPaymentMode.bank: SystemAccount.BANK,
+}
+
+
+async def post_supplier_payment(
+    db: AsyncSession,
+    payment: SupplierPayment,
+    *,
+    supplier_name: str,
+    user_id: int | None = None,
+) -> JournalEntry:
+    """
+    Money out, and the payable comes down by the same amount.
+
+    Debit 2110 Suppliers — a liability falling — tagged with the party, because
+    the party columns are what a supplier statement reads. Credit cash or bank.
+
+    Nothing here says *which bill* was paid. That is derived when the bills are
+    read, oldest first, and deliberately not stored: a payment that named its
+    bill would be a second record of the debt alongside the ledger's, and the
+    two would disagree the first time anybody posted a manual correction.
+    """
+    amount = d(payment.amount)
+    if amount <= 0:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "A payment of nothing has nothing to post."
+        )
+    account = _PAYMENT_SOURCE.get(payment.method)
+    if account is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Settling a bill 'on credit' is not a payment — it is the bill.",
+        )
+
+    draft = EntryDraft(
+        memo=f"{payment.payment_no}: paid {supplier_name}"
+        + (f" ({payment.reference})" if payment.reference else ""),
+        entry_date=clock.shop_date(payment.paid_at),
+        source_type=SUPPLIER_PAYMENT_SOURCE,
+        source_id=payment.id,
+    )
+    draft.add(
+        Posting(
+            account_code=SystemAccount.SUPPLIERS.value,
+            quantity=amount,
+            party_type=PartyType.supplier,
+            party_id=payment.supplier_id,
+            memo=f"Paid to {supplier_name}",
+        )
+    )
+    draft.add(
+        Posting(
+            account_code=account.value,
+            quantity=-amount,
+            memo=f"Paid to {supplier_name} by {payment.method.value}",
+        )
+    )
+    return await post_entry(db, draft, user_id=user_id)
+
+
+async def reverse_supplier_payment(
+    db: AsyncSession, payment: SupplierPayment, *, user_id: int | None = None
+) -> JournalEntry:
+    """Undo a payment. The row stays; the ledger gets a contra entry."""
+    if payment.journal_entry_id is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"{payment.payment_no} never posted, so there is nothing to reverse.",
+        )
+    original = await db.get(JournalEntry, payment.journal_entry_id)
+    if original is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"The journal entry behind {payment.payment_no} is missing.",
+        )
+    return await reverse_entry(
+        db, original, memo=f"Reversal of supplier payment {payment.payment_no}", user_id=user_id
+    )
+
+
+class BillStatus(str, enum.Enum):
+    """
+    Where a bill stands, in the words §36 of the specification asks for.
+
+    `undated` is the one the spec does not list and the shop needs anyway. A
+    bill nobody put a date on is not upcoming, not due and not overdue — and
+    calling it any of those would either invent a deadline or hide a real debt
+    in a bucket people stop reading.
+    """
+
+    paid = "paid"
+    part_paid = "part_paid"
+    overdue = "overdue"
+    due_today = "due_today"
+    upcoming = "upcoming"
+    undated = "undated"
+
+
+@dataclass
+class Bill:
+    """One purchase the shop owes on, with what is left against it."""
+
+    kind: str  # 'gold' | 'silver' | 'stone'
+    purchase_id: int
+    purchase_no: str
+    supplier_id: int
+    supplier_name: str | None
+    purchased_on: date
+    due_date: date | None
+    reference: str | None
+    total: Decimal
+    paid: Decimal
+    outstanding: Decimal
+    status: BillStatus
+    days_overdue: int | None
+
+
+def _bill_status(
+    outstanding: Decimal, paid: Decimal, due: date | None, today: date
+) -> tuple[BillStatus, int | None]:
+    # The order of these tests is the whole design, because a bill can honestly
+    # be described several ways at once and only one label fits on a row.
+    #
+    # Settled wins over everything, including the date: a bill paid late is
+    # paid, and leaving it red would make the overdue list useless in a month.
+    if outstanding <= Decimal("0.005"):
+        return BillStatus.paid, None
+    # Late beats part-paid. Both are true of a bill half-settled and overdue,
+    # but only one of them is why somebody needs to look at it today.
+    if due is not None and due < today:
+        return BillStatus.overdue, (today - due).days
+    # Part-paid beats undated. Money having been received against a bill is a
+    # fact about the bill; the date missing is a fact about the paperwork, and
+    # reporting the paperwork would hide the money.
+    if paid > 0:
+        return BillStatus.part_paid, None
+    if due is None:
+        return BillStatus.undated, None
+    if due == today:
+        return BillStatus.due_today, None
+    return BillStatus.upcoming, None
+
+
+def apply_oldest_first(bills: list[Bill], pool: Decimal) -> None:
+    """
+    Spread what has been paid across the bills, oldest first, in place.
+
+    The shop's own rule, and the reason there is no allocation table. Money
+    handed over for this week's bill will show as clearing March's — that is
+    the honest cost of the choice, and it is what a khata does.
+
+    `bills` must already be in the order the debt was incurred.
+    """
+    for bill in bills:
+        if pool <= 0:
+            break
+        applied = min(pool, bill.total)
+        pool -= applied
+        bill.paid = applied
+        bill.outstanding = (bill.total - applied).quantize(_PKR)
+
+
+async def supplier_bills(
+    db: AsyncSession,
+    *,
+    supplier_id: int | None = None,
+    today: date | None = None,
+) -> list[Bill]:
+    """
+    Every bill the shop still owes on, with what is left against each.
+
+    Three things this has to get right, and each is a way it would otherwise be
+    quietly wrong:
+
+    * **Only bills that created a payable count.** A bullion bill paid in cash
+      at the counter never touched 2110 and is not a debt; including it would
+      show the shop owing money it handed over on the day. Stone bills always
+      post to the supplier, so they always count.
+    * **Reversed bills are excluded.** A reversal is a contra entry, so the
+      debt is gone from the ledger — leaving the bill in the ageing list would
+      have the shop chasing a payment for a purchase that was undone.
+    * **Payments are applied in the order the debt was incurred**, so the
+      oldest bill clears first. Ordering by `purchased_at` and not by due date:
+      the money was owed from the day the goods arrived, and a bill given a
+      long credit period does not jump the queue behind one bought later.
+    """
+    today = today or clock.today()
+
+    gold_rows = (
+        await db.execute(
+            select(GoldPurchase)
+            .where(
+                GoldPurchase.payment_mode == GoldPaymentMode.credit,
+                *( [GoldPurchase.supplier_id == supplier_id] if supplier_id else [] ),
+            )
+            .order_by(GoldPurchase.purchased_at, GoldPurchase.id)
+        )
+    ).unique().scalars().all()
+
+    stone_rows = (
+        await db.execute(
+            select(StonePurchase)
+            .where(*( [StonePurchase.supplier_id == supplier_id] if supplier_id else [] ))
+            .order_by(StonePurchase.purchased_at, StonePurchase.id)
+        )
+    ).unique().scalars().all()
+
+    entry_ids = [
+        r.journal_entry_id
+        for r in [*gold_rows, *stone_rows]
+        if r.journal_entry_id is not None
+    ]
+    reversed_ids: set[int] = set()
+    if entry_ids:
+        reversed_ids = {
+            int(original)
+            for (original,) in (
+                await db.execute(
+                    select(JournalEntry.reverses_entry_id).where(
+                        JournalEntry.reverses_entry_id.in_(entry_ids)
+                    )
+                )
+            ).all()
+            if original is not None
+        }
+
+    supplier_names = {
+        int(sid): name
+        for sid, name in (
+            await db.execute(select(Supplier.id, Supplier.name))
+        ).all()
+    }
+
+    bills: list[Bill] = []
+    for row in gold_rows:
+        if row.journal_entry_id in reversed_ids:
+            continue
+        bills.append(_bill_from(row, kind=(row.metal or Metal.gold).value, names=supplier_names))
+    for row in stone_rows:
+        if row.journal_entry_id in reversed_ids:
+            continue
+        bills.append(_bill_from(row, kind="stone", names=supplier_names))
+
+    bills.sort(key=lambda b: (b.purchased_on, b.purchase_no))
+
+    # What has actually been paid to each supplier, net of reversed payments.
+    # Read off the *payments* rather than off the 2110 balance: that balance
+    # also carries opening balances and manual corrections, and treating those
+    # as bill payments would silently mark the oldest bills settled.
+    # `contra` is an alias because the reversal being looked for is a *different*
+    # journal entry from the one the payment points at. Without it SQLAlchemy
+    # correlates the subquery against the outer JournalEntry and the statement
+    # loses its FROM clause entirely.
+    contra = aliased(JournalEntry)
+    paid_stmt = (
+        select(
+            SupplierPayment.supplier_id,
+            func.coalesce(func.sum(SupplierPayment.amount), 0),
+        )
+        .where(
+            SupplierPayment.journal_entry_id.is_not(None),
+            ~select(contra.id)
+            .where(contra.reverses_entry_id == SupplierPayment.journal_entry_id)
+            .exists(),
+            *( [SupplierPayment.supplier_id == supplier_id] if supplier_id else [] ),
+        )
+        .group_by(SupplierPayment.supplier_id)
+    )
+    pools = {int(sid): d(amt) for sid, amt in (await db.execute(paid_stmt)).all()}
+
+    by_supplier: dict[int, list[Bill]] = {}
+    for bill in bills:
+        by_supplier.setdefault(bill.supplier_id, []).append(bill)
+    for sid, group in by_supplier.items():
+        apply_oldest_first(group, pools.get(sid, _ZERO_PKR))
+
+    for bill in bills:
+        bill.status, bill.days_overdue = _bill_status(
+            bill.outstanding, bill.paid, bill.due_date, today
+        )
+    return bills
+
+
+def _bill_from(row, *, kind: str, names: dict[int, str]) -> Bill:
+    total = d(row.total)
+    return Bill(
+        kind=kind,
+        purchase_id=row.id,
+        purchase_no=row.purchase_no,
+        supplier_id=row.supplier_id,
+        supplier_name=names.get(row.supplier_id),
+        purchased_on=clock.shop_date(row.purchased_at),
+        due_date=row.due_date,
+        reference=row.reference,
+        total=total,
+        paid=_ZERO_PKR,
+        outstanding=total,
+        # Filled in by the caller once payments have been spread. Defaulting to
+        # `undated` rather than to a real bucket so a code path that forgets to
+        # settle it cannot quietly report every bill as upcoming.
+        status=BillStatus.undated,
+        days_overdue=None,
     )

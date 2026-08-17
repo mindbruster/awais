@@ -46,6 +46,7 @@ interface Purchase {
   supplier_name: string | null;
   purchased_at: string;
   reference: string | null;
+  due_date: string | null;
   subtotal: string;
   extra_cost_pct: string;
   extra_cost_amount: string;
@@ -104,6 +105,7 @@ export function StonePurchasePage() {
   const [supplierId, setSupplierId] = useState("");
   const [reference, setReference] = useState("");
   const [extraPct, setExtraPct] = useState("0");
+  const [dueDate, setDueDate] = useState("");
   const [notes, setNotes] = useState("");
   const [lines, setLines] = useState<LineDraft[]>([blankLine()]);
   const [saving, setSaving] = useState(false);
@@ -183,6 +185,7 @@ export function StonePurchasePage() {
       const res = await api.post<Purchase>("/purchasing/stone-purchases", {
         supplier_id: Number(supplierId),
         reference: reference || null,
+        due_date: dueDate || null,
         extra_cost_pct: extraPct || "0",
         notes: notes || null,
         items: usable.map((l) => ({
@@ -244,6 +247,15 @@ export function StonePurchasePage() {
             value={reference}
             onChange={(e) => setReference(e.target.value)}
             placeholder="Supplier's own number"
+          />
+          {/* A stone bill always goes on the supplier's account — there is no
+              pay-at-the-counter mode here — so the date is always offered. */}
+          <TextField
+            label="Payment due"
+            type="date"
+            value={dueDate}
+            onChange={(e) => setDueDate(e.target.value)}
+            hint="Leave blank if nothing was agreed"
           />
           <TextField
             label="Extra cost %"

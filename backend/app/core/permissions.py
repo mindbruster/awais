@@ -36,6 +36,19 @@ PERMISSIONS: dict[str, set[str]] = {
         "design:read",
         # Taking money and reconciling it is the accountant's core job.
         "payment:read", "payment:write", "payment:reverse",
+        # The cash book is the accountant's ledger by another name: rent, wages,
+        # bank charges and the till float all land in the books.
+        "cash:read", "cash:write", "cash:flow",
+        # Salesmen, brokers and the figures they are asked to hit.
+        "seller:read", "seller:write",
+        # Branch figures are money figures — sales by shop, stock by shop.
+        # Opening or closing a branch is an owner decision, so writing stays
+        # with admins.
+        "branch:read",
+        "transfer:read", "transfer:write",
+        "order:read", "order:write",
+        "notification:read", "notification:send",
+        "approval:read", "approval:write",
     },
     "staff": {
         "customer:read", "customer:write", "customer:delete",
@@ -56,11 +69,32 @@ PERMISSIONS: dict[str, set[str]] = {
         # receive all day. They cannot see the books those postings land in —
         # worker gold liabilities and cash balances are owner information.
         "design:read", "design:write",
+        # Counter staff record what leaves the till — a courier, tea, a taxi —
+        # because an expense nobody could enter is an expense that never
+        # reaches the books. Reading the cash *flow* is a money figure and
+        # stays with the accountant, so the flow report checks "cash:flow".
+        "cash:read", "cash:write",
+        # The counter works alongside salesmen and needs to pick one on a bill.
+        # Setting their targets is an owner decision.
+        "seller:read",
         # Counter staff take money at the till and must be able to record it —
         # a payment that goes unrecorded because the salesperson lacked a
         # permission is worse than one recorded by the wrong person. Reversing
         # one is a correction to the books, so that stays with the accountant.
         "payment:read", "payment:write",
+        # Staff need to know which shops exist in order to pick one, and they
+        # are the people who physically pack and sign for a transfer. Opening
+        # or closing a branch is not theirs.
+        "branch:read",
+        "transfer:read", "transfer:write",
+        # Counter staff take the job in, chase it and hand it over. This is
+        # their screen more than anyone's.
+        "order:read", "order:write",
+        # The counter is who tells a customer their piece is ready.
+        "notification:read", "notification:send",
+        # Letting a piece out on approval and chasing it back is
+        # counter work, and the piece is the shop's until it sells.
+        "approval:read", "approval:write",
     },
 }
 

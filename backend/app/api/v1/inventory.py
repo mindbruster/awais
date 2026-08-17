@@ -1,7 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import or_, select
 
-from app.api.deps import DbSession, require_password_confirm, require_perm
+from app.api.deps import CurrentUser, DbSession, require_password_confirm, require_perm
+from app.services import branches
 from app.models.inventory import InventoryItem, InventoryType
 from app.schemas.inventory import (
     InventoryItemCreate,
@@ -20,12 +21,15 @@ async def list_items(
     db: DbSession,
     q: str | None = Query(default=None),
     type: InventoryType | None = Query(default=None),
+    branch_id: int | None = Query(default=None, description="Stock held at this shop"),
     limit: int = Query(default=100, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> list[InventoryItem]:
     stmt = select(InventoryItem).order_by(InventoryItem.id.desc()).limit(limit).offset(offset)
     if type:
         stmt = stmt.where(InventoryItem.type == type)
+    if branch_id is not None:
+        stmt = stmt.where(InventoryItem.branch_id == branch_id)
     if q:
         like = f"%{q}%"
         stmt = stmt.where(or_(InventoryItem.label.ilike(like), InventoryItem.location.ilike(like)))
@@ -34,8 +38,14 @@ async def list_items(
 
 
 @router.post("", response_model=InventoryItemRead, status_code=status.HTTP_201_CREATED, dependencies=[write])
-async def create_item(payload: InventoryItemCreate, db: DbSession) -> InventoryItem:
-    item = InventoryItem(**payload.model_dump())
+async def create_item(
+    payload: InventoryItemCreate, db: DbSession, current: CurrentUser
+) -> InventoryItem:
+    data = payload.model_dump()
+    branch = await branches.resolve_branch(
+        db, requested_id=data.pop("branch_id", None), user=current
+    )
+    item = InventoryItem(**data, branch_id=branch.id)
     db.add(item)
     await db.commit()
     await db.refresh(item)

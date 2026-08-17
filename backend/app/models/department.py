@@ -42,6 +42,12 @@ class Department(Base, TimestampMixin):
         String(20), default="percent_of_issued", nullable=False
     )
     default_wastage_per_100_pcs_g: Mapped[float | None] = mapped_column(Numeric(14, 4))
+    # The number of pieces the figure above is quoted against — see
+    # `JobLeg.wastage_pieces_base`. A hundred by default, because that is what
+    # most shops say, but never assumed.
+    default_wastage_pieces_base: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=100
+    )
     # Rupees per piece for departments that charge by the piece — stone setting
     # at 5 or 10 a stone, lacquering at 500 or 1000 an item.
     default_rate_per_piece: Mapped[float | None] = mapped_column(Numeric(14, 4))

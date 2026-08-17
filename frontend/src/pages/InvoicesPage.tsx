@@ -28,11 +28,28 @@ interface Invoice {
   sale_type: string;
   status: string;
   customer_id: number;
+  customer_name: string | null;
+  seller_name: string | null;
   currency: Currency;
   subtotal: string;
   discount_amount: string;
   total: string;
   issued_at: string | null;
+}
+
+/**
+ * A salesman or a broker, as the invoice form offers them.
+ *
+ * `kind` is carried so the two can be labelled apart in the picker. A salesman
+ * carries the shop's stock; a broker introduces a buyer and holds nothing.
+ * They settle differently and a bill credited to the wrong sort is a
+ * commission paid on the wrong basis.
+ */
+interface Seller {
+  id: number;
+  name: string;
+  kind: "salesman" | "broker";
+  commission_pct: string;
 }
 
 interface Customer {
@@ -157,6 +174,7 @@ export function InvoicesPage() {
                 <th className="px-4 py-3">Type</th>
                 <th className="px-4 py-3">Status</th>
                 <th className="px-4 py-3">Customer</th>
+                <th className="px-4 py-3">Sold by</th>
                 <th className="px-4 py-3 text-right">Subtotal</th>
                 <th className="px-4 py-3 text-right">Discount</th>
                 <th className="px-4 py-3 text-right">Total</th>
@@ -185,7 +203,14 @@ export function InvoicesPage() {
                       {inv.status}
                     </span>
                   </td>
-                  <td className="px-4 py-3 text-slate-500">#{inv.customer_id}</td>
+                  <td className="px-4 py-3">
+                    {inv.customer_name ?? (
+                      <span className="text-slate-400">#{inv.customer_id}</span>
+                    )}
+                  </td>
+                  <td className="px-4 py-3 text-slate-600">
+                    {inv.seller_name ?? <span className="text-slate-300">—</span>}
+                  </td>
                   <td className="px-4 py-3 text-right">{fmtMoney(inv.subtotal, inv.currency)}</td>
                   <td className="px-4 py-3 text-right text-red-600">
                     {fmtMoney(inv.discount_amount, inv.currency)}
@@ -360,14 +385,27 @@ function NewInvoiceModal({
 }) {
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
+  const [sellers, setSellers] = useState<Seller[]>([]);
   const [customerId, setCustomerId] = useState<number>(0);
+  // Who gets credit for the sale. Optional — a walk-in served by nobody in
+  // particular is an ordinary bill, and forcing a name would put fictional
+  // sales against whoever is first in the list.
+  const [sellerId, setSellerId] = useState<number>(0);
   const [saleType, setSaleType] = useState("normal");
+  // Which of the shop's two bills. A loose-material bill carries no gold at
+  // all — the server refuses weight, wastage and ratti on one — so the gold
+  // fields are hidden rather than left to be rejected after typing.
+  const [kind, setKind] = useState<"finished_product" | "loose_material">(
+    "finished_product",
+  );
   const [currency, setCurrency] = useState<Currency>("PKR");
   const [goldRate, setGoldRate] = useState("0");
   const [discount, setDiscount] = useState("0");
   const [discountWeight, setDiscountWeight] = useState("0");
   const [tax, setTax] = useState("0");
   const [billBookNo, setBillBookNo] = useState("");
+  // Days of credit. 0 — due on issue — is a counter sale and the common case.
+  const [termDays, setTermDays] = useState("0");
   const [roundOff, setRoundOff] = useState("0");
   const [notes, setNotes] = useState("");
   const [items, setItems] = useState<DraftItem[]>([blankItem()]);
@@ -401,9 +439,13 @@ function NewInvoiceModal({
     Promise.all([
       api.get<Customer[]>("/customers"),
       api.get<Product[]>("/products"),
-    ]).then(([c, p]) => {
+      // Active only: a salesman who has left should not be offered on a bill
+      // written today, though the bills he already carries keep his name.
+      api.get<Seller[]>("/sales/sellers", { params: { is_active: true } }),
+    ]).then(([c, p, s_]) => {
       setCustomers(c.data);
       setProducts(p.data);
+      setSellers(s_.data);
       if (c.data.length && !customerId) setCustomerId(c.data[0].id);
     });
   }, [open]);
@@ -451,34 +493,42 @@ function NewInvoiceModal({
       toast("error", "Pick a customer first");
       return;
     }
+    const loose = kind === "loose_material";
     setSubmitting(true);
     try {
       await api.post("/invoices", {
         customer_id: customerId,
+        seller_id: sellerId || null,
         sale_type: saleType,
+        kind,
         currency,
         gold_rate_per_g: goldRate || "0",
         discount_amount: discount || "0",
         discount_weight_g: discountWeight || "0",
         tax_amount: tax || "0",
         bill_book_no: billBookNo || null,
+        term_days: Number(termDays || 0),
         round_off: roundOff || "0",
         notes: notes || null,
         items: items.map((it) => ({
           product_id: it.product_id,
           description: it.description || "Untitled line",
           quantity: it.quantity || 1,
-          gold_weight_g: it.gold_weight_g || "0",
-          gold_purity: it.gold_purity ? parseInt(it.gold_purity, 10) : null,
-          gold_rate_per_g: it.gold_rate_per_g || goldRate || "0",
+          // Zeroed rather than sent on a loose-material bill. The server
+          // refuses gold on one, and a value left over from switching the bill
+          // type halfway through would come back as a validation error naming
+          // a field the form is no longer showing.
+          gold_weight_g: loose ? "0" : it.gold_weight_g || "0",
+          gold_purity: loose ? null : it.gold_purity ? parseInt(it.gold_purity, 10) : null,
+          gold_rate_per_g: loose ? "0" : it.gold_rate_per_g || goldRate || "0",
           stone_weight_ct: it.stone_weight_ct || "0",
           stone_rate_per_ct: it.stone_rate_per_ct || "0",
           labor_amount: it.labor_amount || "0",
           line_discount: it.line_discount || "0",
-          discount_ratti: it.discount_ratti || "0",
+          discount_ratti: loose ? "0" : it.discount_ratti || "0",
           ratti_base: RATTI_BASE,
-          sale_wastage_pct: it.sale_wastage_pct || "0",
-          sale_wastage_g: it.sale_wastage_g || "0",
+          sale_wastage_pct: loose ? "0" : it.sale_wastage_pct || "0",
+          sale_wastage_g: loose ? "0" : it.sale_wastage_g || "0",
         })),
       });
       toast("success", "Invoice draft created");
@@ -508,6 +558,28 @@ function NewInvoiceModal({
             onChange={(e) => setCustomerId(Number(e.target.value))}
             options={[{ value: 0, label: "— pick —" }, ...customers.map((c) => ({ value: c.id, label: c.name }))]}
           />
+          {/* Right after the customer, which is the order the counter works
+              in and the order the specification asks for. Optional: a bill
+              nobody is credited with is ordinary, and a required field here
+              would put invented sales against whoever sorts first. */}
+          <SelectField
+            label="Sold by"
+            value={String(sellerId)}
+            onChange={(e) => setSellerId(Number(e.target.value))}
+            options={[
+              { value: 0, label: "— nobody in particular —" },
+              ...sellers.map((s_) => ({
+                value: s_.id,
+                label:
+                  s_.kind === "broker" ? `${s_.name} · broker` : s_.name,
+              })),
+            ]}
+            hint={
+              sellers.length === 0
+                ? "No salesmen on file — add them under Sales."
+                : "Credits the sale to their target"
+            }
+          />
           <SelectField
             label="Sale type"
             value={saleType}
@@ -518,6 +590,20 @@ function NewInvoiceModal({
             ]}
           />
         </div>
+        <SelectField
+          label="Bill for"
+          value={kind}
+          onChange={(e) => setKind(e.target.value as typeof kind)}
+          options={[
+            { value: "finished_product", label: "Finished pieces" },
+            { value: "loose_material", label: "Loose material — stones only" },
+          ]}
+          hint={
+            kind === "loose_material"
+              ? "No gold on this bill: no weight, no wastage, no ratti. The discount comes off the stone price."
+              : "Billed on the metal, with the stones priced alongside."
+          }
+        />
         <div className="grid grid-cols-2 gap-3">
           <SelectField
             label="Currency"
@@ -753,6 +839,16 @@ function NewInvoiceModal({
             onChange={(e) => setBillBookNo(e.target.value)}
             placeholder="e.g. 441"
             hint="The paper bill this matches"
+          />
+          {/* Prints on the bill as Term Days, with the due date worked out
+              from it. Zero is a counter sale — money now. */}
+          <TextField
+            label="Term days"
+            type="number"
+            min="0"
+            value={termDays}
+            onChange={(e) => setTermDays(e.target.value)}
+            hint="Days of credit — 0 is due on issue"
           />
           <TextField
             label="Round off"

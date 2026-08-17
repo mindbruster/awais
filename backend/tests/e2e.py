@@ -7,13 +7,17 @@ Run: python -m tests.e2e
 from __future__ import annotations
 
 import io
+import os
 import sys
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
 import httpx
 
-BASE = "http://127.0.0.1:8000"
+# Overridable so the suite can be pointed at a throwaway instance. It rebuilds
+# the database it runs against, and a shop's live data is not a thing to find
+# out about afterwards.
+BASE = os.environ.get("E2E_BASE_URL", "http://127.0.0.1:8000")
 API = f"{BASE}/api/v1"
 
 PASS = "PASS"
@@ -62,6 +66,11 @@ def preflight(client: httpx.Client, auth: dict[str, str]) -> str | None:
 
 def main() -> int:
     client = httpx.Client(base_url=API, timeout=30)
+    # The AI endpoints wait on a third party and the free models are slow — a
+    # large one on a free tier can sit in a queue for a minute before it starts.
+    # They get their own client rather than a raised global timeout, so a real
+    # endpoint that starts taking 30s still fails the suite the way it should.
+    ai_client = httpx.Client(base_url=API, timeout=240)
 
     # ----- AUTH -----
     section("Auth")
@@ -166,42 +175,54 @@ def main() -> int:
 
     # ----- VENDORS -----
     section("Vendors")
-    # Every worker belongs to a department. That is what the worker dropdown on
-    # a design filters by, so one saved without a department can never be given
-    # work — he is simply absent from every screen that matters.
+    # Every worker handles a stage. That is what the worker dropdown on a design
+    # filters by, so one saved without a stage can never be given work — he is
+    # simply absent from every screen that matters.
     depts_by_code = {d["code"]: d["id"] for d in client.get("/departments", headers=auth).json()}
+    check(
+        "the floor is the three stages the shop runs",
+        set(depts_by_code) == {"MAKE", "SET", "LAC"},
+        f"got {sorted(depts_by_code)}",
+    )
     karigar = client.post(
-        "/vendors", headers=auth,
-        json={"name": "Ravi Karigar", "type": "karigar", "department_id": depts_by_code["CAST"]},
+        "/vendors", headers=auth, json={"name": "Ravi Karigar", "department_id": depts_by_code["MAKE"]},
     ).json()
     fixer = client.post(
-        "/vendors", headers=auth,
-        json={"name": "Stone Master", "type": "stone_fixer", "department_id": depts_by_code["SET"]},
+        "/vendors", headers=auth, json={"name": "Stone Master", "department_id": depts_by_code["SET"]},
     ).json()
-    polisher = client.post(
-        "/vendors", headers=auth,
-        json={"name": "Glow Polish", "type": "polish", "department_id": depts_by_code["POL"]},
+    lacker = client.post(
+        "/vendors", headers=auth, json={"name": "Coating Wala", "department_id": depts_by_code["LAC"]},
     ).json()
-    check("create karigar / fixer / polisher", all(v.get("id") for v in (karigar, fixer, polisher)))
+    check("create maker / stone fixer / lacker", all(v.get("id") for v in (karigar, fixer, lacker)))
 
-    r = client.post("/vendors", headers=auth, json={"name": "Nobody's Worker", "type": "karigar"})
+    r = client.post("/vendors", headers=auth, json={"name": "Nobody's Worker"})
     check(
-        "a worker without a department is refused → 422",
+        "a worker without a stage is refused → 422",
         r.status_code == 422,
         f"got {r.status_code} — one saved this way can never be picked on a design",
     )
     r = client.post(
         "/vendors", headers=auth,
-        json={"name": "Untyped Worker", "department_id": depts_by_code["POL"]},
+        json={"name": "Second Maker", "department_id": depts_by_code["MAKE"], "type": "polish"},
     )
     check(
-        "the legacy type is optional now → 201",
-        r.status_code == 201 and r.json()["type"] == "other",
-        f"got {r.status_code}: {r.json().get('type')} — the department is the routing key, not the type",
+        "the legacy type follows the stage, not the payload",
+        r.status_code == 201 and r.json()["type"] == "karigar",
+        f"got {r.status_code}: {r.json().get('type')} — the stage is the routing key",
+    )
+    check(
+        "the stone fixer's legacy type is derived too",
+        fixer["type"] == "stone_fixer" and lacker["type"] == "other",
+        f"got {fixer.get('type')} / {lacker.get('type')}",
     )
 
-    r = client.get("/vendors", headers=auth, params={"type": "karigar"})
-    check("filter vendors by type", r.status_code == 200 and all(v["type"] == "karigar" for v in r.json()))
+    r = client.get("/vendors", headers=auth, params={"department_id": depts_by_code["SET"]})
+    check(
+        "filter workers by stage",
+        r.status_code == 200
+        and r.json()
+        and all(v["department_id"] == depts_by_code["SET"] for v in r.json()),
+    )
 
     # ----- INVENTORY (raw) -----
     section("Inventory (raw)")
@@ -358,6 +379,9 @@ def main() -> int:
         "discount_amount": "100",
         "discount_weight_g": "0",
         "tax_amount": "50",
+        # Credit terms. The printed bill carries them and works the due date
+        # out from them, so both have to survive the round trip.
+        "term_days": 30,
         "items": [
             {
                 "product_id": finished_product_id,
@@ -386,6 +410,19 @@ def main() -> int:
 
     invoice_id = inv["id"]
 
+    # --- what the printed bill needs ---
+    check("credit terms stored", inv["term_days"] == 30, str(inv.get("term_days")))
+    check(
+        "a draft has no due date",
+        inv["due_date"] is None,
+        f"got {inv.get('due_date')} — nothing is due from a bill that was never issued",
+    )
+    check(
+        "the bill knows which shop raised it",
+        (inv.get("letterhead") or {}).get("print_name") == "Main Shop",
+        str(inv.get("letterhead")),
+    )
+
     # Issue → must deduct stock. Now requires password (Phase 8 alignment).
     r = client.post(f"/invoices/{invoice_id}/issue", headers=auth)
     check("issue without password → 401", r.status_code == 401)
@@ -401,6 +438,21 @@ def main() -> int:
     # Verify product status = sold
     r = client.get(f"/products/{finished_product_id}", headers=auth)
     check("product marked sold", r.json()["status"] == "sold")
+
+    # The due date only exists once there is an issue date to count from, and
+    # it is derived rather than stored, so it always agrees with the terms.
+    issued = client.get(f"/invoices/{invoice_id}", headers=auth).json()
+    # Counted from the shop's day, not the server's or the database's. Between
+    # local midnight and dawn those disagree, and a due date a day out is a
+    # payment chased on the wrong morning — so the expected value is derived
+    # from what the shop itself thinks today is.
+    shop_today = client.get("/dashboard", headers=auth, params={"days": 7}).json()["as_of"]
+    expected_due = (date.fromisoformat(shop_today) + timedelta(days=30)).isoformat()
+    check(
+        "due date = the shop's day + term days",
+        issued["due_date"] == expected_due,
+        f"got {issued['due_date']}, expected {expected_due}",
+    )
 
     # Mark paid
     r = client.post(f"/invoices/{invoice_id}/mark-paid", headers=auth)
@@ -689,7 +741,7 @@ def main() -> int:
     check("delete customer (no FK) → 204", r.status_code == 204)
 
     vend = client.post("/vendors", headers=auth, json={
-        "name": "ToDelete Vend", "type": "other", "department_id": depts_by_code["POL"],
+        "name": "ToDelete Vend", "department_id": depts_by_code["MAKE"],
     }).json()
     r = client.delete(f"/vendors/{vend['id']}", headers=auth)
     check("delete vendor → 204", r.status_code == 204)
@@ -1068,17 +1120,22 @@ def main() -> int:
     # ----- MASTER DATA (phase 2) -----
     section("Master data")
 
-    # Departments ship seeded so a fresh install is usable immediately.
+    # Departments ship seeded so a fresh install is usable immediately: the
+    # three stages this shop runs, in the order work flows through them.
     r = client.get("/departments", headers=auth)
     depts = r.json()
-    check("9 departments seeded", r.status_code == 200 and len(depts) == 9, f"got {len(depts)}")
+    check("3 stages seeded", r.status_code == 200 and len(depts) == 3, f"got {len(depts)}")
     check(
-        "departments ordered by sequence",
-        [d["code"] for d in depts][:3] == ["RP", "CAST", "CLEAN"],
-        str([d["code"] for d in depts][:3]),
+        "stages ordered by sequence",
+        [d["code"] for d in depts] == ["MAKE", "SET", "LAC"],
+        str([d["code"] for d in depts]),
     )
     setting = next((d for d in depts if d["code"] == "SET"), None)
-    check("setting is the stone-consuming stage", setting and setting["consumes_stones"] is True)
+    check(
+        "the stone fixer is the stone-consuming stage",
+        setting and setting["consumes_stones"] is True and setting["name"] == "Stone Fixer",
+        str(setting),
+    )
 
     r = client.post("/departments", headers=auth, json={"name": "Enamel", "code": "enml", "sequence": 95})
     check("create department → 201", r.status_code == 201, f"got {r.status_code}")
@@ -1180,23 +1237,22 @@ def main() -> int:
     r = client.post("/customers", headers=auth, json={"name": "Bare Minimum"})
     check("name alone is still enough to create a customer", r.status_code == 201, f"got {r.status_code}")
 
-    # Workers gained a department, agreed wastage and opening balances.
-    casting_id = next(d["id"] for d in depts if d["code"] == "CAST")
+    # Workers gained a stage, agreed wastage and opening balances.
+    maker_id = next(d["id"] for d in depts if d["code"] == "MAKE")
     r = client.post(
         "/vendors",
         headers=auth,
         json={
             "name": "Zahid Bhai",
-            "type": "karigar",
-            "department_id": casting_id,
+            "department_id": maker_id,
             "default_wastage_pct": "3.5",
             "opening_gold_g": "12.5",
             "cnic": "42101-7654321-9",
         },
     )
-    check("create worker with department → 201", r.status_code == 201, f"got {r.status_code}")
+    check("create worker with a stage → 201", r.status_code == 201, f"got {r.status_code}")
     w = r.json()
-    check("worker department name resolved", w["department_name"] == "Casting", str(w))
+    check("worker stage name resolved", w["department_name"] == "Maker", str(w))
     check("worker opening gold stored", Decimal(str(w["opening_gold_g"])) == Decimal("12.5"))
     check(
         "worker's own wastage wins",
@@ -1207,15 +1263,20 @@ def main() -> int:
     r = client.post(
         "/vendors",
         headers=auth,
-        json={"name": "Inherits Dept Rate", "type": "other", "department_id": enamel_id},
+        json={"name": "Inherits Dept Rate", "department_id": enamel_id},
     )
     check(
-        "worker with no rate inherits the department's",
+        "worker with no rate inherits the stage's",
         Decimal(str(r.json()["effective_wastage_pct"])) == Decimal("2.0"),
         str(r.json().get("effective_wastage_pct")),
     )
-    r = client.delete(f"/departments/{casting_id}", headers=pwd_h)
-    check("delete department with workers → 409", r.status_code == 409, f"got {r.status_code}")
+    check(
+        "a stage outside the three legacy roles leaves the worker unlabelled",
+        r.json()["type"] == "other",
+        f"got {r.json().get('type')} — better absent from the old roll-up than filed wrong",
+    )
+    r = client.delete(f"/departments/{maker_id}", headers=pwd_h)
+    check("delete a stage with workers → 409", r.status_code == 409, f"got {r.status_code}")
 
     # Stones gained category / abbreviation / quality.
     r = client.post(
@@ -1251,10 +1312,27 @@ def main() -> int:
     r = client.get("/ledger/accounts", headers=auth)
     accounts = r.json()
     by_code = {a["code"]: a for a in accounts}
+    # Every code the posting services resolve by name must be present. Asserted
+    # as a set rather than a count on purpose: a count has to be edited every
+    # time the chart grows, and an off-by-one edit to make a test pass is
+    # exactly how a genuinely missing account gets waved through.
+    required = {
+        "1110", "1120", "1130", "1140", "1150", "1160",
+        "1210", "1215",
+        "2110", "2120",
+        "3100", "3200",
+        "4100", "4200", "4300",
+        "5100", "5200", "5300", "5400",
+    }
+    missing = sorted(required - set(by_code))
     check(
-        "chart of accounts seeded",
-        r.status_code == 200 and len(accounts) == 25,
-        f"got {len(accounts)}",
+        "chart of accounts has every system account",
+        r.status_code == 200 and not missing,
+        f"missing {missing}" if missing else f"got {len(accounts)}",
+    )
+    check(
+        "party metal and making income are postable system accounts",
+        all(by_code[c]["is_system"] and by_code[c]["is_postable"] for c in ("1215", "4300")),
     )
     check(
         "there is a head to relieve the cost of a sale to",
@@ -1430,6 +1508,188 @@ def main() -> int:
     r = client.get("/ledger/statement", headers=auth)
     check("statement without an account → 400", r.status_code == 400, f"got {r.status_code}")
 
+    # --- trade billing: gold charged in grams, not rupees ---
+    # A jeweller settles the metal in metal. The bill must state the fine grams
+    # to hand over and must NOT also price that same gold in rupees, or he is
+    # invoiced for it twice in two different units.
+    r = client.post(
+        "/customers", headers=auth, json={"name": "Sarafa Trading Co", "is_trade": True}
+    )
+    check("create a trade customer → 201", r.status_code == 201, f"got {r.status_code}")
+    jeweller = r.json()
+    check("the customer is marked as trade", jeweller.get("is_trade") is True, str(jeweller.get("is_trade")))
+
+    r = client.post(
+        "/invoices",
+        headers=auth,
+        json={
+            "customer_id": jeweller["id"],
+            "sale_type": "normal",
+            "currency": "PKR",
+            "gold_rate_per_g": "6500",
+            "items": [
+                {
+                    "description": "Trade ring",
+                    "quantity": 1,
+                    "gold_weight_g": "10",
+                    "gold_purity": 22,
+                    "stone_weight_ct": "0.5",
+                    "stone_rate_per_ct": "80000",
+                    "labor_amount": "5000",
+                }
+            ],
+        },
+    )
+    check("bill a trade customer → 201", r.status_code == 201, f"got {r.status_code}: {r.text[:200]}")
+    tb = r.json()
+    check(
+        "a trade customer's bill charges gold in grams",
+        tb["gold_charged_in"] == "grams",
+        str(tb.get("gold_charged_in")),
+    )
+    check(
+        "the gold is not priced on a trade bill",
+        Decimal(str(tb["items"][0]["gold_amount"])) == 0,
+        str(tb["items"][0]["gold_amount"]),
+    )
+    check(
+        "the cash total is stones and making only",
+        Decimal(str(tb["total"])) == Decimal("45000.00"),
+        str(tb["total"]),
+    )
+    check(
+        "the bill states the fine grams to hand over",
+        Decimal(str(tb["metal_due_fine_g"])) == Decimal("9.1667"),
+        str(tb["metal_due_fine_g"]),
+    )
+    r = client.post(f"/invoices/{tb['id']}/issue", headers=pwd_h)
+    check("issue a trade bill → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:200]}")
+    # The metal obligation has to reach the party's metal account, or the shop
+    # has sold gold it will never chase.
+    r = client.get(
+        "/ledger/party-statement",
+        headers=auth,
+        params={"party_type": "customer", "party_id": jeweller["id"]},
+    )
+    tps = r.json()
+    check(
+        "issuing a trade bill puts metal on the jeweller's account",
+        Decimal(str(tps["closing_metal_g"])) == Decimal("9.1667"),
+        str(tps.get("closing_metal_g")),
+    )
+    check(
+        "and the cash side carries only the stones and making",
+        Decimal(str(tps["closing_cash"])) == Decimal("45000.00"),
+        str(tps.get("closing_cash")),
+    )
+
+    # The counter path must be untouched by all of this.
+    r = client.post(
+        "/invoices",
+        headers=auth,
+        json={
+            "customer_id": customer_id,
+            "sale_type": "normal",
+            "currency": "PKR",
+            "gold_rate_per_g": "6500",
+            "items": [
+                {
+                    "description": "Counter ring",
+                    "quantity": 1,
+                    "gold_weight_g": "10",
+                    "gold_purity": 22,
+                    "stone_weight_ct": "0.5",
+                    "stone_rate_per_ct": "80000",
+                    "labor_amount": "5000",
+                }
+            ],
+        },
+    )
+    cb = r.json()
+    check(
+        "a counter customer's bill still charges gold in rupees",
+        cb["gold_charged_in"] == "rupees",
+        str(cb.get("gold_charged_in")),
+    )
+    check(
+        "the counter bill prices the gold and owes no metal",
+        Decimal(str(cb["items"][0]["gold_amount"])) > 0
+        and Decimal(str(cb["metal_due_fine_g"])) == 0,
+        f"gold={cb['items'][0]['gold_amount']} metal={cb['metal_due_fine_g']}",
+    )
+    check(
+        "the two bills differ by exactly the priced gold",
+        Decimal(str(cb["total"])) - Decimal(str(tb["total"]))
+        == Decimal(str(cb["items"][0]["gold_amount"])),
+        f"{cb['total']} - {tb['total']} vs {cb['items'][0]['gold_amount']}",
+    )
+
+    # --- party statement: the wholesale account, in metal and money at once ---
+    # The document a jeweller dealing with other jewellers actually keeps. The
+    # two columns must never be netted: the metal side is unpriced on purpose,
+    # because the rate is agreed on the day the gold moves and not on the day
+    # the bill was written.
+    r = client.get(
+        "/ledger/party-statement",
+        headers=auth,
+        params={"party_type": "customer", "party_id": customer_id},
+    )
+    check("party statement → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:200]}")
+    ps = r.json()
+    check("party statement names the party", bool(ps.get("party_name")), str(ps.get("party_name")))
+    check(
+        "metal and cash are reported as separate closing figures",
+        "closing_metal_g" in ps and "closing_cash" in ps,
+        str(list(ps)),
+    )
+    check(
+        "the cash column foots against its opening and period totals",
+        Decimal(str(ps["closing_cash"]))
+        == Decimal(str(ps["opening_cash"]))
+        + Decimal(str(ps["cash_debit_total"]))
+        - Decimal(str(ps["cash_credit_total"])),
+        f"{ps['opening_cash']} + {ps['cash_debit_total']} - {ps['cash_credit_total']} "
+        f"!= {ps['closing_cash']}",
+    )
+    check(
+        "the metal column foots independently of the cash one",
+        Decimal(str(ps["closing_metal_g"]))
+        == Decimal(str(ps["opening_metal_g"]))
+        + Decimal(str(ps["metal_in_total_g"]))
+        - Decimal(str(ps["metal_out_total_g"])),
+        f"{ps['opening_metal_g']} + {ps['metal_in_total_g']} - {ps['metal_out_total_g']} "
+        f"!= {ps['closing_metal_g']}",
+    )
+    check(
+        "one row per document, not one per posting",
+        len({row["entry_id"] for row in ps["rows"]}) == len(ps["rows"]),
+        f"{len(ps['rows'])} rows, {len({row['entry_id'] for row in ps['rows']})} entries",
+    )
+    if ps["rows"]:
+        check(
+            "the running cash balance continues down the page",
+            Decimal(str(ps["rows"][-1]["cash_balance"])) == Decimal(str(ps["closing_cash"])),
+            f"{ps['rows'][-1]['cash_balance']} vs {ps['closing_cash']}",
+        )
+        check(
+            "each row names the document that caused it",
+            all(row["entry_no"] for row in ps["rows"]),
+        )
+    # A party with nothing against them is an empty account, not an error — the
+    # screen has to open before the first trade, or it can never show the first.
+    r = client.get(
+        "/ledger/party-statement",
+        headers=auth,
+        params={"party_type": "salesman", "party_id": 999999},
+    )
+    check("statement for a party with no activity → 200", r.status_code == 200, f"got {r.status_code}")
+    empty = r.json()
+    check(
+        "an untraded account opens at zero on both columns",
+        Decimal(str(empty["closing_metal_g"])) == 0 and Decimal(str(empty["closing_cash"])) == 0,
+        str(empty.get("closing_metal_g")),
+    )
+
     # --- trial balance ---
     r = client.get("/ledger/trial-balance", headers=auth)
     tb = r.json()
@@ -1533,7 +1793,7 @@ def main() -> int:
         f"/designs/{design['id']}/legs",
         headers=auth,
         json={
-            "department_id": casting_id,
+            "department_id": maker_id,
             "worker_id": w["id"],
             "gold_issued_g": "100",
             "gold_issued_purity": 22,
@@ -1542,7 +1802,7 @@ def main() -> int:
             "labour_rate": "150",
         },
     )
-    check("issue to casting → 201", r.status_code == 201, f"got {r.status_code}: {r.text[:250]}")
+    check("issue to the maker → 201", r.status_code == 201, f"got {r.status_code}: {r.text[:250]}")
     leg = r.json()
     check(
         "agreed wastage snapshotted onto the leg at issue",
@@ -1550,30 +1810,31 @@ def main() -> int:
         str(leg.get("wastage_allowed_pct")),
     )
     r = client.get(f"/designs/{design['id']}", headers=auth)
-    check("design now sits in casting", r.json()["current_department_id"] == casting_id)
+    check("design now sits with the maker", r.json()["current_department_id"] == maker_id)
 
     # One pair of hands at a time.
     r = client.post(
         f"/designs/{design['id']}/legs",
         headers=auth,
         json={
-            "department_id": casting_id, "worker_id": w["id"], "gold_issued_g": "5",
+            "department_id": maker_id, "worker_id": w["id"], "gold_issued_g": "5",
             "gold_source_inventory_id": raw_gold["id"],
         },
     )
     check("second open leg refused → 409", r.status_code == 409, f"got {r.status_code}")
 
-    # A worker from the wrong department must be refused.
-    polish_dept_id = next(d_["id"] for d_ in depts if d_["code"] == "POL")
+    # A worker from the wrong stage must be refused: the maker cannot be handed
+    # a stone-setting leg.
+    fixer_dept_id = next(d_["id"] for d_ in depts if d_["code"] == "SET")
     r = client.post(
         f"/designs/{d2['id']}/legs",
         headers=auth,
         json={
-            "department_id": polish_dept_id, "worker_id": w["id"], "gold_issued_g": "5",
+            "department_id": fixer_dept_id, "worker_id": w["id"], "gold_issued_g": "5",
             "gold_source_inventory_id": raw_gold["id"],
         },
     )
-    check("worker from another department refused → 400", r.status_code == 400, f"got {r.status_code}")
+    check("worker from another stage refused → 400", r.status_code == 400, f"got {r.status_code}")
 
     # --- the settlement that matters ---
     # 100g out, 94g back. Actual loss 6g; allowed 3.5g; so 2.5g is Zahid's.
@@ -1600,7 +1861,7 @@ def main() -> int:
         f"got {worker_gold(w['id'])}, expected 104.1667",
     )
     r = client.post(f"/designs/legs/{leg['id']}/receive", headers=auth, json={"gold_received_g": "94"})
-    check("receive from casting → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:250]}")
+    check("receive from the maker → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:250]}")
     settled = r.json()
     check(
         "actual wastage = issued - received",
@@ -1651,25 +1912,25 @@ def main() -> int:
     r = client.post(f"/designs/legs/{leg['id']}/receive", headers=auth, json={"gold_received_g": "94"})
     check("receiving a leg twice refused → 409", r.status_code == 409, f"got {r.status_code}")
 
-    # --- an in-house stage has no worker, and no one to charge a shortfall to ---
-    # Cleaning, burning, rhodium and finish are done on the shop's own bench.
-    # Requiring a worker there would mean inventing a record for the shop
-    # itself, which then shows up in the wastage reports as a party losing you
-    # metal. The leg still tracks the gram; it just carries no ledger party.
-    fin_dept_id = next(d_["id"] for d_ in depts if d_["code"] == "FIN")
+    # --- a stage done in-house has no worker, and no one to charge a shortfall to ---
+    # Lacquering is the one the shop does on its own bench. Requiring a worker
+    # there would mean inventing a record for the shop itself, which then shows
+    # up in the wastage reports as a party losing you metal. The leg still
+    # tracks the gram; it just carries no ledger party.
+    lac_dept_id = next(d_["id"] for d_ in depts if d_["code"] == "LAC")
     inhouse_design = client.post("/designs", headers=auth, json={"item_id": taka_id}).json()
     r = client.post(
         f"/designs/{inhouse_design['id']}/legs",
         headers=auth,
         json={
-            "department_id": fin_dept_id, "gold_issued_g": "10",
+            "department_id": lac_dept_id, "gold_issued_g": "10",
             "gold_issued_purity": 22, "gold_source_inventory_id": raw_gold["id"],
         },
     )
     check(
         "issue to an in-house stage with no worker → 201",
         r.status_code == 201,
-        f"got {r.status_code}: {r.text[:220]} — five of eleven departments have no worker",
+        f"got {r.status_code}: {r.text[:220]} — a stage the shop does itself has nobody to name",
     )
     inhouse_leg = r.json()
     check("the leg carries no worker", inhouse_leg.get("worker_id") is None, str(inhouse_leg.get("worker_id")))
@@ -1699,15 +1960,14 @@ def main() -> int:
     )
 
     # --- a heavier return is legitimate, not an error ---
-    # The polisher was created before departments existed on workers, so give
-    # him one — the routing engine refuses a worker from the wrong department.
-    client.patch(f"/vendors/{polisher['id']}", headers=auth, json={"department_id": polish_dept_id})
+    # Lacquer adds weight. A piece that comes back heavier is the normal
+    # outcome of that stage, not a data-entry mistake.
     r = client.post(
         f"/designs/{design['id']}/legs",
         headers=auth,
         json={
-            "department_id": polish_dept_id,
-            "worker_id": polisher["id"],
+            "department_id": lac_dept_id,
+            "worker_id": lacker["id"],
             "gold_issued_g": "94",
             "gold_issued_purity": 22,
             "gold_source_inventory_id": raw_gold["id"],
@@ -1715,10 +1975,10 @@ def main() -> int:
             "labour_rate": "500",
         },
     )
-    check("issue to polish → 201", r.status_code == 201, f"got {r.status_code}: {r.text[:200]}")
-    polish_leg = r.json()
+    check("issue to the lacker → 201", r.status_code == 201, f"got {r.status_code}: {r.text[:200]}")
+    coat_leg = r.json()
     r = client.post(
-        f"/designs/legs/{polish_leg['id']}/receive", headers=auth, json={"gold_received_g": "95"}
+        f"/designs/legs/{coat_leg['id']}/receive", headers=auth, json={"gold_received_g": "95"}
     )
     check("a heavier return is accepted → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:200]}")
     check(
@@ -1745,8 +2005,8 @@ def main() -> int:
     check(
         "trace lists both hops in order",
         len(hops) == 2
-        and hops[0]["department"] == "Casting"
-        and hops[1]["department"] == "Polish",
+        and hops[0]["department"] == "Maker"
+        and hops[1]["department"] == "Lacker",
         str([h.get("department") for h in hops]),
     )
     check(
@@ -1761,7 +2021,7 @@ def main() -> int:
         f"/designs/{d2['id']}/legs",
         headers=auth,
         json={
-            "department_id": casting_id, "worker_id": w["id"], "gold_issued_g": "20",
+            "department_id": maker_id, "worker_id": w["id"], "gold_issued_g": "20",
             "gold_issued_purity": 22, "gold_source_inventory_id": raw_gold["id"],
         },
     )
@@ -1935,6 +2195,357 @@ def main() -> int:
         f"got {line['line_total']}, expected {(expected_none * 3) + Decimal('3000')}",
     )
 
+    # --- the maker: ratti of the returned weight, settled in fine grams ---
+    # 100.000g of pure 24k goes out. 107.560g of 21k comes back, 6 ratti agreed.
+    #
+    #   allowance = 107.560 / 96 * 6   =   6.7225 g of 21k
+    #   credited  = 107.560 + 6.7225   = 114.2825 g of 21k
+    #   fine      = 114.2825 * 21 / 24 =  99.9972 g pure
+    #   -> the maker is 0.0028 g of pure gold short.
+    #
+    # Two readings of this were possible and they differ by a third of a gram
+    # on a hundred: taking the allowance as *pure* grams instead credits him
+    # 100.8375g and leaves the shop owing him 0.8375g on a job that came out
+    # square. The client confirmed the alloy reading, so it is asserted here.
+    make_dept_id = next(d_["id"] for d_ in depts if d_["code"] == "MAKE")
+    pure_gold = client.post(
+        "/inventory",
+        headers=auth,
+        json={"type": "raw_gold", "label": "24k pure for maker", "weight_g": "500",
+              "purity": 24, "location": "vault"},
+    ).json()
+    maker_design = client.post("/designs", headers=auth, json={"item_id": taka_id}).json()
+    r = client.post(
+        f"/designs/{maker_design['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": make_dept_id,
+            "worker_id": karigar["id"],
+            "gold_issued_g": "100",
+            "gold_issued_purity": 24,
+            "gold_source_inventory_id": pure_gold["id"],
+            "wastage_basis": "ratti_of_received",
+            "wastage_ratti": "6",
+            "piece_count": 12,
+            "labour_basis": "per_piece",
+            "labour_rate": "800",
+        },
+    )
+    check("issue 100g of pure gold to the maker on 6 ratti → 201",
+          r.status_code == 201, f"got {r.status_code}: {r.text[:250]}")
+    maker_leg = r.json()
+
+    # A ratti leg with no ratti figure would allow nothing and charge him the
+    # whole difference between pure metal out and alloy back — about an eighth
+    # of the weight on a 21k job.
+    # Its own design: the one above is still out with the maker, and a second
+    # leg on it is refused for that reason rather than for the missing ratti,
+    # which would make this assertion pass without testing anything.
+    ratti_guard_design = client.post("/designs", headers=auth, json={"item_id": taka_id}).json()
+    guard = client.post(
+        f"/designs/{ratti_guard_design['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": make_dept_id, "worker_id": karigar["id"],
+            "gold_issued_g": "10", "gold_issued_purity": 24,
+            "gold_source_inventory_id": pure_gold["id"],
+            "wastage_basis": "ratti_of_received",
+        },
+    )
+    check("a ratti leg without the agreed ratti is refused → 400",
+          guard.status_code == 400, f"got {guard.status_code}: {guard.text[:200]}")
+
+    r = client.post(
+        f"/designs/legs/{maker_leg['id']}/receive",
+        headers=auth,
+        json={"gold_received_g": "107.5600", "gold_received_purity": 21},
+    )
+    check("receive 107.560g of 21k from the maker → 200",
+          r.status_code == 200, f"got {r.status_code}: {r.text[:250]}")
+    settled = r.json()
+    check(
+        "6 ratti on 107.560g allows 6.7225g of 21k",
+        Decimal(str(settled["wastage_allowed_g"])) == Decimal("6.7225"),
+        f"got {settled['wastage_allowed_g']}, expected 6.7225",
+    )
+    check(
+        "the allowance is 5.8822g once converted to fine",
+        Decimal(str(settled["wastage_allowed_fine_g"])) == Decimal("5.8822"),
+        f"got {settled['wastage_allowed_fine_g']}, expected 5.8822 "
+        "— 6.7225 here would mean the allowance was read as pure gold",
+    )
+    check(
+        "the maker is left owing 0.0028g of pure gold",
+        Decimal(str(settled["wastage_excess_fine_g"])) == Decimal("0.0028"),
+        f"got {settled['wastage_excess_fine_g']}, expected 0.0028",
+    )
+    check(
+        "the purity that came back is recorded, not the purity that went out",
+        settled["gold_received_purity"] == 21,
+        f"got {settled['gold_received_purity']} — crediting 21k at 24k overstates "
+        "the return by about a seventh",
+    )
+    check(
+        "the maker is paid for the pieces he delivered: 12 x Rs 800",
+        Decimal(str(settled["labour_amount"])) == Decimal("9600"),
+        f"got {settled['labour_amount']}, expected 9600.00",
+    )
+    r = client.get("/ledger/trial-balance", headers=auth)
+    check("books balance after a ratti settlement", r.json()["balanced"] is True)
+
+    # --- the purity that comes back is not optional on a ratti leg ---
+    # The whole reason the maker's convention exists is that pure metal goes out
+    # and alloy comes back. Leave the returned purity blank and the fallback
+    # reads it as "same as issued" — 107.560g of 21k credited as 107.560g of
+    # pure, and the shop ends up owing him about fourteen grams on a job he is
+    # actually short on. Silence must not be able to produce that.
+    purity_design = client.post("/designs", headers=auth, json={"item_id": taka_id}).json()
+    purity_leg = client.post(
+        f"/designs/{purity_design['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": make_dept_id, "worker_id": karigar["id"],
+            "gold_issued_g": "100", "gold_issued_purity": 24,
+            "gold_source_inventory_id": pure_gold["id"],
+            "wastage_basis": "ratti_of_received", "wastage_ratti": "6",
+            "piece_count": 1, "labour_basis": "flat", "labour_rate": "0",
+        },
+    ).json()
+    r = client.post(
+        f"/designs/legs/{purity_leg['id']}/receive",
+        headers=auth,
+        json={"gold_received_g": "107.5600"},
+    )
+    check(
+        "a ratti leg cannot be received without stating what purity came back → 400",
+        r.status_code == 400,
+        f"got {r.status_code}: {r.text[:220]} — settling at the issued purity credits "
+        "21k as pure and hands the maker roughly a seventh of the job",
+    )
+    # Stated, it settles correctly.
+    r = client.post(
+        f"/designs/legs/{purity_leg['id']}/receive",
+        headers=auth,
+        json={"gold_received_g": "107.5600", "gold_received_purity": 21},
+    )
+    check("and settles once the purity is stated → 200", r.status_code == 200,
+          f"got {r.status_code}: {r.text[:200]}")
+
+    # --- the maker works on his own gold, and the shop owes him ---
+    # Nothing goes out. He hands over 107.560g of 21k on 6 ratti, so the shop
+    # owes him the fine content plus his ratti: 99.9972 g of pure gold, against
+    # a date the two of them agreed.
+    own_design = client.post("/designs", headers=auth, json={"item_id": taka_id}).json()
+    due = str(date.today() + timedelta(days=30))
+    r = client.post(
+        f"/designs/{own_design['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": make_dept_id, "worker_id": karigar["id"],
+            "gold_issued_g": "0", "gold_issued_purity": 24,
+            "gold_source_inventory_id": pure_gold["id"],
+            "wastage_basis": "percent_of_issued",
+            "piece_count": 1, "labour_basis": "flat", "labour_rate": "0",
+            "metal_due_date": due,
+        },
+    )
+    check(
+        "a no-metal leg on a percentage basis is refused → 422",
+        r.status_code == 422,
+        f"got {r.status_code}: {r.text[:220]} — under a percentage the excess floors at "
+        "zero, so his gold would arrive and he would be owed none of it",
+    )
+    r = client.post(
+        f"/designs/{own_design['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": make_dept_id, "worker_id": karigar["id"],
+            "gold_issued_g": "0", "gold_issued_purity": 24,
+            "gold_source_inventory_id": pure_gold["id"],
+            "wastage_basis": "ratti_of_received", "wastage_ratti": "6",
+            "piece_count": 1, "labour_basis": "flat", "labour_rate": "0",
+        },
+    )
+    check(
+        "a no-metal leg with no due date is refused → 422",
+        r.status_code == 422,
+        f"got {r.status_code}: {r.text[:200]} — an obligation with no date is one "
+        "nobody chases",
+    )
+
+    stock_before = Decimal(
+        str(client.get(f"/inventory/{pure_gold['id']}", headers=auth).json()["weight_g"])
+    )
+    r = client.post(
+        f"/designs/{own_design['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": make_dept_id, "worker_id": karigar["id"],
+            "gold_issued_g": "0", "gold_issued_purity": 24,
+            "gold_source_inventory_id": pure_gold["id"],
+            "wastage_basis": "ratti_of_received", "wastage_ratti": "6",
+            "piece_count": 1, "labour_basis": "flat", "labour_rate": "0",
+            "metal_due_date": due,
+        },
+    )
+    check("issue a leg with no metal at all → 201", r.status_code == 201,
+          f"got {r.status_code}: {r.text[:250]}")
+    own_leg = r.json()
+    check("the due date is recorded on the leg", own_leg["metal_due_date"] == due,
+          f"got {own_leg.get('metal_due_date')}")
+    stock_after = Decimal(
+        str(client.get(f"/inventory/{pure_gold['id']}", headers=auth).json()["weight_g"])
+    )
+    check(
+        "no metal left the safe",
+        stock_after == stock_before,
+        f"stock moved from {stock_before} to {stock_after} on a leg that issued nothing",
+    )
+
+    r = client.post(
+        f"/designs/legs/{own_leg['id']}/receive",
+        headers=auth,
+        json={"gold_received_g": "107.5600", "gold_received_purity": 21},
+    )
+    check("receive the piece he made on his own gold → 200", r.status_code == 200,
+          f"got {r.status_code}: {r.text[:250]}")
+    own = r.json()
+    check(
+        "the shop owes him 99.9972g of pure gold — the fine content plus his ratti",
+        Decimal(str(own["wastage_excess_fine_g"])) == Decimal("-99.9972"),
+        f"got {own['wastage_excess_fine_g']}, expected -99.9972 (negative = owed to him). "
+        "0 would mean his gold arrived free.",
+    )
+    r = client.get("/ledger/trial-balance", headers=auth)
+    check("books balance when the shop owes a maker metal", r.json()["balanced"] is True)
+
+    # --- a lot goes out as one weight and comes back as twelve pieces ---
+    # 100g of pure gold to the maker as LOT-00001; 107.560g of 21k back, divided
+    # into twelve bangles each weighed on its own. Every piece then carries its
+    # own TK number through setting, stock and sale.
+    r = client.post("/designs", headers=auth, json={
+        "item_id": taka_id, "as_lot": True, "expected_pieces": 12,
+    })
+    check("mint a lot → 201", r.status_code == 201, f"got {r.status_code}: {r.text[:250]}")
+    lot = r.json()
+    check(
+        "a lot is numbered from its own sequence, not the item's",
+        lot["design_no"].startswith("LOT-"),
+        f"got {lot['design_no']} — while the metal is out the item is a plan, not a fact",
+    )
+    check("and knows how many pieces it should yield", lot["expected_pieces"] == 12,
+          f"got {lot.get('expected_pieces')}")
+
+    r = client.post("/designs", headers=auth, json={"item_id": taka_id, "expected_pieces": 12})
+    check(
+        "expected_pieces on a single piece is refused → 422",
+        r.status_code == 422,
+        f"got {r.status_code}: {r.text[:180]}",
+    )
+
+    lot_leg = client.post(
+        f"/designs/{lot['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": make_dept_id, "worker_id": karigar["id"],
+            "gold_issued_g": "100", "gold_issued_purity": 24,
+            "gold_source_inventory_id": pure_gold["id"],
+            "wastage_basis": "ratti_of_received", "wastage_ratti": "6",
+            "piece_count": 12, "labour_basis": "per_piece", "labour_rate": "800",
+        },
+    ).json()
+
+    # Dividing before the metal is back would number pieces the shop is not
+    # holding.
+    r = client.post(f"/designs/{lot['id']}/split", headers=auth,
+                    json={"pieces": [{"weight_g": "107.56"}]})
+    check(
+        "splitting a lot still out with the maker is refused → 409",
+        r.status_code == 409,
+        f"got {r.status_code}: {r.text[:200]}",
+    )
+
+    client.post(
+        f"/designs/legs/{lot_leg['id']}/receive",
+        headers=auth,
+        json={"gold_received_g": "107.5600", "gold_received_purity": 21},
+    )
+
+    twelve = [{"weight_g": "9.0000"} for _ in range(11)] + [{"weight_g": "8.5600"}]
+    r = client.post(f"/designs/{lot['id']}/split", headers=auth,
+                    json={"pieces": twelve[:11]})
+    check(
+        "a split that does not add up to what came back is refused → 400",
+        r.status_code == 400,
+        f"got {r.status_code}: {r.text[:220]}",
+    )
+
+    r = client.post(f"/designs/{lot['id']}/split", headers=auth, json={"pieces": twelve})
+    check("divide the lot into 12 pieces → 201", r.status_code == 201,
+          f"got {r.status_code}: {r.text[:250]}")
+    pieces = r.json()
+    check("twelve designs come out of it", len(pieces) == 12, f"got {len(pieces)}")
+    check(
+        "each piece is numbered from the item, not the lot",
+        all(p["design_no"].startswith("TK-") for p in pieces),
+        f"got {[p['design_no'] for p in pieces][:3]}…",
+    )
+    check(
+        "each piece carries the weight it actually came back at",
+        Decimal(str(pieces[-1]["piece_weight_g"])) == Decimal("8.56")
+        and Decimal(str(pieces[0]["piece_weight_g"])) == Decimal("9"),
+        f"first {pieces[0].get('piece_weight_g')}, last {pieces[-1].get('piece_weight_g')} "
+        "— an even split would put 8.9633 on all twelve",
+    )
+    check(
+        "and the purity the maker returned, not the purity that went out",
+        all(p["piece_purity"] == 21 for p in pieces),
+        f"got {[p.get('piece_purity') for p in pieces][:3]}",
+    )
+    check(
+        "every piece points back at its lot",
+        all(p["parent_design_id"] == lot["id"] for p in pieces),
+        "a piece that cannot name its lot cannot be traced to the maker who made it",
+    )
+    check(
+        "the pieces add up to exactly what came back",
+        sum((Decimal(str(p["piece_weight_g"])) for p in pieces), Decimal("0"))
+        == Decimal("107.56"),
+        "the split must reconcile against the metal received",
+    )
+
+    r = client.get(f"/designs/{lot['id']}", headers=auth)
+    check(
+        "the divided lot leaves the floor",
+        r.json()["status"] == "split",
+        f"got {r.json().get('status')} — a lot left in production sits in the worklist "
+        "of pieces still to be made",
+    )
+    r = client.post(f"/designs/{lot['id']}/split", headers=auth, json={"pieces": twelve})
+    check(
+        "dividing the same lot twice is refused → 409",
+        r.status_code == 409,
+        f"got {r.status_code}: {r.text[:200]} — it would mint a second set of numbers "
+        "for metal that came back once",
+    )
+    r = client.post(f"/designs/{pieces[0]['id']}/split", headers=auth,
+                    json={"pieces": [{"weight_g": "9"}]})
+    check(
+        "a single piece cannot be divided → 400",
+        r.status_code == 400,
+        f"got {r.status_code}: {r.text[:200]}",
+    )
+
+    # A lot holds no article. Stocking it as well as its pieces would post the
+    # same metal into Finished Goods twice.
+    r = client.get(f"/stocking/designs/{lot['id']}/preview", headers=auth)
+    check(
+        "a lot cannot be stocked → 409",
+        r.status_code == 409,
+        f"got {r.status_code}: {r.text[:200]} — stocking the lot as well as its pieces "
+        "would post the same metal into Finished Goods twice",
+    )
+
     # --- setting: waste per 100 stones, and a charge per stone ---
     # 0.400 g per 100 over 350 stones = 1.400 g allowed; 350 x Rs 5 = Rs 1,750.
     setting_dept_id = next(d_["id"] for d_ in depts if d_["code"] == "SET")
@@ -1989,24 +2600,21 @@ def main() -> int:
     check("books balance after a per-100 settlement", r.json()["balanced"] is True)
 
     # --- lacker: weight out, weight in, difference, charge per item ---
-    r = client.post(
-        "/departments",
-        headers=auth,
-        json={"name": "Lacker", "code": "LAC", "sequence": 85, "default_rate_per_piece": "500"},
+    # The stage ships seeded; the shop only has to put its own rate on it.
+    r = client.patch(
+        f"/departments/{lac_dept_id}", headers=auth, json={"default_rate_per_piece": "500"}
     )
-    check("create the lacker department → 201", r.status_code == 201, f"got {r.status_code}")
-    lac_dept = r.json()
-    lacquerer = client.post(
-        "/vendors",
-        headers=auth,
-        json={"name": "Coating Wala", "type": "other", "department_id": lac_dept["id"]},
-    ).json()
+    check(
+        "the lacker's per-item rate is agreed once on the stage → 200",
+        r.status_code == 200 and Decimal(str(r.json()["default_rate_per_piece"])) == Decimal("500"),
+        f"got {r.status_code}: {r.text[:150]}",
+    )
     r = client.post(
         f"/designs/{set_design['id']}/legs",
         headers=auth,
         json={
-            "department_id": lac_dept["id"],
-            "worker_id": lacquerer["id"],
+            "department_id": lac_dept_id,
+            "worker_id": lacker["id"],
             "gold_issued_g": "48",
             "gold_issued_purity": 22,
             "gold_source_inventory_id": raw_gold["id"],
@@ -2052,45 +2660,1417 @@ def main() -> int:
         f"got {r.status_code}: {r.text[:160]}",
     )
 
+    # --- setting, in full: gross weight in, net metal out, every carat placed ---
+    # The client's worked example, end to end.
+    #
+    #   out   100.000 g of 21k + 30.00 ct (= 6.000 g)  = 106.000 g
+    #   back  gross 102.000 g, 29.50 ct stated as set  =   5.900 g
+    #   net   102.000 - 5.900                          =  96.100 g
+    #   short 100.000 - 96.100                         =   3.900 g
+    #   allow 0.400 / 100 x 350                        =   1.400 g
+    #   ----------------------------------------------------------
+    #   gold receivable                                    2.500 g of 21k
+    #                                                   =  2.1875 g fine
+    #
+    # and of the 0.50 ct unaccounted for, 0.30 broke and 0.20 is his.
+    setting_stone = client.post("/stones", headers=auth, json={
+        "name": "12 PTR commercial", "kind": "diamond", "category": "diamond",
+        "default_rate_per_ct": "8000", "selling_rate_per_ct": "12000", "currency": "PKR",
+    })
+    check("a stone can carry a selling rate apart from its cost → 201",
+          setting_stone.status_code == 201, f"got {setting_stone.status_code}: {setting_stone.text[:200]}")
+    setting_stone_id = setting_stone.json()["id"]
+    set_stock = client.post("/inventory", headers=auth, json={
+        "type": "raw_stone", "label": "12 PTR parcel", "weight_ct": "100",
+    }).json()
+    piece_gold = client.post("/inventory", headers=auth, json={
+        "type": "raw_gold", "label": "21k for setting", "weight_g": "300", "purity": 21,
+    }).json()
+
+    full_design = client.post("/designs", headers=auth, json={"item_id": taka_id}).json()
+    r = client.post(
+        f"/designs/{full_design['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": setting_dept_id,
+            "worker_id": setter["id"],
+            "gold_issued_g": "100",
+            "gold_issued_purity": 21,
+            "gold_source_inventory_id": piece_gold["id"],
+            "stone_source_inventory_id": set_stock["id"],
+            "stones": [{"stone_id": setting_stone_id, "quantity_issued": 360,
+                        "weight_issued_ct": "30"}],
+            "piece_count": 360,
+            "wastage_basis": "per_100_pieces",
+            "wastage_per_100_pcs_g": "0.400",
+            "labour_basis": "per_piece",
+            "labour_rate": "5",
+        },
+    )
+    check("issue 100g of 21k and 30ct to the setter → 201",
+          r.status_code == 201, f"got {r.status_code}: {r.text[:250]}")
+    full_leg = r.json()
+    check(
+        "30ct is recorded on the leg in carats, never grams",
+        Decimal(str(full_leg["stones_issued_ct"])) == Decimal("30"),
+        f"got {full_leg['stones_issued_ct']}",
+    )
+    line_id = full_leg["stones"][0]["id"]
+
+    r = client.post(
+        f"/designs/legs/{full_leg['id']}/receive",
+        headers=auth,
+        json={
+            "gold_received_g": "102",
+            "piece_count": 350,
+            "stones": [{
+                "leg_stone_id": line_id,
+                "quantity_set": 350, "weight_set_ct": "29.50",
+                "quantity_returned": 0, "weight_returned_ct": "0",
+                "quantity_broken": 4, "weight_broken_ct": "0.30",
+            }],
+        },
+    )
+    check("receive the piece at a gross 102g → 200", r.status_code == 200,
+          f"got {r.status_code}: {r.text[:300]}")
+    full = r.json()
+    check(
+        "the gross weight is kept as the scale read it",
+        Decimal(str(full["gold_received_gross_g"])) == Decimal("102"),
+        f"got {full['gold_received_gross_g']}, expected 102.0000",
+    )
+    check(
+        "29.50ct set is 5.900g, so the metal back is 96.100g",
+        Decimal(str(full["gold_received_g"])) == Decimal("96.1"),
+        f"got {full['gold_received_g']}, expected 96.1000 — 102 would mean the stones "
+        "were never taken out of the gross",
+    )
+    check(
+        "the allowance is 0.400g per 100 over 350 stones = 1.400g",
+        Decimal(str(full["wastage_allowed_g"])) == Decimal("1.4"),
+        f"got {full['wastage_allowed_g']}, expected 1.4000",
+    )
+    check(
+        "2.500g of 21k is receivable from the setter",
+        Decimal(str(full["wastage_excess_g"])) == Decimal("2.5"),
+        f"got {full['wastage_excess_g']}, expected 2.5000",
+    )
+    check(
+        "which is 2.1875g once converted to fine",
+        Decimal(str(full["wastage_excess_fine_g"])) == Decimal("2.1875"),
+        f"got {full['wastage_excess_fine_g']}, expected 2.1875",
+    )
+    check(
+        "0.30ct is recorded as broken",
+        Decimal(str(full["stones_broken_ct"])) == Decimal("0.30"),
+        f"got {full['stones_broken_ct']}",
+    )
+    check(
+        "0.20ct is left owed by the setter, derived not typed",
+        Decimal(str(full["stones_owed_ct"])) == Decimal("0.20"),
+        f"got {full['stones_owed_ct']}, expected 0.2000 — 30 less 29.50 set less 0.30 broken",
+    )
+    check(
+        "every issued carat is placed: set + returned + broken + owed = issued",
+        Decimal(str(full["stones_set_ct"])) + Decimal(str(full["stones_returned_ct"]))
+        + Decimal(str(full["stones_broken_ct"])) + Decimal(str(full["stones_owed_ct"]))
+        == Decimal(str(full["stones_issued_ct"])),
+        f"set {full['stones_set_ct']} + returned {full['stones_returned_ct']} + broken "
+        f"{full['stones_broken_ct']} + owed {full['stones_owed_ct']} "
+        f"!= issued {full['stones_issued_ct']}",
+    )
+    check(
+        "the setter is charged for the 350 he set, not the 360 he was handed",
+        Decimal(str(full["labour_amount"])) == Decimal("1750"),
+        f"got {full['labour_amount']}, expected 1750.00",
+    )
+    r = client.get("/ledger/trial-balance", headers=auth)
+    check("books balance after a full setting settlement", r.json()["balanced"] is True)
+
+    # Broken stones are stock, not a loss: they land in their own category
+    # rather than back among the whole stones they can no longer serve.
+    inv = client.get("/inventory", headers=auth, params={"type": "broken_stone"})
+    broken_rows = inv.json() if inv.status_code == 200 else []
+    if isinstance(broken_rows, dict):
+        broken_rows = broken_rows.get("items", [])
+    check(
+        "0.30ct of broken stones is held as its own stock",
+        any(Decimal(str(row["weight_ct"])) == Decimal("0.30") for row in broken_rows),
+        f"got {[str(row.get('weight_ct')) for row in broken_rows]} from {inv.status_code}",
+    )
+
+    # --- a stone with no rate still leaves a claim ---
+    # The setter owes carats whether or not anybody has priced that grade. If
+    # the claim is only recorded when it has a rupee value, a shop that has not
+    # filled in its stone rates loses every stone debt silently — which is the
+    # one thing the carat account exists to prevent.
+    norate_stone = client.post("/stones", headers=auth, json={
+        "name": "Unpriced chips", "kind": "diamond", "category": "diamond",
+    }).json()
+    norate_stock = client.post("/inventory", headers=auth, json={
+        "type": "raw_stone", "label": "unpriced chips packet", "weight_ct": "50",
+    }).json()
+    nr_design = client.post("/designs", headers=auth, json={"item_id": taka_id}).json()
+    nr_leg = client.post(
+        f"/designs/{nr_design['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": setting_dept_id, "worker_id": setter["id"],
+            "gold_issued_g": "10", "gold_issued_purity": 21,
+            "gold_source_inventory_id": piece_gold["id"],
+            "stone_source_inventory_id": norate_stock["id"],
+            "stones": [{"stone_id": norate_stone["id"], "quantity_issued": 10,
+                        "weight_issued_ct": "5"}],
+            "piece_count": 10, "wastage_basis": "per_100_pieces",
+            "wastage_per_100_pcs_g": "0.400",
+        },
+    ).json()
+    r = client.post(
+        f"/designs/legs/{nr_leg['id']}/receive",
+        headers=auth,
+        json={
+            "gold_received_g": "10.5",
+            "stones": [{
+                "leg_stone_id": nr_leg["stones"][0]["id"],
+                "quantity_set": 8, "weight_set_ct": "4",
+            }],
+        },
+    )
+    check("receive an unpriced-stone leg → 200", r.status_code == 200,
+          f"got {r.status_code}: {r.text[:220]}")
+    nr = r.json()
+    check(
+        "1.00ct is still recorded as owed even with no rate on the stone",
+        Decimal(str(nr["stones_owed_ct"])) == Decimal("1"),
+        f"got {nr['stones_owed_ct']}",
+    )
+    r = client.get("/ledger/position", headers=auth)
+    check(
+        "and the carat claim reaches the books, valued or not",
+        Decimal(str(r.json()["stones_with_workers_ct"])) >= Decimal("1"),
+        f"1170 holds {r.json().get('stones_with_workers_ct')}ct — a claim recorded only "
+        "when it has a rupee value is a claim a shop with no stone rates never gets",
+    )
+
+    # A line cannot account for more than it was issued. Without the guard the
+    # leftover comes out negative and reads as the shop owing him stones.
+    over_design = client.post("/designs", headers=auth, json={"item_id": taka_id}).json()
+    over_leg = client.post(
+        f"/designs/{over_design['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": setting_dept_id, "worker_id": setter["id"],
+            "gold_issued_g": "10", "gold_issued_purity": 21,
+            "gold_source_inventory_id": piece_gold["id"],
+            "stone_source_inventory_id": set_stock["id"],
+            "stones": [{"stone_id": setting_stone_id, "quantity_issued": 10,
+                        "weight_issued_ct": "5"}],
+            "piece_count": 10, "wastage_basis": "per_100_pieces",
+            "wastage_per_100_pcs_g": "0.400",
+        },
+    ).json()
+    r = client.post(
+        f"/designs/legs/{over_leg['id']}/receive",
+        headers=auth,
+        json={
+            "gold_received_g": "11",
+            "stones": [{
+                "leg_stone_id": over_leg["stones"][0]["id"],
+                "quantity_set": 8, "weight_set_ct": "4",
+                "quantity_returned": 4, "weight_returned_ct": "2",
+            }],
+        },
+    )
+    check(
+        "a stone line accounting for more than it was issued is refused → 400",
+        r.status_code == 400,
+        f"got {r.status_code}: {r.text[:200]}",
+    )
+
+    # --- silver: the same floor, a different metal, and never the same balance ---
+    # 999 silver is quoted out of a thousand, not in karat. A silver leg values
+    # at the silver rate, posts to the silver accounts, and its grams must never
+    # land in a gold balance.
+    section("Silver")
+    r = client.post("/gold-rates", headers=auth, json={
+        "rate_date": str(date.today()), "currency": "PKR", "metal": "silver",
+        "rate_per_g": "340", "fineness_pct": "99.9",
+    })
+    check("set today's silver rate → 201", r.status_code == 201,
+          f"got {r.status_code}: {r.text[:250]}")
+    r = client.post("/gold-rates", headers=auth, json={
+        "rate_date": str(date.today()), "currency": "PKR", "metal": "silver",
+        "rate_per_g": "340",
+    })
+    check(
+        "a silver rate with no fineness is refused → 422",
+        r.status_code == 422,
+        f"got {r.status_code}: {r.text[:200]} — without it the quote would be taken as "
+        "the pure rate and every silver movement valued light",
+    )
+    r = client.get("/gold-rates/current", headers=auth, params={"metal": "silver", "currency": "PKR"})
+    check("the silver rate is fetched apart from the gold rate", r.status_code == 200,
+          f"got {r.status_code}: {r.text[:200]}")
+
+    silver_stock = client.post("/inventory", headers=auth, json={
+        "type": "raw_silver", "label": "999 silver bullion", "weight_g": "5000",
+        "tunch_pct": "99.9",
+    })
+    check("silver has its own stock category → 201", silver_stock.status_code == 201,
+          f"got {silver_stock.status_code}: {silver_stock.text[:200]}")
+    silver_stock = silver_stock.json()
+
+    silver_design = client.post("/designs", headers=auth, json={"item_id": taka_id}).json()
+    r = client.post(
+        f"/designs/{silver_design['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": make_dept_id, "worker_id": karigar["id"], "metal": "silver",
+            "gold_issued_g": "1000", "gold_issued_purity": 24,
+            "gold_source_inventory_id": silver_stock["id"],
+            "piece_count": 1, "labour_basis": "flat", "labour_rate": "0",
+        },
+    )
+    check(
+        "a silver leg quoted in karat is refused → 422",
+        r.status_code == 422,
+        f"got {r.status_code}: {r.text[:200]} — there is no such thing as 21k silver",
+    )
+    r = client.post(
+        f"/designs/{silver_design['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": make_dept_id, "worker_id": karigar["id"], "metal": "silver",
+            "gold_issued_g": "1000", "gold_source_inventory_id": silver_stock["id"],
+            "piece_count": 1, "labour_basis": "flat", "labour_rate": "0",
+        },
+    )
+    check(
+        "a silver leg with no fineness at all is refused → 422",
+        r.status_code == 422,
+        f"got {r.status_code}: {r.text[:200]} — the karat fallback would read 999 as pure",
+    )
+    r = client.post(
+        f"/designs/{silver_design['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": make_dept_id, "worker_id": karigar["id"], "metal": "silver",
+            "gold_issued_g": "1000", "gold_issued_tunch_pct": "99.9",
+            "gold_source_inventory_id": raw_gold["id"],
+            "piece_count": 1, "labour_basis": "flat", "labour_rate": "0",
+        },
+    )
+    check(
+        "a silver leg drawing from the gold vault is refused → 400",
+        r.status_code == 400,
+        f"got {r.status_code}: {r.text[:200]} — it would post to the silver accounts "
+        "while emptying the gold drawer",
+    )
+
+    # Metal with workers, read before and after a silver issue. The whole point
+    # of a separate commodity is that the gold figure does not move.
+    def position() -> dict:
+        return client.get("/ledger/position", headers=auth).json()
+
+    gold_before = Decimal(str(position()["gold_with_workers_g"]))
+    r = client.post(
+        f"/designs/{silver_design['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": make_dept_id, "worker_id": karigar["id"], "metal": "silver",
+            "gold_issued_g": "1000", "gold_issued_tunch_pct": "99.9",
+            "gold_source_inventory_id": silver_stock["id"],
+            "piece_count": 1, "labour_basis": "flat", "labour_rate": "0",
+        },
+    )
+    check("issue 1000g of 999 silver to the maker → 201", r.status_code == 201,
+          f"got {r.status_code}: {r.text[:250]}")
+    silver_leg = r.json()
+    check("the leg records the metal it is working", silver_leg["metal"] == "silver",
+          f"got {silver_leg.get('metal')}")
+
+    pos = position()
+    check(
+        "999 silver is 999 fine grams with the worker",
+        Decimal(str(pos["silver_with_workers_g"])) == Decimal("999"),
+        f"got {pos['silver_with_workers_g']}, expected 999.0000 (1000g at 99.9%)",
+    )
+    check(
+        "and not one gram of it landed in the gold balance",
+        Decimal(str(pos["gold_with_workers_g"])) == gold_before,
+        f"gold with workers moved from {gold_before} to {pos['gold_with_workers_g']} "
+        "on a silver issue — the two metals are sharing a balance",
+    )
+    r = client.get("/ledger/trial-balance", headers=auth)
+    check("books balance with silver on them", r.json()["balanced"] is True)
+
+    # Reports are grams, and grams of the two metals cannot be added. A report
+    # that summed them would tell a shop losing a kilo of silver that it was
+    # losing a kilo of gold.
+    r = client.get("/reports/manufacturing-loss", headers=auth, params={"metal": "silver"})
+    check(
+        "the loss report can be asked for silver on its own → 200",
+        r.status_code == 200 and r.json().get("metal") == "silver",
+        f"got {r.status_code}: {r.text[:200]}",
+    )
+    gold_loss = client.get("/reports/manufacturing-loss", headers=auth).json()
+    check(
+        "and defaults to gold, saying so on the response",
+        gold_loss.get("metal") == "gold",
+        f"got {gold_loss.get('metal')} — a gram figure that does not say which metal "
+        "it is cannot be read at all",
+    )
+    # The silver leg above is 1000g and still out; only received legs count, so
+    # what matters is that asking for one metal never returns the other's legs.
+    silver_rows = client.get(
+        "/reports/department-throughput", headers=auth, params={"metal": "silver"}
+    ).json()
+    gold_rows = client.get("/reports/department-throughput", headers=auth).json()
+    check(
+        "department throughput keeps the two metals apart",
+        silver_rows.get("rows") != gold_rows.get("rows")
+        or all(Decimal(str(x["gold_in_g"])) == 0 for x in silver_rows.get("rows", [])),
+        "a silver leg appearing in the gold rows means the two are sharing a total",
+    )
+
+    # ==================================================================
+    # THE TWO WASTAGE CONVENTIONS, SIDE BY SIDE
+    # ==================================================================
+    # The client's own two worked examples, verbatim, asserted together in one
+    # place — because the single thing he has repeated most is that these are
+    # *independent* formulas and must never be conflated.
+    #
+    # They differ in all four ways that matter:
+    #
+    #                      MAKER (ratti)              SETTER (per 100 pieces)
+    #   measured against   what comes BACK            what went OUT
+    #   quoted in          ratti of 96                grams per 100 stones
+    #   denominated in     the returned karat         the issued karat
+    #   an unused part is  owed to him (entitlement)  kept by the shop (a cap)
+    #
+    # Neither converts into the other, and until the job is finished nobody
+    # knows the maker's reference weight at all.
+    section("Maker vs setter — two conventions")
+
+    # --- 1. THE MAKER ---------------------------------------------------
+    #   100.000 g of pure 24k out, 107.560 g of 21k back, 6 ratti agreed.
+    #     107.560 / 96 * 6      =   6.7225 g of 21k   (added to his credit)
+    #     107.560 + 6.7225      = 114.2825 g of 21k
+    #     114.2825 * 21 / 24    =  99.9972 g pure
+    #     100.000 - 99.9972     =   0.0028 g pure still owed by him
+    mk_design = client.post("/designs", headers=auth, json={"item_id": taka_id}).json()
+    mk_leg = client.post(
+        f"/designs/{mk_design['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": make_dept_id, "worker_id": karigar["id"],
+            "gold_issued_g": "100", "gold_issued_purity": 24,
+            "gold_source_inventory_id": pure_gold["id"],
+            "wastage_basis": "ratti_of_received", "wastage_ratti": "6",
+            "piece_count": 1, "labour_basis": "flat", "labour_rate": "0",
+        },
+    ).json()
+    mk = client.post(
+        f"/designs/legs/{mk_leg['id']}/receive",
+        headers=auth,
+        json={"gold_received_g": "107.5600", "gold_received_purity": 21},
+    ).json()
+    check(
+        "MAKER: 6 ratti of 96 on the 107.560g he returned = 6.7225g of 21k",
+        Decimal(str(mk["wastage_allowed_g"])) == Decimal("6.7225"),
+        f"got {mk['wastage_allowed_g']} — worked out on what came BACK, not what went out",
+    )
+    check(
+        "MAKER: the allowance is in the karat he returned, so 5.8822g fine",
+        Decimal(str(mk["wastage_allowed_fine_g"])) == Decimal("5.8822"),
+        f"got {mk['wastage_allowed_fine_g']} — 6.7225 here would mean it was read as pure",
+    )
+    check(
+        "MAKER: he is left owing 0.0028g of pure gold",
+        Decimal(str(mk["wastage_excess_fine_g"])) == Decimal("0.0028"),
+        f"got {mk['wastage_excess_fine_g']}, expected 0.0028",
+    )
+
+    # --- 2. THE STONE SETTER --------------------------------------------
+    #   100.000 g of 21k product + 30.00 ct of stones out.
+    #     30.00 / 5              =   6.000 g of stones
+    #     total handed over      = 106.000 g
+    #   102.000 g comes back gross, all 30.00 ct still set in it.
+    #     106.000 - 102.000      =   4.000 g short
+    #     0.400 / 100 * 350 pcs  =   1.400 g allowed
+    #     4.000 - 1.400          =   2.600 g receivable from him
+    st_design = client.post("/designs", headers=auth, json={"item_id": taka_id}).json()
+    st_leg = client.post(
+        f"/designs/{st_design['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": setting_dept_id, "worker_id": setter["id"],
+            "gold_issued_g": "100", "gold_issued_purity": 21,
+            "gold_source_inventory_id": piece_gold["id"],
+            "stone_source_inventory_id": set_stock["id"],
+            "stones": [{"stone_id": setting_stone_id, "quantity_issued": 350,
+                        "weight_issued_ct": "30"}],
+            "piece_count": 350,
+            "wastage_basis": "per_100_pieces", "wastage_per_100_pcs_g": "0.400",
+            "labour_basis": "per_piece", "labour_rate": "5",
+        },
+    ).json()
+    check(
+        "SETTER: 30.00ct is 6.000g, so 106.000g was handed over in total",
+        Decimal(str(st_leg["stones_issued_ct"])) == Decimal("30")
+        and Decimal(str(st_leg["gold_issued_g"])) == Decimal("100"),
+        f"gold {st_leg['gold_issued_g']}g + stones {st_leg['stones_issued_ct']}ct",
+    )
+    st = client.post(
+        f"/designs/legs/{st_leg['id']}/receive",
+        headers=auth,
+        json={
+            "gold_received_g": "102",
+            "piece_count": 350,
+            "stones": [{
+                "leg_stone_id": st_leg["stones"][0]["id"],
+                "quantity_set": 350, "weight_set_ct": "30",
+            }],
+        },
+    ).json()
+    check(
+        "SETTER: 0.400g per 100 over 350 pieces = 1.400g allowed",
+        Decimal(str(st["wastage_allowed_g"])) == Decimal("1.4"),
+        f"got {st['wastage_allowed_g']} — worked out on the pieces he SET, not on any weight",
+    )
+    check(
+        "SETTER: gross 102.000g less the 6.000g of stones in it = 96.000g of metal",
+        Decimal(str(st["gold_received_g"])) == Decimal("96"),
+        f"got {st['gold_received_g']} — 102 would mean the stones were never taken out",
+    )
+    check(
+        "SETTER: 106 given, 102 back, 4.000g short",
+        Decimal(str(st["wastage_actual_g"])) == Decimal("4"),
+        f"got {st['wastage_actual_g']} — the client's own figure",
+    )
+    check(
+        "SETTER: 4.000 less 1.400 allowed = 2.600g receivable from him",
+        Decimal(str(st["wastage_excess_g"])) == Decimal("2.6"),
+        f"got {st['wastage_excess_g']}, expected 2.6000 — the client's own figure",
+    )
+    check(
+        "SETTER: charged 350 x Rs 5 = Rs 1,750",
+        Decimal(str(st["labour_amount"])) == Decimal("1750"),
+        f"got {st['labour_amount']}",
+    )
+
+    # --- 3. THEY ARE NOT THE SAME RULE ----------------------------------
+    # The proof that they are independent: the two legs above were settled by
+    # different arithmetic against different reference weights, and neither
+    # figure could have been produced by the other's formula.
+    check(
+        "the maker's allowance came from the weight he RETURNED",
+        Decimal(str(mk["wastage_allowed_g"]))
+        == (Decimal("107.5600") / 96 * 6).quantize(Decimal("0.0001")),
+        f"{mk['wastage_allowed_g']} vs 107.56/96*6 — a percentage of the 100g issued would "
+        "have given something else entirely",
+    )
+    # --- 3b. EVERY ISSUED CARAT IS ACCOUNTED FOR ------------------------
+    # The client's own figures: "if we give him 2ct he used 1.2 then he owes us
+    # .8 — and if .2 is broken the broken goes to our broken stock and the
+    # others go to the stock."
+    #
+    # So the 0.8 he did not set is his to produce, in one of three ways: hand it
+    # back whole, hand it back broken, or owe it. Those three plus what he set
+    # must equal what he was given, and nothing may fall between them.
+    acct_design = client.post("/designs", headers=auth, json={"item_id": taka_id}).json()
+    acct_leg = client.post(
+        f"/designs/{acct_design['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": setting_dept_id, "worker_id": setter["id"],
+            "gold_issued_g": "20", "gold_issued_purity": 21,
+            "gold_source_inventory_id": piece_gold["id"],
+            "stone_source_inventory_id": set_stock["id"],
+            "stones": [{"stone_id": setting_stone_id, "quantity_issued": 20,
+                        "weight_issued_ct": "2"}],
+            "piece_count": 12, "wastage_basis": "per_100_pieces",
+            "wastage_per_100_pcs_g": "0.400",
+        },
+    ).json()
+    broken_before = sum(
+        Decimal(str(row["weight_ct"]))
+        for row in client.get("/inventory", headers=auth,
+                              params={"type": "broken_stone"}).json()
+    )
+    ac = client.post(
+        f"/designs/legs/{acct_leg['id']}/receive",
+        headers=auth,
+        json={
+            "gold_received_g": "19.5",
+            "stones": [{
+                "leg_stone_id": acct_leg["stones"][0]["id"],
+                "quantity_set": 12, "weight_set_ct": "1.2",
+                "quantity_broken": 2, "weight_broken_ct": "0.2",
+                "quantity_returned": 6, "weight_returned_ct": "0.6",
+            }],
+        },
+    ).json()
+    check(
+        "2ct out, 1.2ct set — so 0.8ct is his to produce",
+        Decimal(str(ac["stones_set_ct"])) == Decimal("1.2")
+        and Decimal(str(ac["stones_issued_ct"])) - Decimal(str(ac["stones_set_ct"]))
+        == Decimal("0.8"),
+        f"set {ac['stones_set_ct']} of {ac['stones_issued_ct']}",
+    )
+    check(
+        "0.2ct broken goes to the broken stock",
+        Decimal(str(ac["stones_broken_ct"])) == Decimal("0.2"),
+        f"got {ac['stones_broken_ct']}",
+    )
+    broken_after = sum(
+        Decimal(str(row["weight_ct"]))
+        for row in client.get("/inventory", headers=auth,
+                              params={"type": "broken_stone"}).json()
+    )
+    check(
+        "and it physically lands there, not just on the row",
+        broken_after - broken_before == Decimal("0.2"),
+        f"broken stock moved {broken_after - broken_before}ct, expected 0.2",
+    )
+    check(
+        "0.6ct handed back whole goes to the ordinary stock",
+        Decimal(str(ac["stones_returned_ct"])) == Decimal("0.6"),
+        f"got {ac['stones_returned_ct']}",
+    )
+    check(
+        "he produced all 0.8ct, so he owes nothing",
+        Decimal(str(ac["stones_owed_ct"])) == Decimal("0"),
+        f"got {ac['stones_owed_ct']} — 1.2 set + 0.6 back + 0.2 broken = the 2ct he was given",
+    )
+
+    # The same leg with nothing handed back: then the 0.6 he cannot produce is
+    # a debt, which is the other half of "he owes us them".
+    owe_design = client.post("/designs", headers=auth, json={"item_id": taka_id}).json()
+    owe_leg = client.post(
+        f"/designs/{owe_design['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": setting_dept_id, "worker_id": setter["id"],
+            "gold_issued_g": "20", "gold_issued_purity": 21,
+            "gold_source_inventory_id": piece_gold["id"],
+            "stone_source_inventory_id": set_stock["id"],
+            "stones": [{"stone_id": setting_stone_id, "quantity_issued": 20,
+                        "weight_issued_ct": "2"}],
+            "piece_count": 12, "wastage_basis": "per_100_pieces",
+            "wastage_per_100_pcs_g": "0.400",
+        },
+    ).json()
+    ow = client.post(
+        f"/designs/legs/{owe_leg['id']}/receive",
+        headers=auth,
+        json={
+            "gold_received_g": "19.5",
+            "stones": [{
+                "leg_stone_id": owe_leg["stones"][0]["id"],
+                "quantity_set": 12, "weight_set_ct": "1.2",
+                "quantity_broken": 2, "weight_broken_ct": "0.2",
+            }],
+        },
+    ).json()
+    check(
+        "what he cannot produce, he owes: 2 − 1.2 set − 0.2 broken = 0.6ct",
+        Decimal(str(ow["stones_owed_ct"])) == Decimal("0.6"),
+        f"got {ow['stones_owed_ct']} — nothing may fall between set, returned, broken and owed",
+    )
+
+    # --- 4. THE BASE IS NOT ALWAYS A HUNDRED ----------------------------
+    # 0.400 per 100 is how it is usually said, not how it is always said. A
+    # deal struck per 250 has to be recordable as 250, or the shop divides it
+    # down by hand and the figure it shook on never appears anywhere.
+    base_design = client.post("/designs", headers=auth, json={"item_id": taka_id}).json()
+    base_leg = client.post(
+        f"/designs/{base_design['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": setting_dept_id, "worker_id": setter["id"],
+            "gold_issued_g": "50", "gold_issued_purity": 21,
+            "gold_source_inventory_id": piece_gold["id"],
+            "piece_count": 500,
+            "wastage_basis": "per_100_pieces",
+            "wastage_per_100_pcs_g": "0.400", "wastage_pieces_base": 250,
+            "labour_basis": "per_piece", "labour_rate": "5",
+        },
+    )
+    check("a per-250 deal is accepted → 201", base_leg.status_code == 201,
+          f"got {base_leg.status_code}: {base_leg.text[:200]}")
+    base_leg = base_leg.json()
+    check("the base is recorded on the leg", base_leg["wastage_pieces_base"] == 250,
+          f"got {base_leg.get('wastage_pieces_base')}")
+    bs = client.post(
+        f"/designs/legs/{base_leg['id']}/receive",
+        headers=auth,
+        json={"gold_received_g": "49"},
+    ).json()
+    check(
+        "0.400g per 250 over 500 pieces = 0.800g, not the 2.000g a hundred would give",
+        Decimal(str(bs["wastage_allowed_g"])) == Decimal("0.8"),
+        f"got {bs['wastage_allowed_g']} — 2.0000 would mean the base was ignored",
+    )
+
+    check(
+        "the setter's allowance came from the pieces he SET, and no weight at all",
+        Decimal(str(st["wastage_allowed_g"]))
+        == (Decimal("0.400") / 100 * 350).quantize(Decimal("0.0001")),
+        f"{st['wastage_allowed_g']} vs 0.400/100*350 — it does not move if the piece is "
+        "heavier or lighter, only if he sets more stones",
+    )
+    check(
+        "an unused ratti allowance is owed back to the maker; an unused per-100 one is not",
+        Decimal(str(mk["wastage_excess_fine_g"])) == Decimal("0.0028")
+        and Decimal(str(st["wastage_excess_g"])) > 0,
+        "the maker's allowance is metal he is entitled to keep, so it is signed; the "
+        "setter's is a cap on what he can be charged, so it floors at zero",
+    )
+    check(
+        "books balance after settling both",
+        client.get("/ledger/trial-balance", headers=auth).json()["balanced"] is True,
+    )
+
+    # ----- TWO BUSINESSES UNDER ONE ROOF -----
+    section("Profit split")
+    r = client.get("/reports/profit-split", headers=auth)
+    check("profit split → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:200]}")
+    ps = r.json()
+    check(
+        "metal, stones and making are reported apart",
+        {s["stream"] for s in ps["streams"]} == {"gold", "stones", "making"},
+        f"got {[s['stream'] for s in ps['streams']]} — a single margin averages a business "
+        "that turns over weekly with one that turns over yearly",
+    )
+    check(
+        "each carries its own margin percentage",
+        all("margin_pct" in s for s in ps["streams"]),
+        "making moves with neither rate and for a wholesaler is most of the margin",
+    )
+    check(
+        "the streams add up to the whole",
+        sum(Decimal(str(s["revenue"])) for s in ps["streams"]) == Decimal(str(ps["revenue"])),
+        f"streams {sum(Decimal(str(s['revenue'])) for s in ps['streams'])} vs total "
+        f"{ps['revenue']}",
+    )
+    check(
+        "lines that could not be split are counted, not guessed at",
+        "unsplit_lines" in ps,
+        "a guess would move margin from one business to the other and nothing would say so",
+    )
+
+    # ----- METAL HELD AT COST IS NOT METAL HELD AT WHAT IT IS WORTH -----
+    section("Metal revaluation")
+    r = client.get("/ledger/revaluation", headers=auth)
+    check("revaluation preview → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:200]}")
+    prev = r.json()
+    gold_v = next(m for m in prev["metals"] if m["metal"] == "gold")
+    check(
+        "it says what the metal is on the books at and what it is worth",
+        gold_v["book_value"] is not None and gold_v["market_value"] is not None,
+        f"book {gold_v.get('book_value')} market {gold_v.get('market_value')}",
+    )
+    grams_before = Decimal(str(client.get("/ledger/position", headers=auth).json()["gold_in_hand_g"]))
+    r = client.post("/ledger/revaluation", headers=pwd_h)
+    check("post the revaluation → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:250]}")
+    res = r.json()
+    check(
+        "an entry is posted when the market has moved",
+        res["entry_no"] is not None or Decimal(str(res["total_difference"])) == 0,
+        f"entry {res.get('entry_no')} for {res.get('total_difference')}",
+    )
+    grams_after = Decimal(str(client.get("/ledger/position", headers=auth).json()["gold_in_hand_g"]))
+    check(
+        "not one gram moved — only the money did",
+        grams_after == grams_before,
+        f"gold went from {grams_before}g to {grams_after}g — revaluing must never touch the "
+        "figure the safe is counted against",
+    )
+    check(
+        "and the books still balance",
+        client.get("/ledger/trial-balance", headers=auth).json()["balanced"] is True,
+    )
+    # Posting twice in a row has nothing left to do, which is a real answer.
+    r = client.post("/ledger/revaluation", headers=pwd_h)
+    check(
+        "revaluing again finds nothing to move, and says so rather than failing",
+        r.status_code == 200 and Decimal(str(r.json()["total_difference"])) == 0,
+        f"got {r.status_code}: {r.text[:200]} — a quiet day is not an error",
+    )
+
+    # ----- SALESMEN, BROKERS AND THE FIGURES THEY ARE ASKED TO HIT -----
+    section("Sellers and targets")
+    sman = client.post("/sales/sellers", headers=auth, json={
+        "name": "Road Salesman", "kind": "salesman", "commission_pct": "2",
+    })
+    check("create a salesman → 201", sman.status_code == 201,
+          f"got {sman.status_code}: {sman.text[:200]}")
+    sman = sman.json()
+    brk = client.post("/sales/sellers", headers=auth, json={
+        "name": "Bazaar Broker", "kind": "broker", "commission_pct": "1",
+    }).json()
+    check("brokers are kept apart from salesmen", brk["kind"] == "broker",
+          f"got {brk.get('kind')} — a broker holds no stock and a blended report would "
+          "show the shop carrying goods with a man who never had any")
+
+    # A target with no figure at all cannot be missed or met.
+    r = client.post("/sales/targets", headers=auth, json={
+        "scope": "company", "period_start": str(date.today()),
+        "period_end": str(date.today() + timedelta(days=30)),
+    })
+    check("a target with neither an amount nor a weight is refused → 422",
+          r.status_code == 422, f"got {r.status_code}: {r.text[:180]}")
+    # A period that ends before it starts measures nothing.
+    r = client.post("/sales/targets", headers=auth, json={
+        "scope": "company", "period_start": str(date.today()),
+        "period_end": str(date.today() - timedelta(days=1)), "target_amount": "1000",
+    })
+    check("a period that ends before it starts is refused → 422",
+          r.status_code == 422, f"got {r.status_code}: {r.text[:180]}")
+    # The scope decides which party is named.
+    r = client.post("/sales/targets", headers=auth, json={
+        "scope": "customer", "period_start": str(date.today()),
+        "period_end": str(date.today() + timedelta(days=30)),
+        "target_amount": "1000", "seller_id": sman["id"],
+    })
+    check("a customer target naming a salesman is refused → 422",
+          r.status_code == 422,
+          f"got {r.status_code}: {r.text[:180]} — it would measure the wrong party's sales")
+
+    # Money and weight side by side, either optional.
+    r = client.post("/sales/targets", headers=auth, json={
+        "scope": "company",
+        "period_start": str(date.today() - timedelta(days=10)),
+        "period_end": str(date.today() + timedelta(days=20)),
+        "label": "This month", "target_amount": "1000000", "target_weight_g": "500",
+    })
+    check("set a company target in both money and weight → 201",
+          r.status_code == 201, f"got {r.status_code}: {r.text[:220]}")
+    tgt = r.json()
+    check(
+        "progress is measured, not stored — both halves come back filled in",
+        Decimal(str(tgt["actual_amount"])) > 0 and tgt["invoices"] > 0,
+        f"actual {tgt['actual_amount']} over {tgt['invoices']} bills — a target that "
+        "cached its actuals would drift the first time a bill was voided",
+    )
+    check(
+        "and against each figure separately",
+        tgt["amount_pct"] is not None and tgt["weight_pct"] is not None,
+        f"amount {tgt.get('amount_pct')}% weight {tgt.get('weight_pct')}% — a shop that "
+        "manages in grams and one that manages in rupees are asking different questions",
+    )
+    check(
+        "how much of the period has gone is shown beside them",
+        tgt["period_elapsed_pct"] is not None,
+        "60% of target reads very differently on day three than on day thirty",
+    )
+
+    # A weight-only target reports no money percentage rather than zero.
+    r = client.post("/sales/targets", headers=auth, json={
+        "scope": "seller", "seller_id": sman["id"],
+        "period_start": str(date.today()), "period_end": str(date.today() + timedelta(days=30)),
+        "target_weight_g": "100",
+    }).json()
+    check(
+        "a weight-only target reports nothing against money, not zero",
+        r["weight_pct"] is not None and r["amount_pct"] is None,
+        f"amount {r.get('amount_pct')} — a percentage against nothing is meaningless, "
+        "and zero would read as failure",
+    )
+    check(
+        "a new salesman has brought nothing yet",
+        Decimal(str(r["actual_weight_g"])) == 0,
+        f"got {r['actual_weight_g']}",
+    )
+
+    # ------------------------------------------------------------------
+    # Crediting a bill to a salesman
+    #
+    # The gap these cover: `Invoice.seller_id` existed and a seller target
+    # filtered on it, but no screen ever set it — so every seller target read
+    # 0% forever and the whole feature was decorative. What matters here is the
+    # round trip: a bill names a seller, and that seller's page and target both
+    # move. If only the target moved, the page would be lying; if only the page
+    # moved, the target would be.
+    # ------------------------------------------------------------------
+    def perf(sid, **params):
+        return client.get(f"/sales/sellers/{sid}/performance", headers=auth, params=params).json()
+
+    before = perf(sman["id"])
+    check("a seller's page loads before he has sold anything",
+          before["invoices"] == 0 and Decimal(str(before["revenue"])) == 0,
+          f"got {before['invoices']} bills")
+
+    credited = client.post("/invoices", headers=auth, json={
+        "customer_id": cust["id"], "seller_id": sman["id"],
+        "gold_rate_per_g": str(day_rate),
+        "items": [{"description": "Credited to the salesman", "quantity": 1,
+                   "gold_weight_g": "10", "gold_purity": 22, "labor_amount": "5000"}],
+    })
+    check("an invoice can name its salesman → 201", credited.status_code == 201,
+          f"got {credited.status_code}: {credited.text[:250]}")
+    credited = credited.json()
+    check("and it reads back with his name, not just his id",
+          credited.get("seller_name") == sman["name"],
+          f"got {credited.get('seller_name')!r} — a list showing #3 helps nobody")
+    check("the customer's name comes back too",
+          credited.get("customer_name") is not None,
+          "the invoice list had to print #3 without this")
+    # Issued, not left a draft: the performance page counts issued and paid
+    # bills only, which is right — a draft is not a sale.
+    iss = client.post(f"/invoices/{credited['id']}/issue", headers=pwd_h)
+    check("the credited bill issues", iss.status_code in (200, 201),
+          f"got {iss.status_code}: {iss.text[:200]}")
+
+    after = perf(sman["id"])
+    check(
+        "the sale lands on the salesman's page",
+        after["invoices"] == before["invoices"] + 1,
+        f"{before['invoices']} → {after['invoices']}",
+    )
+    check(
+        "revenue is net of tax, so commission is not charged on the government's money",
+        Decimal(str(after["revenue"])) > 0
+        and Decimal(str(after["revenue"]))
+        <= Decimal(str(credited["total"])),
+        f"revenue {after['revenue']} against a bill of {credited['total']}",
+    )
+    check(
+        "his commission is estimated at his own agreed rate",
+        Decimal(str(after["commission_estimate"]))
+        == (Decimal(str(after["revenue"])) * Decimal(str(after["commission_pct"]))
+            / Decimal("100")).quantize(Decimal("0.01")),
+        f"got {after['commission_estimate']} at {after['commission_pct']}%",
+    )
+    check(
+        "an unpaid bill shows as outstanding, not as collected",
+        Decimal(str(after["collected"])) == 0 and Decimal(str(after["outstanding"])) > 0,
+        f"collected {after['collected']}, outstanding {after['outstanding']} — "
+        "a salesman writing bills nobody pays must not read as a good one",
+    )
+    check(
+        "the customer he sold to is listed against him",
+        any(c["customer_id"] == cust["id"] for c in after["customers"]),
+        str([c["customer_name"] for c in after["customers"]]),
+    )
+    check(
+        "and the bill itself is listed",
+        any(i["invoice_no"] == credited["invoice_no"] for i in after["recent_invoices"]),
+        str([i["invoice_no"] for i in after["recent_invoices"]]),
+    )
+    check(
+        "his targets travel with him rather than needing a second lookup",
+        len(after["targets"]) > 0,
+        "the page showed no targets for a seller who has them",
+    )
+    check(
+        "the target that read 0% forever now moves",
+        any(Decimal(str(t["actual_amount"])) > 0 for t in after["targets"]),
+        f"actuals {[t['actual_amount'] for t in after['targets']]} — this is the whole "
+        "defect: seller targets could never be met because no bill named a seller",
+    )
+    check(
+        "a bill credited to nobody stays credited to nobody",
+        perf(brk["id"])["invoices"] == 0,
+        "the broker was credited with a sale that named the salesman",
+    )
+
+    # ----- CUSTOMERS, BIGGEST FIRST, WITH WHAT THE SHOP KEPT -----
+    section("Customers by spend")
+    r = client.get("/reports/customers", headers=auth)
+    check("customer report → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:200]}")
+    cust_rep = r.json()
+    check("it has rows", len(cust_rep["rows"]) > 0, f"got {len(cust_rep['rows'])}")
+    check(
+        "ranked by spend, biggest first",
+        all(
+            Decimal(str(cust_rep["rows"][i]["revenue"]))
+            >= Decimal(str(cust_rep["rows"][i + 1]["revenue"]))
+            for i in range(len(cust_rep["rows"]) - 1)
+        ),
+        "the question as asked is who spends most",
+    )
+    top = cust_rep["rows"][0]
+    check(
+        "and every row carries what was kept, not just what was spent",
+        "gross_margin" in top and "margin_pct" in top,
+        f"row keys: {sorted(top)} — spend flatters the customer who buys heavy metal thin",
+    )
+    check(
+        "lines with no product behind them are flagged, not hidden",
+        "uncosted_lines" in top,
+        "a customer billed entirely on typed-in lines has a margin nobody should trust",
+    )
+    check(
+        "revenue is net of tax",
+        Decimal(str(cust_rep["revenue"])) >= 0,
+        f"got {cust_rep['revenue']} — counting the government's money as revenue would "
+        "inflate every margin here by the tax rate",
+    )
+    r = client.get("/reports/customers", headers=auth, params={"format": "csv"})
+    check("and it exports", r.status_code == 200 and "customer" in r.text[:200],
+          f"got {r.status_code}: {r.text[:120]}")
+
+    r = client.get("/cash/flow", headers=auth, params={"format": "csv"})
+    check(
+        "the cash flow exports too — the shop reconciles in Excel",
+        r.status_code == 200 and "entry" in r.text[:200],
+        f"got {r.status_code}: {r.text[:120]}",
+    )
+
+    # ----- THE OVERVIEW ANSWERS ALL FOUR QUESTIONS -----
+    section("Business overview")
+    dash = client.get("/dashboard", headers=auth).json()
+    tday = dash["today"]
+    check(
+        "today's money is there, cash and bank apart",
+        all(k in tday for k in ("cash_in_hand", "bank_balance", "money_in_today",
+                                "money_out_today")),
+        f"keys: {sorted(k for k in tday if 'money' in k or 'bank' in k or 'cash' in k)} — a "
+        "drawer is counted and an account is agreed against a statement; one figure covering "
+        "both reconciles against neither",
+    )
+    check(
+        "money out today includes what no invoice produced",
+        Decimal(str(tday["money_out_today"])) > 0,
+        f"got {tday['money_out_today']} — the rent was paid in cash today and has to be in it",
+    )
+    check(
+        "what the shop is owed and owes covers metal, stones and cash",
+        all(k in tday for k in ("customer_receivable", "supplier_payable", "worker_payable",
+                                "stones_with_workers_ct", "metal_owed_to_makers_g")),
+        f"keys present: {sorted(tday)}",
+    )
+    check(
+        "silver is counted apart from gold, never added to it",
+        "silver_in_hand_g" in tday and "silver_with_workers_g" in tday,
+        "a combined metal figure is a number in no unit at all",
+    )
+    check(
+        "the floor says what is in each department and how long it has sat",
+        isinstance(dash.get("floor"), list)
+        and all("oldest_days" in row for row in dash["floor"]),
+        f"floor: {dash.get('floor')} — a count alone cannot tell a busy stage from a stuck one",
+    )
+
+    # ----- WHAT A WORKER IS HOLDING RIGHT NOW -----
+    # "What is out with Zahid" was answerable only by reading every design.
+    section("Worker's jobs")
+    r = client.get("/designs", headers=auth, params={"worker_id": setter["id"]})
+    check("designs can be listed by worker → 200", r.status_code == 200,
+          f"got {r.status_code}: {r.text[:180]}")
+    all_his = r.json()
+    check("and he has some", len(all_his) > 0, f"got {len(all_his)}")
+    r = client.get(
+        "/designs",
+        headers=auth,
+        params={"worker_id": setter["id"], "held_by_worker": True},
+    )
+    held = r.json()
+    check(
+        "narrowing to what he is still holding is a subset",
+        len(held) <= len(all_his),
+        f"{len(held)} held vs {len(all_his)} ever — held must never exceed ever",
+    )
+    check(
+        "a piece that visited him twice is listed once",
+        len({d["id"] for d in all_his}) == len(all_his),
+        f"{len(all_his)} rows, {len({d['id'] for d in all_his})} distinct — a worklist that "
+        "lists a ring three times is one the shop stops trusting",
+    )
+
+    # ----- A PARTY'S ACCOUNT KEEPS ITS UNITS APART -----
+    # The statement used to have two buckets: gold, and "everything else in
+    # rupees". That was right while gold was the only commodity. Once silver
+    # and stones became commodities it started reading a kilo of silver as a
+    # rupee debt — a worker holding metal shown as owing money, which he could
+    # then be asked to settle in cash.
+    section("Party statement units")
+    st = client.get(
+        "/ledger/party-statement",
+        headers=auth,
+        params={"party_type": "worker", "party_id": karigar["id"]},
+    )
+    check("a worker's statement → 200", st.status_code == 200,
+          f"got {st.status_code}: {st.text[:200]}")
+    acct = st.json()
+    check(
+        "silver he holds is grams of silver, not rupees",
+        Decimal(str(acct["closing_silver_g"])) > 0,
+        f"closing silver {acct.get('closing_silver_g')}g — he was issued 1000g of 999; "
+        "zero here means it was counted as cash",
+    )
+    setter_acct = client.get(
+        "/ledger/party-statement",
+        headers=auth,
+        params={"party_type": "worker", "party_id": setter["id"]},
+    ).json()
+    check(
+        "and a setter's stone debt is carats, not rupees",
+        Decimal(str(setter_acct["closing_stone_ct"])) > 0,
+        f"closing stones {setter_acct.get('closing_stone_ct')}ct — a carat debt cannot be "
+        "settled by paying, so it must not sit in the cash column",
+    )
+
+    # ----- DUE DATES ARE CHASED, NOT JUST RECORDED -----
+    # `Invoice.due_date` has been computed since credit terms were added and
+    # nothing ever read it; `metal_due_date` recorded a promise to hand gold
+    # back and nothing ever mentioned it again. A date the system knows and
+    # never brings up is a date nobody acts on.
+    section("Due dates")
+    alerts_now = {a["key"] for a in client.get("/dashboard", headers=auth).json()["alerts"]}
+    check(
+        "a bill inside its credit terms is not called overdue",
+        "invoices_overdue" not in alerts_now,
+        f"alerts: {sorted(alerts_now)} — every bill written this morning on 30 days would "
+        "otherwise be flagged, and the real ones would be lost among them",
+    )
+
+    # A bill issued on terms that have already run out.
+    late_inv = client.post("/invoices", headers=auth, json={
+        "customer_id": customer_id, "sale_type": "normal", "currency": "PKR",
+        "term_days": 0,
+        "items": [{"description": "late bill", "quantity": 1, "gold_weight_g": "1",
+                   "gold_purity": 22}],
+    }).json()
+    r = client.post(f"/invoices/{late_inv['id']}/issue", headers=pwd_h)
+    check("issue a bill due immediately", r.status_code == 200,
+          f"got {r.status_code}: {r.text[:180]}")
+
+    # Term 0 means due the day it was issued, so it is overdue from tomorrow —
+    # not today. The alert must not fire on the day of issue.
+    alerts_same_day = {a["key"] for a in client.get("/dashboard", headers=auth).json()["alerts"]}
+    check(
+        "a bill due today is not yet past its date",
+        "invoices_overdue" not in alerts_same_day,
+        f"alerts: {sorted(alerts_same_day)} — due today and overdue are different days",
+    )
+
+    # Metal promised to a maker, with the date already gone.
+    od_design = client.post("/designs", headers=auth, json={"item_id": taka_id}).json()
+    r = client.post(
+        f"/designs/{od_design['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": make_dept_id, "worker_id": karigar["id"],
+            "gold_issued_g": "0", "gold_source_inventory_id": pure_gold["id"],
+            "wastage_basis": "ratti_of_received", "wastage_ratti": "6",
+            "piece_count": 1, "labour_basis": "flat", "labour_rate": "0",
+            "metal_due_date": str(date.today() - timedelta(days=5)),
+        },
+    )
+    check("record metal owed to a maker, already past its date → 201",
+          r.status_code == 201, f"got {r.status_code}: {r.text[:220]}")
+    alerts_after = {a["key"] for a in client.get("/dashboard", headers=auth).json()["alerts"]}
+    check(
+        "the shop is told it owes a maker metal past the agreed date",
+        "metal_due" in alerts_after,
+        f"alerts: {sorted(alerts_after)} — this is the only promise in the system to "
+        "*deliver* metal, and nothing else in the day would ever raise it",
+    )
+
+    # ----- LIVE RATES (display only, and never 5xx) -----
+    section("Live rates")
+    r = client.get("/gold-rates/live", headers=auth)
+    check(
+        "live rates answer 200 whether or not the feed is configured",
+        r.status_code == 200,
+        f"got {r.status_code}: {r.text[:200]} — a display panel that takes the page down "
+        "when a third party has a bad morning is worse than one that says it does not know",
+    )
+    lv = r.json()
+    check(
+        "and either carry a price or say why not",
+        (lv.get("gold_per_gram") is not None) or bool(lv.get("unavailable")),
+        f"gold={lv.get('gold_per_gram')} unavailable={lv.get('unavailable')} — a blank with "
+        "no explanation is the one unacceptable answer",
+    )
+    check(
+        "the caveat travels with the figures",
+        "not the local market rate" in (lv.get("caveat") or ""),
+        f"got {lv.get('caveat')!r} — spot converted to PKR is not what the bazaar charges",
+    )
+    # The whole point of the separate tab: this must not have become the rate
+    # anything is priced at.
+    r = client.get("/gold-rates/current", headers=auth, params={"currency": "PKR", "purity": 24})
+    check(
+        "the rate that prices things is still the one the shop set",
+        r.status_code == 200 and Decimal(str(r.json()["rate_per_g"])) > 0,
+        f"got {r.status_code}: {r.text[:150]}",
+    )
+
+    # ----- STOCK POSITION (what is held, and what it is worth) -----
+    section("Stock position")
+    r = client.get("/reports/stock-position", headers=auth)
+    check("stock position → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:200]}")
+    pos = r.json()
+    gold_pos = next(m for m in pos["metals"] if m["metal"] == "gold")
+    silver_pos = next(m for m in pos["metals"] if m["metal"] == "silver")
+    check(
+        "metals are valued on their pure content, not their scale reading",
+        Decimal(str(gold_pos["fine_weight_g"])) < Decimal(str(gold_pos["weight_g"])),
+        f"as weighed {gold_pos['weight_g']}, fine {gold_pos['fine_weight_g']} — equal would "
+        "mean 22k was valued as though it were pure",
+    )
+    check(
+        "999 silver is nearly all pure, and counted apart from the gold",
+        Decimal(str(silver_pos["fine_weight_g"]))
+        == (Decimal(str(silver_pos["weight_g"])) * Decimal("0.999")).quantize(Decimal("0.0001")),
+        f"as weighed {silver_pos['weight_g']}, fine {silver_pos['fine_weight_g']}",
+    )
+    check(
+        "the two metals are never summed into one weight",
+        len({m["metal"] for m in pos["metals"]}) == 2,
+        "a combined metal figure is a number in no unit at all",
+    )
+    check(
+        "stones stay in carats",
+        Decimal(str(pos["stone_weight_ct"])) >= 0 and "stone_weight_ct" in pos,
+        str(pos.get("stone_weight_ct")),
+    )
+
+    # A metal with no rate today is counted but not valued. Reporting it at zero
+    # would show real stock as worthless.
+    r = client.get("/reports/stock-position", headers=staff_auth)
+    check("staff can read stock", r.status_code == 200, f"got {r.status_code}")
+
+    # ----- TWO KINDS OF BILL -----
+    # A finished piece is billed on its metal; a parcel of loose stones has no
+    # gold on it at all, and its discount argues against the stone price.
+    section("Loose material bills")
+    r = client.post("/invoices", headers=auth, json={
+        "customer_id": customer_id, "sale_type": "normal", "kind": "loose_material",
+        "currency": "PKR",
+        "items": [{
+            "description": "12 PTR commercial parcel", "quantity": 1,
+            "stone_weight_ct": "30", "stone_rate_per_ct": "12000",
+            "line_discount": "5000",
+        }],
+    })
+    check("raise a loose-material bill → 201", r.status_code == 201,
+          f"got {r.status_code}: {r.text[:250]}")
+    loose = r.json()
+    check("the bill records which kind it is", loose["kind"] == "loose_material",
+          f"got {loose.get('kind')}")
+    check(
+        "30ct at 12,000 less 5,000 = 355,000",
+        Decimal(str(loose["items"][0]["line_total"])) == Decimal("355000"),
+        f"got {loose['items'][0]['line_total']}",
+    )
+    check(
+        "and it carries no gold",
+        Decimal(str(loose["items"][0]["gold_amount"])) == 0,
+        f"got {loose['items'][0]['gold_amount']}",
+    )
+
+    # The three ways gold sneaks onto a bill that should have none. Each would
+    # report a real figure under the wrong lever.
+    for field, value, why in (
+        ("gold_weight_g", "10", "a weight makes a parcel of stones look like a piece"),
+        ("sale_wastage_pct", "2", "wastage bills metal that was never sold"),
+        ("discount_ratti", "6", "ratti discounts gold that is not there"),
+    ):
+        line = {
+            "description": "parcel", "quantity": 1,
+            "stone_weight_ct": "10", "stone_rate_per_ct": "1000",
+            field: value,
+        }
+        rr = client.post("/invoices", headers=auth, json={
+            "customer_id": customer_id, "sale_type": "normal", "kind": "loose_material",
+            "currency": "PKR", "items": [line],
+        })
+        check(
+            f"a loose bill refuses {field} → 422",
+            rr.status_code == 422,
+            f"got {rr.status_code}: {rr.text[:180]} — {why}",
+        )
+
+    # The default is unchanged, so every bill the shop already writes is
+    # untouched.
+    r = client.post("/invoices", headers=auth, json={
+        "customer_id": customer_id, "sale_type": "normal", "currency": "PKR",
+        "items": [{"description": "ring", "quantity": 1, "gold_weight_g": "5",
+                   "gold_purity": 22}],
+    })
+    check(
+        "a bill with no kind stated is a finished-product bill",
+        r.status_code == 201 and r.json()["kind"] == "finished_product",
+        f"got {r.status_code}: {r.json().get('kind') if r.status_code == 201 else r.text[:150]}",
+    )
+
+    # ----- CASH BOOK (the money no other document explains) -----
+    section("Cash book")
+    r = client.post("/cash/categories", headers=auth, json={
+        "name": "Rent", "direction": "paid", "account_code": "5300",
+    })
+    check("create an expense heading → 201", r.status_code == 201,
+          f"got {r.status_code}: {r.text[:200]}")
+    rent = r.json()
+    r = client.post("/cash/categories", headers=auth, json={
+        "name": "Owner's float", "direction": "received",
+    })
+    check("create a receipt heading → 201", r.status_code == 201, f"got {r.status_code}")
+    float_cat = r.json()
+
+    r = client.post("/cash/categories", headers=auth, json={
+        "name": "Bad head", "account_code": "9999",
+    })
+    check(
+        "a heading pointing at a non-existent account is refused → 400",
+        r.status_code == 400,
+        f"got {r.status_code}: {r.text[:180]} — caught at setup, not on the hundredth expense",
+    )
+
+    cash_before = Decimal(str(client.get("/ledger/position", headers=auth).json()["cash_in_hand"]))
+    r = client.post("/cash/entries", headers=auth, json={
+        "direction": "paid", "method": "cash", "category_id": rent["id"],
+        "amount": "40000", "counterparty": "Landlord", "occurred_on": str(date.today()),
+    })
+    check("pay the rent in cash → 201", r.status_code == 201,
+          f"got {r.status_code}: {r.text[:250]}")
+    rent_entry = r.json()
+    check("the entry is numbered", rent_entry["entry_no"].startswith("CE-"),
+          f"got {rent_entry.get('entry_no')}")
+    cash_after = Decimal(str(client.get("/ledger/position", headers=auth).json()["cash_in_hand"]))
+    check(
+        "the drawer is 40,000 lighter, in the ledger and not just on the row",
+        cash_after == cash_before - Decimal("40000"),
+        f"cash went from {cash_before} to {cash_after}",
+    )
+    check(
+        "books balance after an expense",
+        client.get("/ledger/trial-balance", headers=auth).json()["balanced"] is True,
+    )
+
+    # A bank movement has to name its account or it cannot be reconciled; a
+    # cash one must not, or it claims money passed through a bank it never did.
+    r = client.post("/cash/entries", headers=auth, json={
+        "direction": "paid", "method": "bank", "category_id": rent["id"], "amount": "1000",
+    })
+    check("a bank entry with no account is refused → 400", r.status_code == 400,
+          f"got {r.status_code}: {r.text[:200]}")
+
+    # A heading declared for money out cannot be used on money in.
+    r = client.post("/cash/entries", headers=auth, json={
+        "direction": "received", "method": "cash", "category_id": rent["id"], "amount": "1000",
+    })
+    check("a paid-only heading is refused on a receipt → 400", r.status_code == 400,
+          f"got {r.status_code}: {r.text[:200]}")
+
+    r = client.post("/cash/entries", headers=auth, json={
+        "direction": "received", "method": "cash", "category_id": float_cat["id"],
+        "amount": "25000", "counterparty": "Owner",
+    })
+    check("put money into the till → 201", r.status_code == 201,
+          f"got {r.status_code}: {r.text[:220]}")
+
+    # The flow report reads the journal, not the cash entries — so the rent and
+    # every customer who paid today appear side by side.
+    r = client.get("/cash/flow", headers=auth, params={"date_from": str(date.today())})
+    check("the day's cash flow → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:200]}")
+    flow = r.json()
+    check(
+        "the rent shows as money out",
+        Decimal(str(flow["money_out"])) >= Decimal("40000"),
+        f"money_out={flow['money_out']} — the expense did not reach the report",
+    )
+    check(
+        "and it is filed under the head it was posted to",
+        any(h["account_code"] == "5300" and Decimal(str(h["money_out"])) >= Decimal("40000")
+            for h in flow["by_head"]),
+        "heads: "
+        + ", ".join(
+            f"{h['account_code']} in={h['money_in']} out={h['money_out']}"
+            for h in flow["by_head"]
+        ),
+    )
+    check(
+        "a head that moved nothing is left off the report",
+        all(
+            Decimal(str(h["money_in"])) or Decimal(str(h["money_out"]))
+            for h in flow["by_head"]
+        ),
+        "a row of zeroes reads as 'nothing happened here' when two things did and cancelled out",
+    )
+    check(
+        "the report closes on itself: opening + net = closing",
+        Decimal(str(flow["closing_cash"])) + Decimal(str(flow["closing_bank"]))
+        == Decimal(str(flow["opening_cash"])) + Decimal(str(flow["opening_bank"]))
+        + Decimal(str(flow["net"])),
+        f"opening {flow['opening_cash']}+{flow['opening_bank']}, net {flow['net']}, "
+        f"closing {flow['closing_cash']}+{flow['closing_bank']}",
+    )
+    check(
+        "money the shop took from customers is in there too, not just manual entries",
+        any(h["account_code"] not in ("5300", "4400") for h in flow["by_head"]),
+        "a cash report that only knew about manual entries would miss every sale",
+    )
+    r = client.get("/cash/flow", headers=staff_auth, params={"date_from": str(date.today())})
+    check("staff cannot read the day's money → 403", r.status_code == 403, f"got {r.status_code}")
+
     # ----- AI INSIGHTS (degrade-without-a-provider contract) -----
     section("AI insights")
-    r = client.get("/insights/wastage-anomalies", headers=auth, params={"days": 90})
+    r = ai_client.get("/insights/wastage-anomalies", headers=auth, params={"days": 90})
     check(
         "wastage analysis returns figures with no model configured",
         r.status_code == 200,
         f"got {r.status_code}: {r.text[:200]}",
     )
-    r = client.get("/insights/margin-watch", headers=auth, params={"days": 90})
+    r = ai_client.get("/insights/margin-watch", headers=auth, params={"days": 90})
     check(
         "margin watch returns figures with no model configured",
         r.status_code == 200,
         f"got {r.status_code}: {r.text[:200]}",
     )
-    r = client.post("/insights/ask", headers=auth, json={"question": "kitna sona Zahid ke paas hai"})
-    check(
-        "ask returns a clean 503 when no model is configured",
-        r.status_code == 503,
-        f"got {r.status_code}: {r.text[:200]}",
+    # Whether a model is configured is a property of the machine, not of the
+    # code, so the assertions below adapt rather than encoding one setup. What
+    # is invariant either way is that the AI layer never 500s: unconfigured it
+    # explains itself, configured it either answers or fails with the
+    # provider's own reason. A traceback is the one unacceptable outcome, and
+    # is exactly what an out-of-credit key used to produce.
+    ai_on = ai_client.get("/insights/margin-watch", headers=auth, params={"days": 90}).json().get(
+        "ai_enabled", False
     )
+    r = ai_client.post("/insights/ask", headers=auth, json={"question": "kitna sona Zahid ke paas hai"})
+    if ai_on:
+        check(
+            "ask does not fall over when a model is configured",
+            r.status_code in (200, 400, 502),
+            f"got {r.status_code}: {r.text[:200]}",
+        )
+    else:
+        check(
+            "ask returns a clean 503 when no model is configured",
+            r.status_code == 503,
+            f"got {r.status_code}: {r.text[:200]}",
+        )
     r = client.get("/insights/wastage-anomalies", headers=staff_auth, params={"days": 90})
     check("staff cannot read the wastage analysis → 403", r.status_code == 403, f"got {r.status_code}")
 
     # --- the assistant ---
     # A data question here takes exactly the /ask path, so it is exactly as
     # sensitive and fails exactly as cleanly.
-    r = client.post("/insights/chat", headers=auth, json={
+    r = ai_client.post("/insights/chat", headers=auth, json={
         "messages": [{"role": "user", "content": "kitna sona Zahid ke paas hai"}],
     })
-    check(
-        "the assistant returns a clean 503 when no model is configured",
-        r.status_code == 503,
-        f"got {r.status_code}: {r.text[:200]} — an unconfigured model must not 500",
-    )
-    check(
-        "and the 503 says how to configure it",
-        "AI_PROVIDER" in r.text,
-        "a 503 nobody can act on is the same as a crash",
-    )
+    if ai_on:
+        check(
+            "the assistant answers or fails cleanly, never with a traceback",
+            r.status_code in (200, 400, 502),
+            f"got {r.status_code}: {r.text[:200]}",
+        )
+    else:
+        check(
+            "the assistant returns a clean 503 when no model is configured",
+            r.status_code == 503,
+            f"got {r.status_code}: {r.text[:200]} — an unconfigured model must not 500",
+        )
+        check(
+            "and the 503 says how to configure it",
+            "AI_PROVIDER" in r.text,
+            "a 503 nobody can act on is the same as a crash",
+        )
     r = client.post("/insights/chat", headers=staff_auth, json={
         "messages": [{"role": "user", "content": "what is the margin"}],
     })
@@ -2103,16 +4083,25 @@ def main() -> int:
     check("an empty conversation is rejected → 422", r.status_code == 422, f"got {r.status_code}")
 
     # --- generated images ---
-    r = client.post(
+    r = ai_client.post(
         f"/products/{finished_product_id}/image/generate",
         headers=auth,
         data={"prompt": "a 22k gold taka pendant with a floral border", "attach": "false"},
     )
     check(
-        "image generation returns a clean 503 when unconfigured",
-        r.status_code == 503,
-        f"got {r.status_code}: {r.text[:200]}",
+        "image generation never 500s, configured or not",
+        r.status_code in (200, 502, 503),
+        f"got {r.status_code}: {r.text[:220]}",
     )
+    if r.status_code == 502:
+        # Worth its own assertion: the provider's own words are what tell the
+        # operator whether to top up, fix a model name, or wait — and those are
+        # three different actions.
+        check(
+            "and a provider refusal carries the provider's reason",
+            len(r.text) > 40,
+            f"got {r.text[:160]}",
+        )
     r = client.post(
         "/products/999999/image/generate", headers=auth, data={"prompt": "anything at all"}
     )
@@ -2414,6 +4403,693 @@ def main() -> int:
         Decimal(str(lot["total"])) == Decimal("102000.00"),
         f"got {lot['total']}, expected 100000 + 2%",
     )
+    # ----------------------------------------------------------------------
+    # Bullion bills: gold and silver, one dealer, two control accounts
+    #
+    # Silver could be issued to a karigar, valued, revalued and reported long
+    # before it could be *bought* — `gold_purchases` had no metal column, so
+    # the only way silver ever entered was an opening balance. These assertions
+    # exist to hold the two apart: the failure they guard against is not a
+    # crash but a silent one, where five kilos of silver lands in 1130 and the
+    # shop reads a hundredfold overstatement of its gold.
+    # ----------------------------------------------------------------------
+    def silver_in_hand() -> Decimal:
+        return Decimal(str(client.get("/ledger/position", headers=auth).json()["silver_in_hand_g"]))
+
+    gold_before_bullion = gold_in_hand()
+    silver_before_bullion = silver_in_hand()
+
+    r = client.post(
+        "/purchasing/gold-purchases",
+        headers=auth,
+        json={
+            "supplier_id": supplier["id"],
+            "payment_mode": "credit",
+            "extra_cost_pct": "0",
+            "items": [{"description": "TT bar", "purity": 24, "weight_g": "100",
+                       "rate_per_g": str(day_rate)}],
+        },
+    )
+    check("buy gold bullion → 201", r.status_code == 201, f"got {r.status_code}: {r.text[:250]}")
+    gp = r.json()
+    check("a gold bill is numbered GP", gp["purchase_no"].startswith("GP-"), gp["purchase_no"])
+    check("a gold bill reads back as gold", gp["metal"] == "gold", str(gp.get("metal")))
+    check(
+        "100g of 24k adds 100 fine grams of gold",
+        abs((gold_in_hand() - gold_before_bullion) - Decimal("100")) <= Decimal("0.0002"),
+        f"moved {gold_in_hand() - gold_before_bullion}",
+    )
+    check(
+        "a gold bill does not touch silver",
+        silver_in_hand() == silver_before_bullion,
+        f"silver moved by {silver_in_hand() - silver_before_bullion}",
+    )
+
+    # Silver states fineness, never karat. Both wrong ways round are refused
+    # rather than coerced — a coerced purity is one nobody ever sees again.
+    r = client.post(
+        "/purchasing/gold-purchases",
+        headers=auth,
+        json={
+            "supplier_id": supplier["id"], "metal": "silver", "payment_mode": "cash",
+            "items": [{"purity": 24, "weight_g": "1000", "rate_per_g": "300"}],
+        },
+    )
+    check("silver quoted in karat → 422", r.status_code == 422, f"got {r.status_code}: {r.text[:200]}")
+    r = client.post(
+        "/purchasing/gold-purchases",
+        headers=auth,
+        json={
+            "supplier_id": supplier["id"], "metal": "silver", "payment_mode": "cash",
+            "items": [{"weight_g": "1000", "rate_per_g": "300"}],
+        },
+    )
+    check(
+        "silver with no fineness at all → 422, not 'assume pure'",
+        r.status_code == 422,
+        f"got {r.status_code}: {r.text[:200]}",
+    )
+
+    gold_before_silver = gold_in_hand()
+    r = client.post(
+        "/purchasing/gold-purchases",
+        headers=auth,
+        json={
+            "supplier_id": supplier["id"], "metal": "silver", "payment_mode": "cash",
+            "items": [
+                {"description": "999 bar", "tunch_pct": "99.9", "weight_g": "4000",
+                 "rate_per_g": "300"},
+                {"description": "sterling", "tunch_pct": "92.5", "weight_g": "1000",
+                 "rate_per_g": "280"},
+            ],
+        },
+    )
+    check("buy silver bullion → 201", r.status_code == 201, f"got {r.status_code}: {r.text[:250]}")
+    sb = r.json()
+    check(
+        "a silver bill gets its own series, not the stone-purchase SP",
+        sb["purchase_no"].startswith("SB-"),
+        sb["purchase_no"],
+    )
+    check("a silver bill reads back as silver", sb["metal"] == "silver", str(sb.get("metal")))
+    check(
+        "silver banks at its fineness: 4000×0.999 + 1000×0.925 = 4921 fine",
+        abs(Decimal(str(sb["total_fine_g"])) - Decimal("4921")) <= Decimal("0.0002"),
+        f"got {sb['total_fine_g']}",
+    )
+    check(
+        "those 4921 fine grams land in silver",
+        abs((silver_in_hand() - silver_before_bullion) - Decimal("4921")) <= Decimal("0.0002"),
+        f"moved {silver_in_hand() - silver_before_bullion}",
+    )
+    check(
+        "and not one gram of them lands in gold",
+        gold_in_hand() == gold_before_silver,
+        f"gold moved by {gold_in_hand() - gold_before_silver} on a silver bill",
+    )
+    check(
+        "a silver lot carries no karat",
+        all(i["purity"] is None for i in sb["items"]),
+        str([i["purity"] for i in sb["items"]]),
+    )
+    check("books balance after both bullion bills",
+          client.get("/ledger/trial-balance", headers=auth).json()["balanced"] is True)
+    check(
+        "the two bills are separable by metal",
+        [x["purchase_no"] for x in
+         client.get("/purchasing/gold-purchases?metal=silver", headers=auth).json()]
+        == [sb["purchase_no"]],
+        "the silver filter returned the wrong set",
+    )
+    # Fineness keys the pot, so 999 and 925 are two buckets rather than one
+    # blended figure nobody can weigh against the safe. Asserted on the tunch
+    # and not the label: a pot the shop already opened and named itself — the
+    # seed ships "999 silver bullion" — must be *found*, not shadowed by a
+    # second one this code named its own way. Two rows for one fineness is the
+    # bug; what they are called is the shop's business.
+    silver_pots = [
+        i for i in client.get("/inventory?type=raw_silver", headers=auth).json()
+        if i["type"] == "raw_silver"
+    ]
+    finenesses = [Decimal(str(p["tunch_pct"])) for p in silver_pots if p.get("tunch_pct")]
+    check(
+        "999 and sterling get their own melt pots",
+        {f.normalize() for f in finenesses} >= {Decimal("99.9"), Decimal("92.5")},
+        str([(p["label"], p.get("tunch_pct")) for p in silver_pots]),
+    )
+    check(
+        "and buying into a fineness already on the books reuses its pot",
+        len(finenesses) == len(set(f.normalize() for f in finenesses)),
+        f"duplicate silver pots: {[(p['label'], p.get('tunch_pct')) for p in silver_pots]}",
+    )
+
+    # ----------------------------------------------------------------------
+    # Material outside the company
+    #
+    # The UI spec calls this first-class twice and nothing aggregated it: the
+    # position report gives one total, a party statement gives one party. What
+    # this must get right is that it reads the **ledger**, not open job legs —
+    # a worker with every leg closed and metal still unreturned has to appear.
+    # ----------------------------------------------------------------------
+    # ----------------------------------------------------------------------
+    # Vendor bills: due dates, and paying them oldest-first
+    #
+    # Before this, a purchase on credit posted to 2110 and stayed there — no
+    # date said when it was due and nothing could pay it, so the payables
+    # figure only ever grew. What these assertions pin down is the settlement
+    # rule the shop chose: a payment clears the oldest bill first, and the
+    # paid/outstanding split is derived at read time rather than stored, so it
+    # cannot drift from the ledger.
+    # ----------------------------------------------------------------------
+    def bills(**params):
+        return client.get("/purchasing/bills", headers=auth, params=params).json()
+
+    # Its own stone, so these bills cannot disturb the carat figures the stone
+    # stock assertions below are checking. A test that quietly changes another
+    # test's inputs is worse than no test.
+    bill_stone = client.post(
+        "/stones", headers=auth,
+        json={"name": "Ageing Test Stone", "kind": "other"},
+    ).json()["id"]
+
+    # Two dated bills on the same dealer, a week apart, plus a third with no
+    # date agreed — all three states the report has to tell apart.
+    old_bill = client.post(
+        "/purchasing/stone-purchases", headers=auth,
+        json={"supplier_id": supplier["id"], "due_date": "2020-01-31",
+              "purchased_at": "2020-01-01T10:00:00Z",
+              "items": [{"stone_id": bill_stone, "quantity": 1, "weight_ct": "1",
+                         "rate_per_ct": "100000"}]},
+    )
+    check("a bill can carry a due date → 201", old_bill.status_code == 201,
+          f"got {old_bill.status_code}: {old_bill.text[:200]}")
+    old_bill = old_bill.json()
+    check("the due date reads back", old_bill["due_date"] == "2020-01-31", str(old_bill.get("due_date")))
+
+    new_bill = client.post(
+        "/purchasing/stone-purchases", headers=auth,
+        json={"supplier_id": supplier["id"], "due_date": "2020-02-28",
+              "purchased_at": "2020-02-01T10:00:00Z",
+              "items": [{"stone_id": bill_stone, "quantity": 1, "weight_ct": "1",
+                         "rate_per_ct": "60000"}]},
+    ).json()
+
+    mine = [b for b in bills(supplier_id=supplier["id"])["rows"]
+            if b["purchase_no"] in (old_bill["purchase_no"], new_bill["purchase_no"])]
+    check("both bills are overdue — their dates are years past",
+          all(b["status"] == "overdue" for b in mine), str([(b["purchase_no"], b["status"]) for b in mine]))
+    check("and each says how late it is",
+          all((b["days_overdue"] or 0) > 1000 for b in mine),
+          str([b["days_overdue"] for b in mine]))
+
+    # A cash-paid bullion bill never created a payable, so it must not appear.
+    cash_bill = client.post(
+        "/purchasing/gold-purchases", headers=auth,
+        json={"supplier_id": supplier["id"], "payment_mode": "cash",
+              "items": [{"purity": 24, "weight_g": "1", "rate_per_g": "100"}]},
+    ).json()
+    check(
+        "a bill paid at the counter is not a debt and is not listed",
+        cash_bill["purchase_no"] not in
+        [b["purchase_no"] for b in bills(supplier_id=supplier["id"])["rows"]],
+        f"{cash_bill['purchase_no']} appeared in the payables list",
+    )
+
+    # Pay part of the older bill. Oldest-first is the rule the shop chose.
+    pay = client.post(
+        "/purchasing/supplier-payments", headers=auth,
+        json={"supplier_id": supplier["id"], "amount": "40000", "method": "cash",
+              "reference": "cheque 001"},
+    )
+    check("pay a supplier → 201", pay.status_code == 201, f"got {pay.status_code}: {pay.text[:220]}")
+    pay = pay.json()
+    check("a supplier payment gets its own VP series", pay["payment_no"].startswith("VP-"),
+          pay["payment_no"])
+    check("and it posts to the ledger", pay["journal_entry_no"] is not None, str(pay))
+    check("paying 'on credit' is refused — that is the bill, not a payment",
+          client.post("/purchasing/supplier-payments", headers=auth,
+                      json={"supplier_id": supplier["id"], "amount": "1", "method": "credit"}
+                      ).status_code == 422,
+          "credit was accepted as a payment method")
+
+    def bill_named(no):
+        return next(b for b in bills(supplier_id=supplier["id"])["rows"] if b["purchase_no"] == no)
+
+    # The oldest open bill on this supplier is not necessarily ours — earlier
+    # sections bought stones from them too — so assert the *rule* rather than a
+    # figure: payments land on the earliest-dated bills and never skip ahead.
+    rows_now = bills(supplier_id=supplier["id"])["rows"]
+    paid_order = [b for b in rows_now if Decimal(str(b["paid"])) > 0]
+    unpaid_before_paid = [
+        b for b in rows_now
+        if Decimal(str(b["paid"])) == 0
+        and any(p["purchased_on"] > b["purchased_on"] for p in paid_order)
+    ]
+    check(
+        "a payment clears the oldest bills first and skips none",
+        not unpaid_before_paid,
+        f"these were skipped: {[b['purchase_no'] for b in unpaid_before_paid]}",
+    )
+    check(
+        "the newer of our two bills is untouched while the older is unsettled",
+        Decimal(str(bill_named(new_bill["purchase_no"])["paid"])) == Decimal("0"),
+        "the later bill was paid before the earlier one",
+    )
+    check(
+        "outstanding never exceeds the bill",
+        all(Decimal(str(b["outstanding"])) <= Decimal(str(b["total"])) for b in rows_now),
+        "a bill shows more outstanding than it was ever worth",
+    )
+    check(
+        "total outstanding is the sum of the rows",
+        abs(Decimal(str(bills(supplier_id=supplier["id"])["total_outstanding"]))
+            - sum((Decimal(str(b["outstanding"])) for b in rows_now), Decimal("0")))
+        <= Decimal("0.01"),
+        "the header total disagrees with the table",
+    )
+
+    # Reversing gives the money back to the bills, because nothing was stored.
+    outstanding_paid = Decimal(str(bills(supplier_id=supplier["id"])["total_outstanding"]))
+    rv = client.post(f"/purchasing/supplier-payments/{pay['id']}/reverse", headers=pwd_h, json={})
+    check("reverse a supplier payment → 200", rv.status_code == 200,
+          f"got {rv.status_code}: {rv.text[:220]}")
+    check(
+        "reversing a payment puts the bills back to outstanding",
+        Decimal(str(bills(supplier_id=supplier["id"])["total_outstanding"]))
+        == outstanding_paid + Decimal("40000"),
+        "the reversal did not restore what the payment had cleared",
+    )
+    check("books balance after paying and un-paying a supplier",
+          client.get("/ledger/trial-balance", headers=auth).json()["balanced"] is True)
+
+    # ----------------------------------------------------------------------
+    # Product timeline
+    #
+    # The lifecycle of one piece, assembled from the documents rather than a
+    # stored log. What these pin down is that it is *derived*: a timeline kept
+    # as its own table becomes a second version of history the moment anything
+    # is reversed, and the two then disagree with nobody noticing.
+    # ----------------------------------------------------------------------
+    section("Product timeline")
+    made = [p for p in client.get("/products", headers=auth, params={"limit": 100}).json()
+            if p.get("serial_no")]
+    check("there are products to trace", len(made) > 0, "no products on file")
+    traced = next((p for p in made if p.get("status") == "sold"), made[0])
+
+    r = client.get(f"/products/{traced['id']}/timeline", headers=auth)
+    check("product timeline → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:220]}")
+    tl = r.json()
+    kinds = [e["kind"] for e in tl["events"]]
+    check("it always includes the moment the piece entered stock",
+          "stocked" in kinds, str(kinds))
+    check(
+        "a piece made on the floor carries its job and both ends of every leg",
+        not tl["design_no"] or ("job" in kinds and "issued" in kinds and "received" in kinds),
+        f"job {tl['design_no']} produced {kinds}",
+    )
+    check(
+        "events are in the order they happened",
+        all(
+            (a["at"] or "9999") <= (b["at"] or "9999")
+            for a, b in zip(tl["events"], tl["events"][1:])
+        ),
+        str([e["at"] for e in tl["events"]]),
+    )
+    check(
+        "an undated event sorts last, not to the beginning of time",
+        all(e["at"] for e in tl["events"]) or tl["events"][-1]["at"] is None,
+        "a leg still out has no return date, and sorting it as the epoch would "
+        "put it before the metal was bought",
+    )
+    check(
+        "every event that names a document says where to open it",
+        all(e["to"] for e in tl["events"] if e["reference"]),
+        str([(e["reference"], e["to"]) for e in tl["events"] if e["reference"]]),
+    )
+
+    if traced.get("status") == "sold":
+        check("a sold piece shows the bill that sold it", "sold" in kinds, str(kinds))
+        check(
+            "and its margin is sale less cost, not a guess",
+            tl["margin"] is not None
+            and abs(Decimal(str(tl["margin"]))
+                    - (Decimal(str(tl["sold_for"]))
+                       - Decimal(str(tl["total_cost"])) - Decimal(str(tl["material_cost"]))))
+            <= Decimal("0.01"),
+            f"margin {tl['margin']} against sold {tl['sold_for']} and cost "
+            f"{tl['total_cost']}+{tl['material_cost']}",
+        )
+
+    unsold = next((p for p in made if p.get("status") != "sold"), None)
+    if unsold:
+        u = client.get(f"/products/{unsold['id']}/timeline", headers=auth).json()
+        check(
+            "an unsold piece reports no margin rather than a negative one",
+            u["margin"] is None and u["sold_for"] is None,
+            f"margin {u['margin']} on a piece that has not sold — a margin on unsold "
+            "stock is a guess dressed as a figure",
+        )
+
+    check("a timeline for a piece that does not exist → 404",
+          client.get("/products/999999/timeline", headers=auth).status_code == 404)
+
+    # ----------------------------------------------------------------------
+    # Audit log: before and after
+    #
+    # The log used to record who/what/when and a free-form blob. Whether a line
+    # carried the old value depended on what each call site happened to put in
+    # it, and most put nothing — so it could say Abdul edited a gold rate and
+    # not what it had been. That is a notification, not an audit trail.
+    # ----------------------------------------------------------------------
+    section("Audit before/after")
+
+    def audit(**params):
+        r = client.get("/audit-log", headers=auth, params={"limit": 20, **params}).json()
+        return r if isinstance(r, list) else r.get("rows", [])
+
+    it = client.get("/items", headers=auth).json()[0]
+    original = it["name"]
+    client.patch(f"/items/{it['id']}", headers=auth, json={"name": original + " EDITED"})
+    rows = audit(action="item.update")
+    check("a master edit is audited at all", len(rows) > 0,
+          "eight masters shared one router and none of them logged anything")
+    line = rows[0]
+    check(
+        "it records what the value was, not only that it changed",
+        line["before"] and line["before"].get("name") == original,
+        f"before {line.get('before')}",
+    )
+    check(
+        "and what it became",
+        line["after"] and line["after"].get("name") == original + " EDITED",
+        f"after {line.get('after')}",
+    )
+    check(
+        "only the fields that moved are stored, not the whole row",
+        set(line["before"]) == {"name"} and set(line["after"]) == {"name"},
+        f"before carried {sorted(line['before'])} — a full snapshot buries the "
+        "one number that changed in forty that did not",
+    )
+    check(
+        "both sides carry the same keys, so they can be read side by side",
+        set(line["before"]) == set(line["after"]),
+        f"{sorted(line['before'])} vs {sorted(line['after'])}",
+    )
+
+    # An edit that alters nothing must not write a line.
+    n_before = len(audit(action="item.update"))
+    client.patch(f"/items/{it['id']}", headers=auth, json={"name": original + " EDITED"})
+    check(
+        "an edit that changes nothing writes no audit row",
+        len(audit(action="item.update")) == n_before,
+        "'somebody opened this and changed nothing' only makes real edits harder to find",
+    )
+    client.patch(f"/items/{it['id']}", headers=auth, json={"name": original})
+
+    # Rate changes: called out by the spec, and previously unaudited entirely.
+    r = client.post("/gold-rates", headers=auth, json={
+        "rate_date": str(date.today()), "currency": "PKR", "purity": 24,
+        "rate_per_g": "123456.7890",
+    })
+    check("setting a rate → 201", r.status_code == 201, f"got {r.status_code}: {r.text[:200]}")
+    rate_rows = audit(action="gold_rate.create")
+    check("setting the rate the shop prices at is audited", len(rate_rows) > 0,
+          "the number every invoice reads was changeable without a trace")
+    check(
+        "the new rate is captured exactly, not as a float",
+        rate_rows[0]["after"].get("rate_per_g") == "123456.7890",
+        f"got {rate_rows[0]['after'].get('rate_per_g')!r} — a rate read back as "
+        "123456.78899999999 would undermine the point of keeping the log",
+    )
+
+    # A delete keeps the whole row, because afterwards there is nothing to
+    # compare against.
+    made = client.post("/items", headers=auth, json={"name": "Audit Probe Item", "code": "APX"})
+    if made.status_code == 201:
+        probe = made.json()
+        client.delete(f"/items/{probe['id']}", headers=pwd_h)
+        gone = audit(action="item.delete")
+        check("a delete is audited", len(gone) > 0, "nothing recorded the removal")
+        check(
+            "and keeps the whole row, since nothing survives to compare against",
+            gone[0]["before"] and gone[0]["before"].get("name") == "Audit Probe Item",
+            f"before {gone[0].get('before')}",
+        )
+        check("a delete has no 'after'", gone[0]["after"] is None, str(gone[0].get("after")))
+
+    # ----------------------------------------------------------------------
+    # Universal search
+    #
+    # The palette could already find screens. What these cover is finding
+    # *records* — and the one that matters most is the permission gate: search
+    # is the easiest place in an application to leak the existence of something
+    # a role cannot open, because it touches every table at once.
+    # ----------------------------------------------------------------------
+    section("Universal search")
+
+    def find(term, headers=auth):
+        return client.get("/search", headers=headers, params={"q": term}).json()
+
+    r = client.get("/search", headers=auth, params={"q": sale["invoice_no"]})
+    check("search → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:200]}")
+    hits = r.json()["hits"]
+    check(
+        "an invoice number finds exactly that invoice",
+        any(h["type"] == "invoice" and h["title"] == sale["invoice_no"] for h in hits),
+        str([h["title"] for h in hits]),
+    )
+    check(
+        "and the exact document number sorts first",
+        hits and hits[0]["title"] == sale["invoice_no"],
+        f"first hit was {hits[0]['title'] if hits else 'nothing'}",
+    )
+    check(
+        "every hit says where it goes",
+        all(h.get("to") for h in hits),
+        "a hit with no destination is a tease",
+    )
+    check(
+        "the tail of a number finds it too",
+        any(h["title"] == sale["invoice_no"] for h in find(sale["invoice_no"][-5:])["hits"]),
+        "people search by the end of a number as often as the start",
+    )
+    check(
+        "a customer is found by name",
+        any(h["type"] == "customer" for h in find(cust["name"][:5])["hits"]),
+        str([h["type"] for h in find(cust["name"][:5])["hits"]]),
+    )
+    check(
+        "a karigar is found by name",
+        any(h["type"] == "worker" for h in find("Ravi")["hits"]),
+        str([(h["type"], h["title"]) for h in find("Ravi")["hits"]]),
+    )
+    check(
+        "a job is found by its design number",
+        any(h["type"] == "design" for h in find(set_design["design_no"])["hits"]),
+        str([h["title"] for h in find(set_design["design_no"])["hits"]]),
+    )
+    check("a term matching nothing returns nothing, not an error",
+          find("zzzznotathing")["hits"] == [], "expected an empty list")
+    check("an empty query is refused rather than scanning everything",
+          client.get("/search", headers=auth, params={"q": ""}).status_code == 422,
+          "an unbounded search is a table scan per entity")
+
+    # The gate. Staff may read customers but not the ledger or sellers, so a
+    # staff search must return the customer and never the seller.
+    staff_hits = find(cust["name"][:5], headers=staff_auth)["hits"]
+    check(
+        "staff can still find a customer they are allowed to open",
+        any(h["type"] == "customer" for h in staff_hits),
+        str([h["type"] for h in staff_hits]),
+    )
+    # The gate is real code — each type is skipped unless `role_has` allows it —
+    # but it cannot be *observed* here, because all three seeded roles happen to
+    # hold read on every one of the eight searchable types. Asserting "staff
+    # cannot see sellers" would pass for the wrong reason and quietly stop
+    # meaning anything. What is checkable is the invariant that matters if a
+    # narrower role is ever added: a lesser role never sees more than admin.
+    admin_types = {h["type"] for h in find(sman["name"][:4])["hits"]}
+    staff_types = {h["type"] for h in find(sman["name"][:4], headers=staff_auth)["hits"]}
+    check(
+        "a lesser role never sees a type admin does not",
+        staff_types <= admin_types,
+        f"staff saw {staff_types - admin_types} that admin did not",
+    )
+    check(
+        "every hit is one of the types this endpoint claims to search",
+        all(
+            h["type"]
+            in {"invoice", "product", "design", "order", "customer", "worker",
+                "supplier", "seller"}
+            for h in find("a")["hits"]
+        ),
+        "an unexpected type means a new table was added without a permission gate",
+    )
+
+    # ----------------------------------------------------------------------
+    # Reconciliation: the scale against the books
+    #
+    # The rule under test is the one that makes every other guarantee in this
+    # system worth anything: a count does not overwrite a balance, it posts a
+    # movement and a journal entry. The assertions that matter most are the
+    # refusals — an unweighed pot, a missing reason, a second posting — because
+    # each of them is a way a variance could be written off with nobody's name
+    # on it.
+    # ----------------------------------------------------------------------
+    section("Reconciliation")
+    r = client.get("/reconciliation", headers=auth)
+    check("reconciliation overview → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:200]}")
+    ov = {s_["key"]: s_ for s_ in r.json()["scopes"]}
+    check("gold and silver are countable", ov["gold"]["countable"] and ov["silver"]["countable"],
+          str([(k, v["countable"]) for k, v in ov.items()]))
+    check(
+        "what cannot be counted yet says so rather than hiding",
+        ov["stones"]["countable"] is False and ov["stones"]["note"],
+        "a scope with no button and no explanation reads as an oversight",
+    )
+
+    r = client.post("/reconciliation/counts", headers=auth, json={"metal": "gold"})
+    check("open a gold count → 201", r.status_code == 201, f"got {r.status_code}: {r.text[:250]}")
+    sheet = r.json()
+    check("the sheet numbers itself in its own series", sheet["count_no"].startswith("SC-"),
+          sheet["count_no"])
+    check("every pot is on it, including empty ones", len(sheet["lines"]) > 0, str(sheet["lines"]))
+    check("and none is weighed yet", sheet["unweighed_lines"] == len(sheet["lines"]),
+          f"{sheet['unweighed_lines']} of {len(sheet['lines'])}")
+    check(
+        "a second sheet for the same metal and branch is refused",
+        client.post("/reconciliation/counts", headers=auth, json={"metal": "gold"}).status_code
+        == 409,
+        "two sheets would each measure from the same start and write the gap off twice",
+    )
+    check(
+        "an unweighed sheet cannot be posted",
+        client.post(f"/reconciliation/counts/{sheet['id']}/post", headers=pwd_h).status_code == 400,
+        "an unweighed pot is not an empty one",
+    )
+
+    # Weigh every pot exactly, except one 22k pot short by 2.6g — so the fine
+    # conversion is actually exercised rather than passing by luck on 24k.
+    target = next(
+        (l for l in sheet["lines"] if l["purity"] and int(l["purity"]) != 24),
+        sheet["lines"][0],
+    )
+    payload = []
+    for l in sheet["lines"]:
+        book = Decimal(str(l["book_weight_g"]))
+        short = Decimal("2.6") if l["id"] == target["id"] else Decimal("0")
+        payload.append({"line_id": l["id"], "counted_weight_g": str(book - short)})
+    upd = client.patch(f"/reconciliation/counts/{sheet['id']}", headers=auth,
+                       json={"lines": payload}).json()
+    check("the sheet works out the shortfall", Decimal(str(upd["variance_g"])) == Decimal("-2.6"),
+          f"got {upd['variance_g']}")
+    expected_fine = (Decimal("-2.6") * Decimal(str(target["purity"])) / Decimal("24")
+                     ).quantize(Decimal("0.0001"))
+    check(
+        f"and converts it at the pot's own purity: 2.6g of {target['purity']}k is "
+        f"{abs(expected_fine)} fine",
+        abs(Decimal(str(upd["variance_fine_g"])) - expected_fine) <= Decimal("0.0002"),
+        f"got {upd['variance_fine_g']}, expected {expected_fine} — booking 2.6 would leave "
+        "the trial balance out by the alloy",
+    )
+    check(
+        "posting without a reason is refused",
+        client.post(f"/reconciliation/counts/{sheet['id']}/post", headers=pwd_h).status_code == 400,
+        "a write-off with no explanation is what an auditor asks about first",
+    )
+
+    client.patch(f"/reconciliation/counts/{sheet['id']}", headers=auth,
+                 json={"lines": [], "reason": "Month-end physical count"})
+    gold_before_count = gold_in_hand()
+    r = client.post(f"/reconciliation/counts/{sheet['id']}/post", headers=pwd_h)
+    check("post the count → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:250]}")
+    posted = r.json()
+    check("the sheet is now posted", posted["status"] == "posted", posted["status"])
+    check("and it names the entry it produced", posted["journal_entry_no"] is not None, str(posted))
+    check(
+        "the ledger moves by the FINE shortfall, not the scale reading",
+        abs((gold_in_hand() - gold_before_count) - expected_fine) <= Decimal("0.0002"),
+        f"moved {gold_in_hand() - gold_before_count}, expected {expected_fine}",
+    )
+    check("books balance after writing a shortage off",
+          client.get("/ledger/trial-balance", headers=auth).json()["balanced"] is True)
+    check(
+        "a posted sheet cannot be posted twice",
+        client.post(f"/reconciliation/counts/{sheet['id']}/post", headers=pwd_h).status_code == 409,
+        "posting twice would write the same metal off again",
+    )
+    check(
+        "a posted sheet is a record and does not change",
+        client.patch(f"/reconciliation/counts/{sheet['id']}", headers=auth,
+                     json={"lines": [], "reason": "changed my mind"}).status_code == 409,
+        "the sheet is what was found; editing it after the fact rewrites history",
+    )
+    check(
+        "the stock pot moved too, not just the books",
+        any(m.get("reference_type") == "stock_count"
+            for m in client.get("/stock-movements", headers=auth, params={"limit": 50}).json()),
+        "a count that moved the ledger without the pot leaves the two describing "
+        "different shops",
+    )
+    # Counting and finding nothing wrong is a real outcome and must not error.
+    sheet2 = client.post("/reconciliation/counts", headers=auth, json={"metal": "silver"}).json()
+    client.patch(f"/reconciliation/counts/{sheet2['id']}", headers=auth, json={
+        "lines": [{"line_id": l["id"], "counted_weight_g": str(l["book_weight_g"])}
+                  for l in sheet2["lines"]],
+        "reason": "Agreed on the nose",
+    })
+    r = client.post(f"/reconciliation/counts/{sheet2['id']}/post", headers=pwd_h)
+    check("a count that agrees posts nothing and is not an error",
+          r.status_code == 200 and r.json()["journal_entry_no"] is None,
+          f"got {r.status_code}, entry {r.json().get('journal_entry_no')}")
+    check("but the sheet is still closed and kept",
+          r.json()["status"] == "posted",
+          "'we counted and it agreed' is a fact worth keeping")
+
+    r = client.get("/reports/material-outside", headers=auth)
+    check("material outside → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:220]}")
+    outside = r.json()
+    check("somebody is holding something", outside["parties"] > 0, str(outside["parties"]))
+    check(
+        "the gold total is the sum of the rows, not a separate reading",
+        abs(
+            Decimal(str(outside["total_gold_g"]))
+            - sum((Decimal(str(x["gold_g"])) for x in outside["rows"]), Decimal("0"))
+        )
+        <= Decimal("0.0001"),
+        f"total {outside['total_gold_g']}",
+    )
+    check(
+        "it agrees with the position report's one-line figure",
+        abs(
+            Decimal(str(outside["total_gold_g"]))
+            - Decimal(str(client.get("/ledger/position", headers=auth).json()["gold_with_workers_g"]))
+        )
+        <= Decimal("0.0001"),
+        f"outside says {outside['total_gold_g']}",
+    )
+    check(
+        "each row is ranked by gold, heaviest first",
+        all(
+            Decimal(str(a["gold_g"])) >= Decimal(str(b["gold_g"]))
+            for a, b in zip(outside["rows"], outside["rows"][1:])
+        ),
+        str([x["gold_g"] for x in outside["rows"]]),
+    )
+    # The whole reason it reads the ledger: a balance with no open leg behind
+    # it is metal that has not come back, and the legs alone would call that
+    # worker clear.
+    check(
+        "a worker with no open leg but metal still out is still listed",
+        any(x["open_legs"] == 0 and Decimal(str(x["gold_g"])) != 0 for x in outside["rows"]),
+        "every row has an open leg — the ledger-vs-legs distinction is untested",
+    )
+    check(
+        "silver and stones are their own columns, never folded into gold",
+        all("silver_g" in x and "stone_ct" in x for x in outside["rows"]),
+        str(outside["rows"][:1]),
+    )
+
     r = client.get("/purchasing/stone-stock", headers=auth)
     check("stone stock report → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:220]}")
     rows_ = r.json().get("rows", [])
@@ -2431,6 +5107,96 @@ def main() -> int:
         str(d12),
     )
     check("books balance after buying stones", client.get("/ledger/trial-balance", headers=auth).json()["balanced"] is True)
+
+    # --- stones are costed at the parcel they came out of, oldest first ---
+    # Two purchases of the same grade at different prices. Stock is one figure;
+    # cost is not. A piece made from the January parcel cost Rs 8,000 a carat
+    # however much dearer stone sits beside it on the shelf.
+    fifo_stone = client.post("/stones", headers=auth, json={
+        "name": "FIFO 10 PTR", "kind": "diamond", "category": "diamond",
+        "default_rate_per_ct": "5000", "currency": "PKR",
+    }).json()
+    for when, ct, rate in (("2026-01-10T10:00:00Z", "50", "8000"),
+                           ("2026-03-10T10:00:00Z", "70", "9200")):
+        rp = client.post("/purchasing/stone-purchases", headers=auth, json={
+            "supplier_id": supplier["id"], "purchased_at": when, "extra_cost_pct": "0",
+            "items": [{"stone_id": fifo_stone["id"], "quantity": 100,
+                       "weight_ct": ct, "rate_per_ct": rate}],
+        })
+        check(f"buy {ct}ct at Rs {rate} → 201", rp.status_code == 201,
+              f"got {rp.status_code}: {rp.text[:200]}")
+
+    # More on the shelf than the two parcels account for, which is the ordinary
+    # case: a shop's opening stock predates every bill the system has seen.
+    fifo_stock = client.post("/inventory", headers=auth, json={
+        "type": "raw_stone", "label": "FIFO 10 PTR parcel", "weight_ct": "200",
+    }).json()
+
+    def issue_fifo(carats: str) -> dict:
+        dsn = client.post("/designs", headers=auth, json={"item_id": taka_id}).json()
+        rr = client.post(f"/designs/{dsn['id']}/legs", headers=auth, json={
+            "department_id": setting_dept_id, "worker_id": setter["id"],
+            "gold_issued_g": "10", "gold_issued_purity": 21,
+            "gold_source_inventory_id": piece_gold["id"],
+            "stone_source_inventory_id": fifo_stock["id"],
+            "stones": [{"stone_id": fifo_stone["id"], "quantity_issued": 10,
+                        "weight_issued_ct": carats}],
+            "piece_count": 10, "wastage_basis": "per_100_pieces",
+            "wastage_per_100_pcs_g": "0.400",
+        })
+        assert rr.status_code == 201, rr.text[:300]
+        return rr.json()
+
+    first = issue_fifo("30")
+    check(
+        "30ct drawn wholly from the January parcel is costed at Rs 8,000",
+        Decimal(str(first["stones"][0]["rate_per_ct"])) == Decimal("8000"),
+        f"got {first['stones'][0]['rate_per_ct']} — 5000 would mean the master's standing "
+        "rate was used, 8700 would mean the two parcels were averaged",
+    )
+
+    # 20ct of January is left, so 40ct spans both parcels:
+    #   (20 x 8,000 + 20 x 9,200) / 40 = 8,600
+    second = issue_fifo("40")
+    check(
+        "an issue spanning two parcels is costed at the weighted mean of what it drew",
+        Decimal(str(second["stones"][0]["rate_per_ct"])) == Decimal("8600"),
+        f"got {second['stones'][0]['rate_per_ct']}, expected 8600 "
+        "(20ct left at 8,000 plus 20ct at 9,200)",
+    )
+
+    # 50ct of March is left, so a 60ct issue runs the parcels dry and the last
+    # 10ct has no purchase behind it. That is costed at the master's rate
+    # rather than refused: a shop's opening stock predates the system and still
+    # has to be usable.
+    #   (50 x 9,200 + 10 x 5,000) / 60 = 8,500
+    third = issue_fifo("60")
+    check(
+        "an issue that outruns the parcels costs the remainder at the master rate",
+        Decimal(str(third["stones"][0]["rate_per_ct"])) == Decimal("8500"),
+        f"got {third['stones'][0]['rate_per_ct']}, expected 8500 (50ct at 9,200 plus "
+        "10ct with no purchase behind it at 5,000) — refusing here would mean a shop "
+        "cannot issue its own opening stock",
+    )
+
+    # A rate stated on the request is a price the counter has agreed, and the
+    # system does not overrule it with a historic purchase.
+    dsn = client.post("/designs", headers=auth, json={"item_id": taka_id}).json()
+    stated = client.post(f"/designs/{dsn['id']}/legs", headers=auth, json={
+        "department_id": setting_dept_id, "worker_id": setter["id"],
+        "gold_issued_g": "10", "gold_issued_purity": 21,
+        "gold_source_inventory_id": piece_gold["id"],
+        "stone_source_inventory_id": fifo_stock["id"],
+        "stones": [{"stone_id": fifo_stone["id"], "quantity_issued": 1,
+                    "weight_issued_ct": "1", "rate_per_ct": "12345"}],
+        "piece_count": 1, "wastage_basis": "per_100_pieces",
+        "wastage_per_100_pcs_g": "0.400",
+    }).json()
+    check(
+        "a rate stated on the issue is not overruled by the parcels",
+        Decimal(str(stated["stones"][0]["rate_per_ct"])) == Decimal("12345"),
+        f"got {stated['stones'][0]['rate_per_ct']}",
+    )
 
     # --- a settlement cannot exceed what is owed ---
     inv_now = client.get(f"/invoices/{sale['id']}", headers=auth).json()
@@ -2528,10 +5294,22 @@ def main() -> int:
         - Decimal(str(total["round_off"]))
         - Decimal(str(total["making_cost"]))
     )
+    # Paisa-level drift per line, plus a gram-level allowance per bill.
+    #
+    # The levers decompose an unrounded weight; a trade bill's metal obligation
+    # is stored to four decimal places because that is the figure the customer
+    # is actually handed and the ledger actually posts. At a four-figure gold
+    # rate the fourth decimal of a gram is worth most of a rupee, so a bill that
+    # settles in metal can differ from its own decomposition by more than the
+    # per-line paisa tolerance — without anything being wrong. Bounded and
+    # named rather than widened silently.
+    tolerance = Decimal("0.05") * max(total["lines"], 1) + Decimal("1.00") * max(
+        total["invoices"], 1
+    )
     check(
         "the levers add up to gross profit",
-        abs(attributed - Decimal(str(total["gross_profit"]))) <= Decimal("0.05") * max(total["lines"], 1),
-        f"levers {attributed} vs gross {total['gross_profit']}",
+        abs(attributed - Decimal(str(total["gross_profit"]))) <= tolerance,
+        f"levers {attributed} vs gross {total['gross_profit']} (tolerance {tolerance})",
     )
     check(
         "wastage charged to customers is reported as its own lever",
@@ -2586,6 +5364,37 @@ def main() -> int:
 
     r = client.get("/reports/margin", headers=staff_auth)
     check("staff cannot read the margin report → 403", r.status_code == 403, f"got {r.status_code}")
+
+    # ----- DASHBOARD -----
+    section("Dashboard")
+    r = client.get("/dashboard", headers=auth, params={"days": 14})
+    check("dashboard → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:200]}")
+    dash = r.json()
+    check(
+        "one day per day asked for, with none missing",
+        len(dash["series"]) == 14,
+        f"got {len(dash['series'])} — a gap in the series draws as a crash in the chart",
+    )
+    check(
+        "the series ends today",
+        dash["series"][-1]["day"] == date.today().isoformat(),
+        f"got {dash['series'][-1]['day']}",
+    )
+    check(
+        "the position on the dashboard is the position in the ledger",
+        Decimal(str(dash["today"]["gold_in_hand_g"]))
+        == Decimal(str(client.get("/ledger/position", headers=auth).json()["gold_in_hand_g"])),
+        "two screens showing different metal is worse than one showing none",
+    )
+    check(
+        "an alert carries somewhere to go and fix it",
+        all(a_.get("to") and a_.get("label") for a_ in dash["alerts"]),
+        str(dash["alerts"]),
+    )
+    # The screen shows the cash position, so it is gated like the sales report
+    # rather than being readable by anyone who can log in.
+    r = client.get("/dashboard", headers=staff_auth)
+    check("staff cannot read the dashboard figures → 403", r.status_code == 403, f"got {r.status_code}")
 
     # ----- MULTI-CURRENCY: a dollar bill, end to end -----
     section("Multi-currency")

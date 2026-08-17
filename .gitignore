@@ -55,4 +55,6 @@ postgres_data/
 pgadmin_data/
 
 # Claude Code local settings
-.claude/settings.local.json
+# Claude Code's local working area. `.claude/worktrees/` holds full git
+# worktrees — committing one would check in a second copy of the whole repo.
+.claude/

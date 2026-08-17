@@ -171,3 +171,64 @@ class ChatResponse(BaseModel):
     rows: list[dict[str, Any]] | None = None
     notes: str | None = None
     model: str | None = None
+
+
+# --------------------------------------------------------------------------
+# Karigar risk
+# --------------------------------------------------------------------------
+class RiskReason(BaseModel):
+    """
+    One component of a worker's score, with the figure behind it.
+
+    Scores that cannot be taken apart do not get acted on — an owner is being
+    asked to have a difficult conversation with a man he has worked with for
+    years, and "the computer says 68" is not something he can put to him. Every
+    component states what was measured, what it was measured against, and how
+    many points it contributed.
+    """
+
+    code: str
+    label: str
+    detail: str
+    points: int
+
+
+class KarigarRiskRow(BaseModel):
+    worker_id: int
+    worker_name: str
+    department: str | None = None
+
+    legs: int
+    gold_issued_g: Decimal
+    excess_g: Decimal
+    excess_rate_pct: Decimal
+    avg_days_held: Decimal | None = None
+
+    earlier_rate_pct: Decimal | None = None
+    recent_rate_pct: Decimal | None = None
+
+    # Metal the worker is holding right now, and the oldest leg it sits on.
+    open_legs: int
+    open_gold_g: Decimal
+    oldest_open_days: int | None = None
+
+    score: int
+    band: str
+    reasons: list[RiskReason] = Field(default_factory=list)
+    narrative: str | None = None
+
+
+class KarigarRiskReport(BaseModel):
+    days: int
+    period_from: date
+    period_to: date
+    # A worker below this many finished legs is reported but not scored: a
+    # score built on two jobs says more about the sample than the man.
+    min_legs: int
+    shop_excess_rate_pct: Decimal
+    shop_avg_days_held: Decimal | None = None
+    rows: list[KarigarRiskRow] = Field(default_factory=list)
+    scored_count: int
+    high_count: int
+    ai_enabled: bool
+    ai_note: str | None = None

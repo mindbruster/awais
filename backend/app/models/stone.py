@@ -66,6 +66,14 @@ class Stone(Base, TimestampMixin):
     clarity: Mapped[str | None] = mapped_column(String(40))
 
     default_rate_per_ct: Mapped[float | None] = mapped_column(Numeric(14, 4))
+    # What the shop sells this stone at, as against what it paid.
+    #
+    # Needed because a stone lost by a setter is charged at what it would have
+    # fetched, not at what the parcel cost — otherwise losing stones costs him
+    # the shop's purchase price and costs the shop its margin, which makes
+    # carelessness free. Nullable, falling back to `default_rate_per_ct`, so a
+    # shop that has only ever recorded one rate keeps working unchanged.
+    selling_rate_per_ct: Mapped[float | None] = mapped_column(Numeric(14, 4))
     currency: Mapped[Currency] = mapped_column(
         Enum(Currency, name="currency"), nullable=False, default=Currency.PKR
     )

@@ -14,6 +14,7 @@ from sqlalchemy import case, desc, func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
+from app.core import clock
 from app.api.deps import CurrentUser, DbSession, require_password_confirm, require_perm
 from app.core import lock_keys
 from app.models.account import Account, AccountType, SystemAccount
@@ -22,6 +23,7 @@ from app.models.currency import Currency
 from app.models.customer import Customer
 from app.models.gold_rate import GoldRate
 from app.models.journal import Commodity, JournalEntry, JournalLine, PartyType
+from app.models.purchase import Supplier
 from app.models.vendor import Vendor
 from app.schemas.ledger import (
     AccountCreate,
@@ -34,13 +36,19 @@ from app.schemas.ledger import (
     OpeningBalancePosted,
     OpeningBalanceResult,
     OpeningBalanceSkipped,
+    PartyStatementReport,
+    PartyStatementRow,
     PositionReport,
     StatementReport,
     StatementRow,
+    MetalValuationRead,
+    RevaluationPreview,
+    RevaluationResult,
     TrialBalanceReport,
     TrialBalanceRow,
 )
-from app.services import ledger
+from app.models.metal import Metal
+from app.services import ledger, revaluation
 from app.services.audit import log_action
 from app.services.gold_rate import rate_in_force
 
@@ -577,6 +585,247 @@ async def statement(
     )
 
 
+async def _party_name(db: DbSession, party_type: PartyType, party_id: int) -> str | None:
+    """
+    Whose account this is. None rather than an error if the row has gone —
+    a statement for a deleted party is still a truthful record of what moved.
+    """
+    model = {
+        PartyType.customer: Customer,
+        PartyType.supplier: Supplier,
+        PartyType.worker: Vendor,
+        # Salesmen are held as vendor rows until the route work gives them
+        # somewhere better to live.
+        PartyType.salesman: Vendor,
+    }[party_type]
+    row = await db.get(model, party_id)
+    return getattr(row, "name", None) if row else None
+
+
+@router.get("/party-statement", response_model=PartyStatementReport, dependencies=[read])
+async def party_statement(
+    db: DbSession,
+    party_type: PartyType = Query(...),
+    party_id: int = Query(...),
+    date_from: date | None = Query(default=None),
+    date_to: date | None = Query(default=None),
+    limit: int = Query(default=500, le=5000),
+    offset: int = Query(default=0, ge=0),
+) -> PartyStatementReport:
+    """
+    A trade party's account in both units at once — fine grams and rupees.
+
+    This is the document a wholesale jeweller actually keeps. His counterparty
+    owes him metal *and* money, the two settle on different days by different
+    means, and neither figure can be derived from the other: the metal side is
+    unpriced on purpose, because the rate is agreed on the day the gold moves
+    and not on the day the bill was written.
+
+    Deliberately not scoped to one account. The metal side is every GOLD line
+    carrying this party and the cash side is every non-GOLD line carrying it,
+    wherever they sit in the chart. That makes the statement agnostic to which
+    control account a document chose — and it means a jeweller who both buys
+    and sells nets correctly across Customers and Suppliers, which is how the
+    bazaar reads the relationship and how it will be argued at settlement.
+
+    The cash side sums `value_pkr`, not `quantity`, so a dollar bill and a
+    rupee bill land on the same column instead of being added as though the two
+    units were interchangeable. The metal side sums `quantity`, which is always
+    fine grams.
+    """
+    party_where = [
+        JournalLine.party_type == party_type,
+        JournalLine.party_id == party_id,
+    ]
+    # Four buckets, because the party can owe four different things and none of
+    # them settles the others.
+    #
+    # This used to be two — gold and "everything else, in rupees" — which was
+    # right while gold was the only commodity. Once silver and stones became
+    # commodities of their own it stopped being right and started being
+    # actively wrong: a worker holding a kilo of silver had its *rupee value*
+    # added to his cash balance, so a statement said he owed money when he was
+    # holding metal, and a setter's carat debt appeared as rupees. Both read as
+    # a debt he could settle by paying, which he cannot.
+    #
+    # The cash bucket is now everything that is actually money — rupees and
+    # foreign currency, summed on `value_pkr` so a dollar bill and a rupee
+    # receipt land on one line.
+    is_gold = JournalLine.commodity == Commodity.GOLD
+    is_silver = JournalLine.commodity == Commodity.SILVER
+    is_stone = JournalLine.commodity == Commodity.STONE
+    is_money = JournalLine.commodity.notin_(
+        (Commodity.GOLD, Commodity.SILVER, Commodity.STONE)
+    )
+
+    metal_q = func.coalesce(
+        func.sum(case((is_gold, JournalLine.quantity), else_=0)), 0
+    )
+    silver_q = func.coalesce(
+        func.sum(case((is_silver, JournalLine.quantity), else_=0)), 0
+    )
+    stone_q = func.coalesce(
+        func.sum(case((is_stone, JournalLine.quantity), else_=0)), 0
+    )
+    cash_q = func.coalesce(
+        func.sum(case((is_money, JournalLine.value_pkr), else_=0)), 0
+    )
+
+    # Opening carries in everything strictly before the window, so the first
+    # row continues the account rather than restarting it.
+    opening_metal = _ZERO
+    opening_cash = _ZERO
+    opening_silver = _ZERO
+    opening_stone = _ZERO
+    if date_from is not None:
+        opening_metal, opening_cash, opening_silver, opening_stone = (
+            await db.execute(
+                select(metal_q, cash_q, silver_q, stone_q)
+                .join(JournalEntry, JournalEntry.id == JournalLine.entry_id)
+                .where(*party_where, JournalEntry.entry_date < date_from)
+            )
+        ).one()
+        opening_metal, opening_cash = ledger.d(opening_metal), ledger.d(opening_cash)
+        opening_silver, opening_stone = ledger.d(opening_silver), ledger.d(opening_stone)
+
+    def _in_period(q):
+        q = q.join(JournalEntry, JournalEntry.id == JournalLine.entry_id).where(*party_where)
+        if date_from is not None:
+            q = q.where(JournalEntry.entry_date >= date_from)
+        if date_to is not None:
+            q = q.where(JournalEntry.entry_date <= date_to)
+        return q
+
+    # One row per document, not per posting. A single invoice can put several
+    # lines against the same party, and a statement that showed each of them
+    # would be a journal rather than an account.
+    grouped = (
+        _in_period(
+            select(
+                JournalEntry.id,
+                JournalEntry.entry_no,
+                JournalEntry.entry_date,
+                JournalEntry.memo,
+                JournalEntry.source_type,
+                JournalEntry.source_id,
+                metal_q,
+                cash_q,
+                func.coalesce(
+                    func.sum(case((is_gold, JournalLine.native_weight_g), else_=0)), 0
+                ),
+                # Only reported when the document spoke with one voice. A bill
+                # covering three lots at three tunches has no single purity, and
+                # printing one of them would misdescribe the other two.
+                case(
+                    (
+                        func.count(func.distinct(JournalLine.native_purity)) == 1,
+                        func.max(JournalLine.native_purity),
+                    ),
+                    else_=None,
+                ),
+                case(
+                    (
+                        func.count(func.distinct(JournalLine.native_tunch_pct)) == 1,
+                        func.max(JournalLine.native_tunch_pct),
+                    ),
+                    else_=None,
+                ),
+                # Appended after the existing columns on purpose: the row
+                # tuple is read positionally below, and inserting these in the
+                # middle would silently reassign every field after them.
+                silver_q,
+                stone_q,
+            )
+        )
+        .group_by(
+            JournalEntry.id,
+            JournalEntry.entry_no,
+            JournalEntry.entry_date,
+            JournalEntry.memo,
+            JournalEntry.source_type,
+            JournalEntry.source_id,
+        )
+        .order_by(JournalEntry.entry_date, JournalEntry.id)
+    )
+
+    all_rows = (await db.execute(grouped)).all()
+    total_rows = len(all_rows)
+
+    # Period totals span the whole window even when the page does not, so a
+    # truncated statement still foots. Computed from the same grouped rows
+    # rather than a second query, which keeps the two definitions identical.
+    metal_in_total = sum((ledger.d(r[6]) for r in all_rows if r[6] and r[6] > 0), _ZERO)
+    metal_out_total = -sum((ledger.d(r[6]) for r in all_rows if r[6] and r[6] < 0), _ZERO)
+    cash_debit_total = sum((ledger.d(r[7]) for r in all_rows if r[7] and r[7] > 0), _ZERO)
+    cash_credit_total = -sum((ledger.d(r[7]) for r in all_rows if r[7] and r[7] < 0), _ZERO)
+
+    # The running balance has to be carried from the start of the period even
+    # when the page begins in the middle of it, or row 501 would open at
+    # nothing and every balance below it would be wrong.
+    metal_running = opening_metal
+    cash_running = opening_cash
+    silver_running = opening_silver
+    stone_running = opening_stone
+    rows: list[PartyStatementRow] = []
+    for index, r in enumerate(all_rows):
+        metal_delta = ledger.d(r[6])
+        cash_delta = ledger.d(r[7])
+        silver_delta = ledger.d(r[11])
+        stone_delta = ledger.d(r[12])
+        metal_running += metal_delta
+        cash_running += cash_delta
+        silver_running += silver_delta
+        stone_running += stone_delta
+        if index < offset or len(rows) >= limit:
+            continue
+        rows.append(
+            PartyStatementRow(
+                entry_id=r[0],
+                entry_no=r[1],
+                entry_date=r[2],
+                memo=r[3],
+                source_type=r[4],
+                source_id=r[5],
+                metal_in_g=metal_delta if metal_delta > 0 else _ZERO,
+                metal_out_g=-metal_delta if metal_delta < 0 else _ZERO,
+                metal_balance_g=metal_running,
+                native_weight_g=ledger.d(r[8]) or None,
+                native_purity=r[9],
+                native_tunch_pct=r[10],
+                cash_debit=cash_delta if cash_delta > 0 else _ZERO,
+                cash_credit=-cash_delta if cash_delta < 0 else _ZERO,
+                cash_balance=cash_running,
+                silver_delta_g=silver_delta,
+                silver_balance_g=silver_running,
+                stone_delta_ct=stone_delta,
+                stone_balance_ct=stone_running,
+            )
+        )
+
+    return PartyStatementReport(
+        party_type=party_type,
+        party_id=party_id,
+        party_name=await _party_name(db, party_type, party_id),
+        date_from=date_from,
+        date_to=date_to,
+        opening_metal_g=opening_metal,
+        opening_cash=opening_cash,
+        opening_silver_g=opening_silver,
+        opening_stone_ct=opening_stone,
+        rows=rows,
+        metal_in_total_g=metal_in_total,
+        metal_out_total_g=metal_out_total,
+        cash_debit_total=cash_debit_total,
+        cash_credit_total=cash_credit_total,
+        closing_metal_g=metal_running,
+        closing_cash=cash_running,
+        closing_silver_g=silver_running,
+        closing_stone_ct=stone_running,
+        total_rows=total_rows,
+        truncated=offset + len(rows) < total_rows,
+    )
+
+
 @router.get("/trial-balance", response_model=TrialBalanceReport, dependencies=[read])
 async def trial_balance(
     db: DbSession,
@@ -667,15 +916,32 @@ async def position(db: DbSession) -> PositionReport:
     with_workers = await ledger.balance(
         db, account_code=SystemAccount.GOLD_WITH_WORKERS.value, commodity=Commodity.GOLD
     )
+    # Each metal read against its own account *and* its own commodity. Either
+    # alone would be enough today, but both together is what makes the figure
+    # unable to drift: a line posted to the silver account in the gold
+    # commodity — the one mistake a metal-aware posting path can make — falls
+    # out of both readings instead of inflating one of them.
+    silver = await ledger.balance(
+        db, account_code=SystemAccount.SILVER_IN_HAND.value, commodity=Commodity.SILVER
+    )
+    silver_with_workers = await ledger.balance(
+        db, account_code=SystemAccount.SILVER_WITH_WORKERS.value, commodity=Commodity.SILVER
+    )
+    stones_with_workers = await ledger.balance(
+        db, account_code=SystemAccount.STONES_WITH_WORKERS.value, commodity=Commodity.STONE
+    )
     receivable = await ledger.balance_pkr(db, account_code=SystemAccount.CUSTOMERS.value)
     suppliers = await ledger.balance_pkr(db, account_code=SystemAccount.SUPPLIERS.value)
     workers = await ledger.balance_pkr(db, account_code=SystemAccount.WORKERS_PAYABLE.value)
 
     return PositionReport(
-        as_of=datetime.now(timezone.utc).date(),
+        as_of=clock.today(),
         cash_in_hand=cash,
         gold_in_hand_g=gold,
         gold_with_workers_g=with_workers,
+        silver_in_hand_g=silver,
+        silver_with_workers_g=silver_with_workers,
+        stones_with_workers_ct=stones_with_workers,
         customer_receivable=receivable,
         supplier_payable=-suppliers,
         worker_payable=-workers,
@@ -903,3 +1169,94 @@ async def post_opening_balances(db: DbSession, current: CurrentUser) -> OpeningB
         )
     await db.commit()
     return OpeningBalanceResult(gold_rate_per_g=gold_rate, posted=posted, skipped=skipped)
+
+
+# --------------------------------------------------------------------------
+# Metal revaluation
+# --------------------------------------------------------------------------
+@router.get("/revaluation", response_model=RevaluationPreview, dependencies=[read])
+async def revaluation_preview(db: DbSession) -> RevaluationPreview:
+    """
+    What the metal on the books is worth today, and what posting would change.
+
+    Read-only and safe to open as often as you like. The posting is a separate,
+    deliberate act — moving a balance sheet to market is a decision somebody
+    makes, not something that happens while a page loads.
+    """
+    rows = await revaluation.value(db)
+    return RevaluationPreview(
+        as_of=clock.today(),
+        metals=[
+            MetalValuationRead(
+                metal=v.metal,
+                fine_grams=v.fine_grams,
+                rate_per_fine_g=v.rate_per_fine_g,
+                book_value=v.book_value,
+                market_value=v.market_value,
+                difference=v.difference,
+                unpriced=v.unpriced,
+            )
+            for v in rows
+        ],
+        total_difference=sum(
+            (v.difference for v in rows if v.difference is not None), _ZERO
+        ),
+    )
+
+
+@router.post(
+    "/revaluation",
+    response_model=RevaluationResult,
+    # It moves the balance sheet and books profit, and undoing it means a
+    # hand-written reversal. The operator re-authenticates.
+    dependencies=[post, confirm],
+)
+async def revaluation_post(db: DbSession, current: CurrentUser) -> RevaluationResult:
+    """
+    Bring the metal accounts to market and book the difference.
+
+    Only money moves. The gram balances are untouched, because no metal moved —
+    altering them would break the one figure that can be checked against the
+    safe. What changes is the rupee value sitting beside those grams, which is
+    exactly the split `balance` and `balance_pkr` already make.
+
+    Nothing to do is a real answer on a quiet day, and comes back as a success
+    with no entry rather than an error.
+    """
+    entry, rows = await revaluation.post(db, user_id=current.id)
+    await log_action(
+        db, user=current,
+        action="ledger.revalue_metal",
+        resource_type="journal_entry",
+        resource_id=entry.id if entry else None,
+        details={
+            v.metal.value: {
+                "fine_g": str(v.fine_grams),
+                "book": str(v.book_value),
+                "market": str(v.market_value) if v.market_value is not None else None,
+                "difference": str(v.difference) if v.difference is not None else None,
+            }
+            for v in rows
+        },
+    )
+    await db.commit()
+    return RevaluationResult(
+        as_of=clock.today(),
+        entry_id=entry.id if entry else None,
+        entry_no=entry.entry_no if entry else None,
+        total_difference=sum(
+            (v.difference for v in rows if v.difference is not None), _ZERO
+        ),
+        metals=[
+            MetalValuationRead(
+                metal=v.metal,
+                fine_grams=v.fine_grams,
+                rate_per_fine_g=v.rate_per_fine_g,
+                book_value=v.book_value,
+                market_value=v.market_value,
+                difference=v.difference,
+                unpriced=v.unpriced,
+            )
+            for v in rows
+        ],
+    )

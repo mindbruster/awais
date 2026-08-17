@@ -6,6 +6,7 @@ import { SelectField, TextField } from "@/components/Field";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { toast } from "@/components/Toast";
 import { apiError } from "@/lib/api-error";
+import { ProductTimeline } from "@/pages/products/ProductTimeline";
 import { Currency, fmtMoney } from "@/lib/money";
 import { staticUrl } from "@/lib/url";
 import { ImageStudio } from "@/components/ImageStudio";
@@ -231,6 +232,10 @@ export function ProductDetailPage() {
           load();
         }}
       />
+      {/* Below the piece and its stones, because it answers a different
+          question: not "what is this" but "where has it been". */}
+      <ProductTimeline productId={Number(pid)} />
+
       <ConfirmDialog
         open={!!removing}
         onClose={() => setRemoving(null)}

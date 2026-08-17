@@ -1,6 +1,7 @@
 import { FormEvent, ReactNode, useEffect, useState } from "react";
 import { AxiosError } from "axios";
 import { api } from "@/api/client";
+import { KarigarRisk } from "@/pages/insights/KarigarRisk";
 import { TextField } from "@/components/Field";
 import { apiError } from "@/lib/api-error";
 import { Currency, fmtMoney } from "@/lib/money";
@@ -483,6 +484,12 @@ export function InsightsPage() {
           )}
         </Contents>
       </section>
+
+      {/* ---------------------------------------------------------------- */}
+      {/* Sits with the other computed reports, above the free-text box:
+          everything here is arithmetic over the books, and the question box
+          is the one thing on the page that isn't. */}
+      <KarigarRisk days={days} />
 
       {/* ---------------------------------------------------------------- */}
       <section className="card">

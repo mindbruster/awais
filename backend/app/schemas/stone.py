@@ -21,6 +21,12 @@ class StoneBase(BaseModel):
     color: str | None = Field(default=None, max_length=40)
     clarity: str | None = Field(default=None, max_length=40)
     default_rate_per_ct: Decimal | None = Field(default=None, ge=0)
+    # What the stone sells at, as against what it cost. Used when a worker is
+    # charged for stones he cannot produce: a stone lost in setting costs the
+    # shop the sale, not the purchase, so billing him cost would leave the
+    # margin as the price of his carelessness. Falls back to
+    # `default_rate_per_ct` when the shop only keeps one rate.
+    selling_rate_per_ct: Decimal | None = Field(default=None, ge=0)
     currency: Currency = Currency.PKR
     notes: str | None = None
 
@@ -39,6 +45,7 @@ class StoneUpdate(BaseModel):
     color: str | None = Field(default=None, max_length=40)
     clarity: str | None = Field(default=None, max_length=40)
     default_rate_per_ct: Decimal | None = Field(default=None, ge=0)
+    selling_rate_per_ct: Decimal | None = Field(default=None, ge=0)
     currency: Currency | None = None
     notes: str | None = None
 

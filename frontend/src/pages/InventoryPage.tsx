@@ -1,4 +1,5 @@
 import { FormEvent, useEffect, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { api } from "@/api/client";
 import { Modal } from "@/components/Modal";
 import { SelectField, TextField } from "@/components/Field";
@@ -16,15 +17,28 @@ interface InventoryItem {
   weight_g: string;
   weight_ct: string;
   purity: number | null;
+  tunch_pct: string | null;
   product_id: number | null;
 }
 
 const TYPES = [
   { value: "raw_gold", label: "Raw gold" },
+  // Silver keeps its own category, its own ledger accounts and its own daily
+  // rate. Without this option the shop cannot create a silver row at all —
+  // which also means it cannot issue a silver leg, since a leg has to draw
+  // from stock of its own metal.
+  { value: "raw_silver", label: "Raw silver" },
   { value: "raw_stone", label: "Raw stone" },
+  // Stones chipped in setting. Held at cost and still saleable, but kept apart
+  // from whole stones, which is why it is not a filter on raw_stone.
+  { value: "broken_stone", label: "Broken / misc stones" },
   { value: "finished_product", label: "Finished product" },
   { value: "other", label: "Other" },
 ];
+
+// Which metals are weighed in grams at a purity, as against stones counted in
+// carats. Drives which fields the form shows.
+const METAL_TYPES = new Set(["raw_gold", "raw_silver"]);
 
 export function InventoryPage() {
   const [items, setItems] = useState<InventoryItem[]>([]);
@@ -34,7 +48,15 @@ export function InventoryPage() {
   const [editing, setEditing] = useState<InventoryItem | null>(null);
   const [deleting, setDeleting] = useState<InventoryItem | null>(null);
   const [q, setQ] = useState("");
-  const [type, setType] = useState("");
+  // Seeded from the URL so the Stock page can link straight to one category.
+  // A link that lands on an unfiltered list has not taken the reader anywhere.
+  const [params, setParams] = useSearchParams();
+  const [type, setTypeState] = useState(params.get("type") ?? "");
+  const setType = (next: string) => {
+    setTypeState(next);
+    // Kept in the address so the filtered view can be shared or reloaded.
+    setParams(next ? { type: next } : {}, { replace: true });
+  };
 
   const load = () => {
     setLoading(true);
@@ -186,6 +208,7 @@ function InventoryForm({
   const [weightG, setWeightG] = useState("0");
   const [weightCt, setWeightCt] = useState("0");
   const [purity, setPurity] = useState("");
+  const [tunch, setTunch] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
@@ -197,6 +220,7 @@ function InventoryForm({
       setWeightG(existing?.weight_g ?? "0");
       setWeightCt(existing?.weight_ct ?? "0");
       setPurity(existing?.purity ? String(existing.purity) : "");
+      setTunch(existing?.tunch_pct ? String(existing.tunch_pct) : "");
     }
   }, [open, existing]);
 
@@ -211,7 +235,10 @@ function InventoryForm({
         quantity: parseInt(quantity || "0", 10),
         weight_g: weightG || "0",
         weight_ct: weightCt || "0",
-        purity: purity ? parseInt(purity, 10) : null,
+        // Karat only ever belongs to gold; anything else sends null rather
+        // than a leftover from switching the type mid-entry.
+        purity: type === "raw_gold" && purity ? parseInt(purity, 10) : null,
+        tunch_pct: METAL_TYPES.has(type) && tunch ? tunch : null,
       };
       if (existing) {
         await api.patch(`/inventory/${existing.id}`, body);
@@ -271,15 +298,38 @@ function InventoryForm({
             onChange={(e) => setWeightCt(e.target.value)}
           />
         </div>
-        <TextField
-          label="Purity (1–24)"
-          type="number"
-          min={1}
-          max={24}
-          value={purity}
-          onChange={(e) => setPurity(e.target.value)}
-          hint="Only for raw_gold"
-        />
+        {/* Karat is gold's scale and stops at 24; silver is quoted out of a
+            thousand. Showing a karat box on a silver row invites "21k silver",
+            which is not a thing — so each metal is asked in its own unit and
+            neither is asked of a stone. */}
+        {type === "raw_gold" && (
+          <TextField
+            label="Purity (1–24k)"
+            type="number"
+            min={1}
+            max={24}
+            value={purity}
+            onChange={(e) => setPurity(e.target.value)}
+            hint="Or state an assayed tunch below instead"
+          />
+        )}
+        {METAL_TYPES.has(type) && (
+          <TextField
+            label={type === "raw_silver" ? "Fineness (%)" : "Assayed tunch (%)"}
+            type="number"
+            step="0.001"
+            min={0.001}
+            max={100}
+            value={tunch}
+            onChange={(e) => setTunch(e.target.value)}
+            placeholder={type === "raw_silver" ? "99.9" : "optional"}
+            hint={
+              type === "raw_silver"
+                ? "99.9 for the 999 silver the shop buys, 92.5 for 925"
+                : "Wins over the karat when the metal was actually tested — 91.6 is not 22k rounded"
+            }
+          />
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button type="button" className="btn-ghost" onClick={onClose}>
             Cancel
