@@ -33,11 +33,15 @@ PROVIDERS = ("none", "anthropic", "openrouter")
 
 DEFAULT_MODELS = {
     "anthropic": "claude-opus-5",
-    # The cheapest GLM on OpenRouter. Note that despite the name, none of the
-    # GLM models are on OpenRouter's free tier — the ":free" catalogue rotates
-    # and currently carries none of them. This one is inexpensive rather than
-    # free; see docs/AI_SETUP.md for genuinely free alternatives.
-    "openrouter": "z-ai/glm-4.7-flash",
+    # Genuinely free, and verified against a zero-credit key: it answers, and
+    # it honours the json_schema response format the router and the SQL step
+    # depend on. Most of the ":free" catalogue does neither — several return
+    # 429 immediately and others reject structured output with a 400.
+    #
+    # No GLM model is on the free tier despite the name; a key with no credits
+    # gets a 402 from all of them, which is what "free models" usually means
+    # when someone asks for GLM.
+    "openrouter": "nvidia/nemotron-3-ultra-550b-a55b:free",
 }
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -49,7 +53,13 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 #
 # Images cost real money per call — cents, not the fractions of a cent the text
 # models cost — so nothing generates one without somebody asking for it.
-DEFAULT_IMAGE_MODEL = "google/gemini-2.5-flash-image-preview"
+# Verified present in OpenRouter's catalogue and the cheapest of the eleven
+# models there that can output an image. The "-preview" name this used to carry
+# does not exist on the gateway and returns "no endpoints found".
+#
+# There is no free option: every image-output model on OpenRouter is paid, so
+# unlike the text side this cannot run on an empty account.
+DEFAULT_IMAGE_MODEL = "google/gemini-2.5-flash-image"
 
 SETUP_INSTRUCTIONS = (
     "AI features are not configured. Either set AI_PROVIDER=openrouter with "

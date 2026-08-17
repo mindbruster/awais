@@ -1,4 +1,4 @@
-from sqlalchemy import ForeignKey, Integer, String
+from sqlalchemy import ForeignKey, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -29,5 +29,24 @@ class AuditLog(Base, TimestampMixin):
     resource_id: Mapped[int | None] = mapped_column(Integer, index=True)
 
     # Free-form context. JSON so we don't have to migrate every time we add a key.
+    # Kept alongside before/after because plenty of actions are not field
+    # changes at all — how many lots were on a bill, which entry a reversal
+    # produced — and forcing those into a diff shape would lose them.
     details: Mapped[dict | None] = mapped_column(JSONB)
+
+    # What the changed fields held before and after, and *only* the changed
+    # ones. A full snapshot of both sides buries the one number that moved in
+    # forty that did not, and on a wide table makes the log larger than the
+    # data it describes.
+    #
+    # NULL rather than `{}` when an action was not recorded this way: an empty
+    # object would claim nothing changed, which is a different statement from
+    # "this was never captured".
+    before: Mapped[dict | None] = mapped_column(JSONB)
+    after: Mapped[dict | None] = mapped_column(JSONB)
+
+    # Why. Its own column rather than a key in `details` because it is the
+    # field somebody actually searches, and JSON cannot be filtered on cheaply.
+    reason: Mapped[str | None] = mapped_column(Text)
+
     request_id: Mapped[str | None] = mapped_column(String(40))

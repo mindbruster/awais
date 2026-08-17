@@ -164,6 +164,20 @@ def ensure_stockable(design: Design) -> None:
             status.HTTP_409_CONFLICT,
             f"{design.design_no} is {design.status.value} and cannot be stocked.",
         )
+    # A lot is a dealing with a maker, not an article. Its metal becomes the
+    # pieces it divides into, and each of those is stocked on its own — so
+    # stocking the lot as well would post the same gold into Finished Goods
+    # twice and mint a product for something that was never one piece.
+    if design.is_lot:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"{design.design_no} is a lot, not a piece."
+            + (
+                " It has been divided — stock the pieces individually."
+                if design.status is DesignStatus.split
+                else " Divide it into pieces first; those are what get stocked."
+            ),
+        )
 
     out = open_leg(design)
     if out is not None:
@@ -209,8 +223,13 @@ def roll_up(design: Design) -> Rollup:
     for leg in live_legs(design):
         lines: list[StoneUse] = []
         for s in leg.stones:
-            qty = s.quantity_issued - s.quantity_returned
-            ct = (d(s.weight_issued_ct) - d(s.weight_returned_ct)).quantize(_G)
+            # What was set into the piece, not what failed to come back.
+            # Stones the setter broke or owes are gone from stock too, but they
+            # are his affair, not the article's cost — charging them here would
+            # inflate what the shop believes the piece cost to make and would
+            # bill the same carats twice, once to the piece and once to him.
+            qty = s.quantity_used
+            ct = d(s.weight_used_ct).quantize(_G)
             if ct <= 0 and qty <= 0:
                 continue
             rate = d(s.rate_per_ct)

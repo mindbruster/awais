@@ -2,7 +2,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import or_, select
 
 from app.api.deps import DbSession, require_perm
-from app.models.vendor import Vendor, VendorType
+from app.models.department import Department
+from app.models.vendor import Vendor, VendorType, legacy_type_for
 from app.schemas.vendor import VendorCreate, VendorRead, VendorUpdate
 
 router = APIRouter()
@@ -15,11 +16,16 @@ delete = Depends(require_perm("vendor:delete"))
 async def list_vendors(
     db: DbSession,
     q: str | None = Query(default=None),
+    department_id: int | None = Query(default=None),
+    # The stage a worker handles is what anyone actually filters by. `type` is
+    # kept because the legacy loss report links here with it.
     type: VendorType | None = Query(default=None),
     limit: int = Query(default=200, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> list[Vendor]:
     stmt = select(Vendor).order_by(Vendor.name).limit(limit).offset(offset)
+    if department_id is not None:
+        stmt = stmt.where(Vendor.department_id == department_id)
     if type:
         stmt = stmt.where(Vendor.type == type)
     if q:
@@ -29,9 +35,17 @@ async def list_vendors(
     return list(result.scalars().all())
 
 
+async def _department(db: DbSession, department_id: int) -> Department:
+    department = await db.get(Department, department_id)
+    if department is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Department not found")
+    return department
+
+
 @router.post("", response_model=VendorRead, status_code=status.HTTP_201_CREATED, dependencies=[write])
 async def create_vendor(payload: VendorCreate, db: DbSession) -> Vendor:
-    vendor = Vendor(**payload.model_dump())
+    department = await _department(db, payload.department_id)
+    vendor = Vendor(**payload.model_dump(), type=legacy_type_for(department))
     db.add(vendor)
     await db.commit()
     await db.refresh(vendor)
@@ -53,8 +67,12 @@ async def update_vendor(
     vendor = await db.get(Vendor, vendor_id)
     if vendor is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Vendor not found")
-    for k, v in payload.model_dump(exclude_unset=True).items():
+    fields = payload.model_dump(exclude_unset=True)
+    for k, v in fields.items():
         setattr(vendor, k, v)
+    # Moving a worker to another stage moves his legacy role with him.
+    if fields.get("department_id") is not None:
+        vendor.type = legacy_type_for(await _department(db, fields["department_id"]))
     await db.commit()
     await db.refresh(vendor)
     return vendor

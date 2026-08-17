@@ -36,10 +36,26 @@ PAYMENT_NO = 7_300_007
 OLD_GOLD_PURCHASE_NO = 7_300_010
 STONE_PURCHASE_NO = 7_300_011
 RAW_STONE_ITEM = 7_300_012
+BRANCH_TRANSFER_NO = 7_300_013
+ORDER_NO = 7_300_014
+APPROVAL_NO = 7_300_015
+GOLD_PURCHASE_NO = 7_300_016
+CASH_ENTRY_NO = 7_300_017
+# Money out to a dealer. Its own series (`VP`) because a payment to a supplier
+# and a receipt from a customer are different documents on different sides of
+# the books, and telling them apart by number alone has to be possible.
+SUPPLIER_PAYMENT_NO = 7_300_018
+# Stock-take sheets. Two counters opening one at the same moment must not both
+# be handed SC-26-00004.
+STOCK_COUNT_NO = 7_300_019
 
 # --- ledger and routing (7_300_02x) -----------------------------------------
 JOURNAL_ENTRY_NO = 7_300_020
 TAG_NO = 7_300_021
+# Lots are one global sequence, not per item: a lot is a dealing with a maker,
+# and the item it will turn into is not what identifies it while the metal is
+# out. Design numbers stay per-item and keep their own derived base below.
+LOT_NO = 7_300_023
 # The opening-balance run is a read-then-write over every party at once, so the
 # whole endpoint is serialised rather than each party in turn.
 OPENING_BALANCES = 7_300_022
@@ -50,6 +66,11 @@ OPENING_BALANCES = 7_300_022
 DESIGN_NO_BASE = 7_400_000
 # Melt pots are per purity, so buying 22k does not serialise against 21k.
 RAW_GOLD_ITEM_BASE = 7_420_000
+# Silver pots key on fineness × 10 — 999 fineness is stored as 99.9 tunch, so
+# 999 lands on +999 and 925 on +925. Its own base rather than sharing gold's:
+# 92.5 tunch and 22 karat are numbers on unrelated scales, and any single base
+# wide enough for one collides somewhere in the other.
+RAW_SILVER_ITEM_BASE = 7_430_000
 
 
 def assert_unique() -> None:
@@ -65,8 +86,16 @@ def assert_unique() -> None:
         "OLD_GOLD_PURCHASE_NO": OLD_GOLD_PURCHASE_NO,
         "STONE_PURCHASE_NO": STONE_PURCHASE_NO,
         "RAW_STONE_ITEM": RAW_STONE_ITEM,
+        "BRANCH_TRANSFER_NO": BRANCH_TRANSFER_NO,
+        "ORDER_NO": ORDER_NO,
+        "APPROVAL_NO": APPROVAL_NO,
+        "GOLD_PURCHASE_NO": GOLD_PURCHASE_NO,
+        "CASH_ENTRY_NO": CASH_ENTRY_NO,
+        "SUPPLIER_PAYMENT_NO": SUPPLIER_PAYMENT_NO,
+        "STOCK_COUNT_NO": STOCK_COUNT_NO,
         "JOURNAL_ENTRY_NO": JOURNAL_ENTRY_NO,
         "TAG_NO": TAG_NO,
+        "LOT_NO": LOT_NO,
         "OPENING_BALANCES": OPENING_BALANCES,
     }
     seen: dict[int, str] = {}

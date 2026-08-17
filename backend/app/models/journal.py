@@ -31,12 +31,33 @@ class Commodity(str, enum.Enum):
     PKR = "PKR"
     USD = "USD"
     GOLD = "GOLD"
+    # Fine grams of silver. A separate commodity from gold rather than a purity
+    # of it: the shop gives silver to the same workers on the same terms, but a
+    # gram of one must never settle a gram of the other, and one commodity with
+    # a metal flag would let exactly that happen every time a balance was
+    # summed without remembering to filter.
+    SILVER = "SILVER"
+    # Carats. Only ever a *claim* on somebody, never stock.
+    #
+    # Stone inventory deliberately stays out of the ledger — leg issues move
+    # stone stock without any posting against 1140, and `post_stocking` says so
+    # at length. Nothing here changes that. What this commodity exists for is
+    # the one stone figure that is a debt rather than a shelf: a setter who
+    # cannot produce the carats he was given owes them, and a debt recorded
+    # only as a smaller number in a stock row is a debt nobody chases.
+    STONE = "STONE"
 
 
 class PartyType(str, enum.Enum):
     customer = "customer"
     worker = "worker"
     supplier = "supplier"
+    # Staff who carry stock out to jewellers and sell on the road. A fourth
+    # party rather than a kind of worker: a karigar is given metal to transform
+    # and owes it back as pieces, a salesman is given finished pieces and owes
+    # them back as either goods or money. Both hold the firm's assets, but the
+    # obligations settle in different units, so they cannot share a sub-ledger.
+    salesman = "salesman"
 
 
 class JournalEntry(Base, TimestampMixin):
@@ -129,6 +150,10 @@ class JournalLine(Base, TimestampMixin):
     # Gold as the counter entered it, for display only — never used in maths.
     native_weight_g: Mapped[float | None] = mapped_column(Numeric(14, 4))
     native_purity: Mapped[int | None] = mapped_column(Integer)
+    # And the tunch it was weighed at, when the document carried one. Display
+    # only, like the two columns above it — `quantity` is already fine grams
+    # and remains the only figure any balance is computed from.
+    native_tunch_pct: Mapped[float | None] = mapped_column(Numeric(6, 3))
 
     # Subsidiary identity behind a control account. A customer statement is
     # (account = Customers, party_type = customer, party_id = N).

@@ -22,18 +22,22 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import joinedload, selectinload
 
+from app.core import clock
 from app.api.deps import DbSession, require_perm
-from app.models.account import SystemAccount
+from app.models.account import Account, SystemAccount
 from app.models.currency import Currency
+from app.models.customer import Customer
 from app.models.department import Department
 from app.models.design import Design, JobLeg, LegStatus
+from app.models.metal import Metal
 from app.models.inventory import InventoryItem
 from app.models.invoice import Invoice, InvoiceItem, InvoiceStatus
 from app.models.item import Item
-from app.models.journal import Commodity, PartyType
+from app.models.journal import Commodity, JournalLine, PartyType
 from app.models.manufacturing import JobStage, ManufacturingJob
 from app.models.product import Product
-from app.models.purchase import OldGoldPurchase
+from app.models.purchase import OldGoldPurchase, StonePurchaseItem
+from app.models.stone_draw import StoneDraw
 from app.models.vendor import Vendor, VendorType
 from app.schemas.reports import (
     CurrencyTotal,
@@ -45,12 +49,20 @@ from app.schemas.reports import (
     LossReport,
     MarginBreakdown,
     MarginReport,
+    MaterialOutsideReport,
+    MaterialOutsideRow,
     ProfitCurrencyTotal,
     ProfitReport,
     ProfitRow,
     SalesBucket,
     SalesReport,
+    MetalPosition,
     StockBucket,
+    CustomerPerformanceReport,
+    CustomerPerformanceRow,
+    ProfitSplitLine,
+    ProfitSplitReport,
+    StockPositionReport,
     StockReport,
     VendorLossRow,
     WorkerDepartmentLossRow,
@@ -58,6 +70,8 @@ from app.schemas.reports import (
     WorkerPerformanceRow,
 )
 from app.services import ledger, margin
+from app.services.gold_rate import fine_rate_per_g, rate_in_force
+from app.services.ledger import fine_grams
 
 router = APIRouter()
 
@@ -98,8 +112,25 @@ def _fine_sql(weight, purity):
     return weight * func.coalesce(purity, 24) / Decimal("24")
 
 
+def _fine_any_metal_sql(weight, purity, tunch):
+    """
+    Fine grams for either metal, preferring the assayed tunch.
+
+    The karat-only version above cannot describe silver at all — 999 has no
+    karat, and reading a blank purity as 24 would value a kilo of silver as a
+    kilo of pure gold. Tunch is a percentage of pure and serves both metals, so
+    it wins wherever it is present; karat is the gold fallback; and "neither
+    stated" means pure, which is how bullion is entered.
+    """
+    return weight * func.coalesce(
+        tunch / Decimal("100"),
+        purity / Decimal("24"),
+        Decimal("1"),
+    )
+
+
 def _stamp(date_from: date | None, date_to: date | None) -> str:
-    return f"{date_from or 'open'}_{date_to or date.today()}"
+    return f"{date_from or 'open'}_{date_to or clock.today()}"
 
 
 def _csv_response(
@@ -164,7 +195,7 @@ async def stock_report(db: DbSession, format: Format = Query(default="json")):
 
     if format == "csv":
         return _csv_response(
-            f"stock_{date.today()}.csv",
+            f"stock_{clock.today()}.csv",
             ["type", "items", "total_quantity", "total_weight_g", "total_weight_ct"],
             [
                 [b.type.value, b.items, b.total_quantity, b.total_weight_g, b.total_weight_ct]
@@ -172,6 +203,452 @@ async def stock_report(db: DbSession, format: Format = Query(default="json")):
             ],
         )
     return StockReport(by_type=buckets, items_count=total_count)
+
+
+@router.get(
+    "/profit-split",
+    response_model=ProfitSplitReport,
+    dependencies=[Depends(require_perm("report:profit"))],
+)
+async def profit_split_report(
+    db: DbSession,
+    date_from: date | None = Query(default=None),
+    date_to: date | None = Query(default=None),
+    currency: Currency = Query(default=Currency.PKR),
+    format: Format = Query(default="json"),
+):
+    """
+    Two businesses under one roof: the metal, and the raw material.
+
+    The shop asked for these apart, and they are apart because they behave
+    differently and are managed differently. Metal is bought at a rate that
+    moves daily, sold at a rate that moves daily, and its margin is largely the
+    spread plus the wastage charged. Stones are bought in parcels at a
+    negotiated price, sit in stock for months, and their margin is whatever was
+    agreed when the parcel was bought. A single "gross margin" averages a
+    business that turns over weekly with one that turns over yearly, and the
+    average describes neither.
+
+    Making is shown as a third column rather than folded into metal. It is the
+    shop's own labour sold on, it moves with neither rate, and for a wholesaler
+    it is most of the margin — which is exactly what a blended figure hides.
+
+    **How cost is split.** A product carries one `material_cost` covering both
+    metal and stones. The metal half is recoverable because `gold_rate_at_cost`
+    was locked onto the piece when it was costed: fine grams at that rate is
+    what the gold in it cost. What remains of `material_cost` is the stones. A
+    piece missing that locked rate cannot be split and is counted in
+    `unsplit_lines` rather than guessed at — a guess here would move margin
+    from one business to the other and nothing on the report would say so.
+
+    One currency at a time. Rupees and dollars do not add.
+    """
+    start, end = _window(date_from, date_to)
+
+    stmt = (
+        select(
+            InvoiceItem.gold_amount,
+            InvoiceItem.stone_amount,
+            InvoiceItem.labor_amount,
+            InvoiceItem.line_discount,
+            InvoiceItem.quantity,
+            Product.material_cost,
+            Product.total_cost,
+            Product.gold_weight_g,
+            Product.gold_purity,
+            Product.gold_tunch_pct,
+            Product.gold_rate_at_cost,
+            Product.id,
+        )
+        .join(Invoice, Invoice.id == InvoiceItem.invoice_id)
+        .join(Product, Product.id == InvoiceItem.product_id, isouter=True)
+        .where(
+            Invoice.status.in_((InvoiceStatus.issued, InvoiceStatus.paid)),
+            Invoice.currency == currency,
+        )
+    )
+    if start is not None:
+        stmt = stmt.where(Invoice.issued_at >= start)
+    if end is not None:
+        stmt = stmt.where(Invoice.issued_at <= end)
+
+    gold_rev = stone_rev = making_rev = _ZERO
+    gold_cost = stone_cost = making_cost = _ZERO
+    unsplit = lines = 0
+
+    for (
+        g_amt, s_amt, l_amt, disc, qty, mat_cost, tot_cost,
+        p_gold_g, p_purity, p_tunch, p_rate, product_id,
+    ) in (await db.execute(stmt)).all():
+        lines += 1
+        n = Decimal(str(qty or 1))
+        gold_rev += _d(g_amt)
+        stone_rev += _d(s_amt)
+        making_rev += _d(l_amt)
+        # A line discount is money given away against the line as a whole. It
+        # is netted off the largest revenue component rather than spread,
+        # because that is what the counter was arguing about when it was given.
+        discount = _d(disc)
+        if discount:
+            biggest = max(
+                (("gold", _d(g_amt)), ("stone", _d(s_amt)), ("making", _d(l_amt))),
+                key=lambda kv: kv[1],
+            )[0]
+            if biggest == "gold":
+                gold_rev -= discount
+            elif biggest == "stone":
+                stone_rev -= discount
+            else:
+                making_rev -= discount
+
+        if product_id is None:
+            # No product, no cost. Counted in `unsplit_lines` so a report built
+            # mostly from typed-in lines cannot be mistaken for a costed one.
+            unsplit += 1
+            continue
+
+        making_cost += _d(tot_cost) * n
+        material = _d(mat_cost) * n
+        if p_rate and _d(p_rate) > 0 and _d(p_gold_g) > 0:
+            fine = fine_grams(p_gold_g, p_purity, p_tunch)
+            metal_part = (fine * _d(p_rate) * n).quantize(_PKR)
+            # Never more than the material actually cost: a rate keyed after
+            # the fact could otherwise make the metal alone exceed the whole,
+            # handing the stone business a negative cost and a false margin.
+            metal_part = min(metal_part, material)
+            gold_cost += metal_part
+            stone_cost += material - metal_part
+        else:
+            # The piece has no locked rate, so its material cannot be split
+            # honestly. Charged whole to metal — most pieces are mostly metal —
+            # and counted, so the reader knows how much of the split is firm.
+            gold_cost += material
+            unsplit += 1
+
+    def line(name, rev, cost):
+        margin = (rev - cost).quantize(_PKR)
+        return ProfitSplitLine(
+            stream=name,
+            revenue=rev.quantize(_PKR),
+            cost=cost.quantize(_PKR),
+            gross_margin=margin,
+            margin_pct=_pct(margin, rev) if rev else None,
+        )
+
+    streams = [
+        line("gold", gold_rev, gold_cost),
+        line("stones", stone_rev, stone_cost),
+        line("making", making_rev, making_cost),
+    ]
+    total_rev = sum((s.revenue for s in streams), _ZERO)
+    total_cost = sum((s.cost for s in streams), _ZERO)
+
+    if format == "csv":
+        return _csv_response(
+            f"profit_split_{_stamp(date_from, date_to)}.csv",
+            ["stream", "revenue", "cost", "gross_margin", "margin_pct"],
+            [[s.stream, s.revenue, s.cost, s.gross_margin, s.margin_pct] for s in streams],
+        )
+    return ProfitSplitReport(
+        date_from=date_from,
+        date_to=date_to,
+        currency=currency,
+        streams=streams,
+        revenue=total_rev,
+        cost=total_cost,
+        gross_margin=(total_rev - total_cost).quantize(_PKR),
+        lines=lines,
+        unsplit_lines=unsplit,
+    )
+
+
+@router.get(
+    "/customers",
+    response_model=CustomerPerformanceReport,
+    dependencies=[Depends(require_perm("report:profit"))],
+)
+async def customer_performance_report(
+    db: DbSession,
+    date_from: date | None = Query(default=None),
+    date_to: date | None = Query(default=None),
+    format: Format = Query(default="json"),
+):
+    """
+    Who the shop's customers actually are, biggest first, and what each is worth.
+
+    Two questions in one table because they are asked together and answered
+    differently. *Spend* is what they bought — the obvious ranking, and the one
+    that flatters a customer who buys heavy metal at a thin margin. *Margin* is
+    what the shop kept, and it reorders the list: the second-biggest spender is
+    routinely the best customer, and nothing in the system could say so.
+
+    Cost is the same figure the profit report uses — `total_cost` plus
+    `material_cost` off the product, weighted by line quantity — so the two
+    reports cannot disagree about what a sale cost. Lines carrying no product
+    contribute revenue and no cost, which overstates margin on those; that is
+    visible as `uncosted_lines` rather than buried, because a customer bought
+    entirely on typed-in lines has a margin figure nobody should trust.
+
+    One currency at a time. Rupees and dollars do not add, and ranking a mixed
+    list would sort by a number that means nothing.
+    """
+    start, end = _window(date_from, date_to)
+
+    cost_subq = (
+        select(
+            InvoiceItem.invoice_id.label("invoice_id"),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (Product.id.is_(None), Decimal("0")),
+                        else_=(Product.total_cost + Product.material_cost)
+                        * InvoiceItem.quantity,
+                    )
+                ),
+                0,
+            ).label("cost"),
+            func.coalesce(
+                func.sum(case((Product.id.is_(None), 1), else_=0)), 0
+            ).label("uncosted"),
+            func.coalesce(func.sum(InvoiceItem.gold_weight_g), 0).label("gold_g"),
+            func.coalesce(func.sum(InvoiceItem.stone_weight_ct), 0).label("stone_ct"),
+        )
+        .join(Product, Product.id == InvoiceItem.product_id, isouter=True)
+        .group_by(InvoiceItem.invoice_id)
+        .subquery()
+    )
+
+    stmt = (
+        select(
+            Customer.id,
+            Customer.name,
+            Invoice.currency,
+            func.count(Invoice.id),
+            func.coalesce(func.sum(Invoice.total), 0),
+            func.coalesce(func.sum(Invoice.tax_amount), 0),
+            func.coalesce(func.sum(cost_subq.c.cost), 0),
+            func.coalesce(func.sum(cost_subq.c.uncosted), 0),
+            func.coalesce(func.sum(cost_subq.c.gold_g), 0),
+            func.coalesce(func.sum(cost_subq.c.stone_ct), 0),
+            func.max(Invoice.issued_at),
+        )
+        .join(Customer, Customer.id == Invoice.customer_id)
+        .join(cost_subq, cost_subq.c.invoice_id == Invoice.id, isouter=True)
+        .where(Invoice.status.in_((InvoiceStatus.issued, InvoiceStatus.paid)))
+        .group_by(Customer.id, Customer.name, Invoice.currency)
+    )
+    if start is not None:
+        stmt = stmt.where(Invoice.issued_at >= start)
+    if end is not None:
+        stmt = stmt.where(Invoice.issued_at <= end)
+
+    rows: list[CustomerPerformanceRow] = []
+    for (
+        cust_id, name, currency, invoices, total, tax, cost, uncosted, gold_g, stone_ct, last
+    ) in (await db.execute(stmt)).all():
+        # Tax is the government's money passing through; counting it as revenue
+        # would inflate every margin on this report by the tax rate.
+        revenue = (_d(total) - _d(tax)).quantize(_PKR)
+        cost_d = _d(cost).quantize(_PKR)
+        margin = (revenue - cost_d).quantize(_PKR)
+        rows.append(
+            CustomerPerformanceRow(
+                customer_id=cust_id,
+                customer_name=name,
+                currency=currency,
+                invoices=int(invoices),
+                revenue=revenue,
+                cost_of_goods=cost_d,
+                gross_margin=margin,
+                margin_pct=_pct(margin, revenue) if revenue else None,
+                gold_weight_g=_d(gold_g).quantize(_G),
+                stone_weight_ct=_d(stone_ct).quantize(_G),
+                uncosted_lines=int(uncosted),
+                last_purchase_at=last,
+            )
+        )
+
+    # Ranked by what they spent, which is the question as asked. `margin_pct`
+    # is on every row so the reader can re-sort by what the shop actually kept —
+    # and will often find a different customer at the top.
+    rows.sort(key=lambda r: r.revenue, reverse=True)
+
+    if format == "csv":
+        return _csv_response(
+            f"customers_{_stamp(date_from, date_to)}.csv",
+            ["customer", "currency", "invoices", "revenue", "cost_of_goods",
+             "gross_margin", "margin_pct", "gold_g", "stone_ct", "uncosted_lines"],
+            [
+                [r.customer_name, r.currency.value, r.invoices, r.revenue, r.cost_of_goods,
+                 r.gross_margin, r.margin_pct, r.gold_weight_g, r.stone_weight_ct,
+                 r.uncosted_lines]
+                for r in rows
+            ],
+        )
+    return CustomerPerformanceReport(
+        date_from=date_from,
+        date_to=date_to,
+        rows=rows,
+        customers=len({r.customer_id for r in rows}),
+        revenue=sum((r.revenue for r in rows), _ZERO),
+        gross_margin=sum((r.gross_margin for r in rows), _ZERO),
+    )
+
+
+@router.get(
+    "/stock-position",
+    response_model=StockPositionReport,
+    dependencies=[Depends(require_perm("report:stock"))],
+)
+async def stock_position(db: DbSession) -> StockPositionReport:
+    """
+    Everything the shop is holding, in the unit it is held in, and what it is
+    worth this morning.
+
+    `/reports/stock` groups inventory rows by type and stops there — it can say
+    there are 1,240 grams of raw gold, but not that they are 22k, not what they
+    are worth, and not that the eight kilos beside them are silver. This answers
+    the question the owner actually asks when he walks in.
+
+    Three rules hold it together, and each of them is a thing that would
+    otherwise go quietly wrong:
+
+    * **Every metal is converted to fine grams before it is valued**, preferring
+      the assayed tunch over the karat. Valuing as-weighed grams at the pure
+      rate over-values every 22k bar by nine percent.
+    * **Gold and silver are never added.** They differ a hundredfold in value
+      and a combined "metal" figure is a number in no unit at all. The only
+      place they meet is the rupee total, where they have both become money.
+    * **A metal with no rate on record is reported unvalued rather than at
+      zero.** A stock page that silently shows a kilo of silver as worthless is
+      worse than one that says it does not know today's silver rate.
+
+    Stones are held at what they cost — the parcels they were bought in, less
+    what has been drawn out of them — because there is no market rate for a
+    grade of diamond the way there is for metal.
+    """
+    metals = []
+    total_value = _ZERO
+    unpriced: list[str] = []
+
+    for metal, inv_type in ((Metal.gold, "raw_gold"), (Metal.silver, "raw_silver")):
+        weight, fine = (
+            await db.execute(
+                select(
+                    func.coalesce(func.sum(InventoryItem.weight_g), 0),
+                    func.coalesce(
+                        func.sum(
+                            _fine_any_metal_sql(
+                                InventoryItem.weight_g,
+                                InventoryItem.purity,
+                                InventoryItem.tunch_pct,
+                            )
+                        ),
+                        0,
+                    ),
+                ).where(InventoryItem.type == inv_type)
+            )
+        ).one()
+        rate_row = await rate_in_force(db, currency=Currency.PKR, purity=24, metal=metal)
+        rate = fine_rate_per_g(rate_row) if rate_row is not None else None
+        fine_d = _d(fine).quantize(_G)
+        value = (fine_d * rate).quantize(_PKR) if rate else None
+        if value is not None:
+            total_value += value
+        elif fine_d:
+            unpriced.append(metal.value)
+        metals.append(
+            MetalPosition(
+                metal=metal,
+                weight_g=_d(weight).quantize(_G),
+                fine_weight_g=fine_d,
+                rate_per_fine_g=rate,
+                value=value,
+            )
+        )
+
+    # Stones on the shelf, and what remains unconsumed of the parcels they were
+    # bought in. The two are counted from different places on purpose: carats
+    # come off the inventory rows the counter actually issues from, cost comes
+    # off the purchase lines, and a shop whose opening stock predates the system
+    # will legitimately hold more carats than it has bills for.
+    stone_ct = _d(
+        (
+            await db.execute(
+                select(func.coalesce(func.sum(InventoryItem.weight_ct), 0)).where(
+                    InventoryItem.type == "raw_stone"
+                )
+            )
+        ).scalar_one()
+    ).quantize(_G)
+    broken_ct = _d(
+        (
+            await db.execute(
+                select(func.coalesce(func.sum(InventoryItem.weight_ct), 0)).where(
+                    InventoryItem.type == "broken_stone"
+                )
+            )
+        ).scalar_one()
+    ).quantize(_G)
+
+    drawn = (
+        select(
+            StoneDraw.purchase_item_id.label("item_id"),
+            func.coalesce(func.sum(StoneDraw.weight_ct), 0).label("ct"),
+        )
+        .where(StoneDraw.purchase_item_id.is_not(None))
+        .group_by(StoneDraw.purchase_item_id)
+        .subquery()
+    )
+    stone_value = _d(
+        (
+            await db.execute(
+                select(
+                    func.coalesce(
+                        func.sum(
+                            (StonePurchaseItem.weight_ct - func.coalesce(drawn.c.ct, 0))
+                            * StonePurchaseItem.rate_per_ct
+                            * StonePurchaseItem.fx_rate_to_pkr
+                        ),
+                        0,
+                    )
+                ).select_from(StonePurchaseItem).outerjoin(
+                    drawn, drawn.c.item_id == StonePurchaseItem.id
+                )
+            )
+        ).scalar_one()
+    ).quantize(_PKR)
+    # Negative when more carats have been issued than the recorded purchases
+    # cover, which is what opening stock looks like from the books' side. Held
+    # at zero rather than subtracted from the shop's worth.
+    stone_value = max(stone_value, _ZERO)
+    total_value += stone_value
+
+    pieces, finished_value = (
+        await db.execute(
+            select(
+                func.count(InventoryItem.id),
+                func.coalesce(func.sum(Product.material_cost), 0),
+            )
+            .select_from(InventoryItem)
+            .join(Product, Product.id == InventoryItem.product_id, isouter=True)
+            .where(InventoryItem.type == "finished_product")
+        )
+    ).one()
+    finished_value_d = _d(finished_value).quantize(_PKR)
+    total_value += finished_value_d
+
+    return StockPositionReport(
+        as_of=clock.today(),
+        metals=metals,
+        stone_weight_ct=stone_ct,
+        stone_value=stone_value,
+        broken_stone_weight_ct=broken_ct,
+        finished_pieces=int(pieces or 0),
+        finished_value=finished_value_d,
+        total_value=total_value.quantize(_PKR),
+        unpriced_metals=unpriced,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +712,7 @@ async def sales_report(
 
     if format == "csv":
         return _csv_response(
-            f"sales_{date.today()}.csv",
+            f"sales_{clock.today()}.csv",
             ["currency", "sale_type", "invoices", "subtotal", "discount", "total"],
             [
                 [b.currency.value, b.sale_type.value, b.invoice_count, b.subtotal, b.discount, b.total]
@@ -267,6 +744,10 @@ async def manufacturing_loss_report(
     db: DbSession,
     date_from: date | None = Query(default=None),
     date_to: date | None = Query(default=None),
+    metal: Metal = Query(
+        default=Metal.gold,
+        description="Which metal to report. Gold and silver grams cannot be added together.",
+    ),
     format: Format = Query(default="json"),
 ):
     """
@@ -293,6 +774,13 @@ async def manufacturing_loss_report(
     the worker's gold account is for. Rows off the retired table are still
     included and tagged `source: legacy`, so a shop that ran both models does
     not lose the first half of its history.
+
+    **One metal at a time.** The figures here are grams, and grams of gold and
+    grams of silver are different assets at a hundredfold difference in value —
+    summing them produces a number in no unit at all, and the report would say
+    a shop losing a kilo of silver was losing a kilo of gold. So the metal is a
+    filter rather than a grouping, defaulting to gold, which is what every leg
+    written before silver existed is.
     """
     start, end = _window(date_from, date_to)
 
@@ -312,7 +800,16 @@ async def manufacturing_loss_report(
         )
         .join(Department, Department.id == JobLeg.department_id)
         .join(Vendor, Vendor.id == JobLeg.worker_id, isouter=True)
-        .where(JobLeg.status == LegStatus.received, JobLeg.received_at.is_not(None))
+        .where(
+            JobLeg.status == LegStatus.received,
+            JobLeg.received_at.is_not(None),
+            JobLeg.metal == metal,
+            # Wastage is issued less received. A leg that issued nothing is the
+            # maker working on his own gold, where that subtraction is not a
+            # loss but the whole weight of the piece arriving — counted here it
+            # reads as a large gain and hides every real loss beside it.
+            JobLeg.gold_issued_g > 0,
+        )
         .group_by(JobLeg.worker_id, Vendor.name, Vendor.type, JobLeg.department_id, Department.name)
     )
     if start is not None:
@@ -325,6 +822,7 @@ async def manufacturing_loss_report(
     karigar_loss = polish_loss = _ZERO
     legs = 0
     t_issued = t_received = t_allowed = t_actual = t_excess = _ZERO
+    t_owed_to_workers = _ZERO
 
     for (
         worker_id,
@@ -375,14 +873,35 @@ async def manufacturing_loss_report(
         t_received += _d(received)
         t_allowed += _d(allowed)
         t_actual += actual_d
-        t_excess += _d(excess)
+        # Split by sign rather than netted.
+        #
+        # Excess is signed on a maker's ratti leg: positive is metal he owes,
+        # negative is metal the shop owes *him* — he was entitled to keep an
+        # allowance and did not take all of it. Adding those together produces
+        # a figure that is neither, and calling it "loss" is worse than
+        # useless: one generous settlement can cancel out a real shortfall
+        # somewhere else and the report says the floor lost nothing.
+        excess_d = _d(excess)
+        if excess_d >= 0:
+            t_excess += excess_d
+        else:
+            t_owed_to_workers += -excess_d
 
     # --- what the retired table still holds ---
+    #
+    # Gold only, and not by choice: the retired module never knew about silver,
+    # so every row in it is gold. Folding those grams into a silver report would
+    # invent silver losses out of gold history.
     legacy_total = _ZERO
-    for column, role in (
-        (ManufacturingJob.karigar_id, VendorType.karigar),
-        (ManufacturingJob.polish_vendor_id, VendorType.polish),
-    ):
+    legacy_roles = (
+        [
+            (ManufacturingJob.karigar_id, VendorType.karigar),
+            (ManufacturingJob.polish_vendor_id, VendorType.polish),
+        ]
+        if metal is Metal.gold
+        else []
+    )
+    for column, role in legacy_roles:
         loss_col = (
             ManufacturingJob.karigar_loss_g
             if role is VendorType.karigar
@@ -473,6 +992,7 @@ async def manufacturing_loss_report(
     return LossReport(
         date_from=date_from,
         date_to=date_to,
+        metal=metal,
         overall_karigar_loss_g=karigar_loss.quantize(_G),
         overall_polish_loss_g=polish_loss.quantize(_G),
         by_vendor=compat,
@@ -482,6 +1002,7 @@ async def manufacturing_loss_report(
         overall_allowed_g=t_allowed.quantize(_G),
         overall_actual_loss_g=t_actual.quantize(_G),
         overall_excess_g=t_excess.quantize(_G),
+        overall_owed_to_workers_g=t_owed_to_workers.quantize(_G),
         by_worker_department=detail,
         legacy_loss_g=legacy_total.quantize(_G),
         notes=notes,
@@ -548,6 +1069,8 @@ async def profit_report(
             Invoice.total,
             Invoice.tax_amount,
             func.coalesce(making_cost_subq.c.making_cost, 0),
+            Invoice.metal_due_fine_g,
+            Invoice.gold_rate_per_g,
         )
         .join(making_cost_subq, making_cost_subq.c.invoice_id == Invoice.id, isouter=True)
         .where(Invoice.status.in_((InvoiceStatus.issued, InvoiceStatus.paid)))
@@ -560,11 +1083,21 @@ async def profit_report(
 
     rows: list[ProfitRow] = []
     by_cur: dict[str, dict] = {}
-    for inv_id, inv_no, currency, issued_at, total, tax, mc in (await db.execute(stmt)).all():
+    for inv_id, inv_no, currency, issued_at, total, tax, mc, metal_g, gold_rate in (
+        await db.execute(stmt)
+    ).all():
         # Tax is collected on the state's behalf and paid straight back out. It
         # is not the shop's money and counting it inflates profit by exactly the
         # tax — which is also what made this disagree with /reports/margin.
         revenue = (Decimal(str(total)) - Decimal(str(tax or 0))).quantize(Decimal("0.01"))
+        # Metal sold for metal is still sold. A trade bill never prices its
+        # gold, so `total` holds only the stones and the making — but the shop
+        # has parted with the metal and is owed gold for it, and this is the
+        # figure the ledger credits to Sales. Without it every wholesale bill
+        # reports as a loss the size of its own gold.
+        revenue += (
+            Decimal(str(metal_g or 0)) * Decimal(str(gold_rate or 0))
+        ).quantize(Decimal("0.01"))
         cost = Decimal(str(mc))
         profit = (revenue - cost).quantize(Decimal("0.01"))
         rows.append(
@@ -588,7 +1121,7 @@ async def profit_report(
 
     if format == "csv":
         return _csv_response(
-            f"profit_{date.today()}.csv",
+            f"profit_{clock.today()}.csv",
             ["invoice_no", "currency", "issued_at", "revenue", "cost_of_goods", "profit"],
             [
                 [
@@ -720,6 +1253,16 @@ async def margin_report(
         # the round-off taken off it, and the tax added on. Stripping the tax
         # back out leaves exactly the figure the levers below have to add up to.
         revenue = (_d(invoice.total) - tax).quantize(_PKR)
+        # Metal sold for metal is still sold. On a trade bill the gold is never
+        # priced, so `invoice.total` carries only the stones and the making —
+        # but the shop has parted with the metal and is owed gold for it, and
+        # the ledger credits Sales with exactly this figure. Leaving it out
+        # would report the whole metal side of the wholesale business as a
+        # dead loss: the cost of the gold in `cost_of_goods` with no revenue
+        # against it, and every lever below unattributed by the same amount.
+        revenue += (
+            _d(invoice.metal_due_fine_g) * _d(invoice.gold_rate_per_g)
+        ).quantize(_PKR)
         weight_discount = (
             _d(invoice.discount_weight_g) * _d(invoice.gold_rate_per_g)
         ).quantize(_PKR)
@@ -801,6 +1344,10 @@ async def margin_report(
 async def worker_performance_report(
     db: DbSession,
     days: int = Query(default=90, ge=1, le=1095),
+    metal: Metal = Query(
+        default=Metal.gold,
+        description="Which metal to report. Gold and silver grams cannot be added together.",
+    ),
     format: Format = Query(default="json"),
 ):
     """
@@ -845,6 +1392,10 @@ async def worker_performance_report(
             JobLeg.received_at.is_not(None),
             JobLeg.received_at >= start,
             JobLeg.received_at <= end,
+            JobLeg.metal == metal,
+            # See the loss report: a leg that issued nothing has no wastage to
+            # measure, only a whole piece arriving.
+            JobLeg.gold_issued_g > 0,
         )
         .group_by(JobLeg.worker_id, Vendor.name, Department.name)
     )
@@ -919,7 +1470,7 @@ async def worker_performance_report(
 
     if format == "csv":
         return _csv_response(
-            f"worker-performance_{days}d_{date.today()}.csv",
+            f"worker-performance_{days}d_{clock.today()}.csv",
             [
                 "worker", "department", "legs", "gold_issued_g", "gold_received_g",
                 "wastage_allowed_g", "wastage_actual_g", "wastage_excess_g",
@@ -1100,6 +1651,10 @@ async def department_throughput_report(
     db: DbSession,
     date_from: date | None = Query(default=None),
     date_to: date | None = Query(default=None),
+    metal: Metal = Query(
+        default=Metal.gold,
+        description="Which metal to report. Gold and silver grams cannot be added together.",
+    ),
     format: Format = Query(default="json"),
 ):
     """
@@ -1136,7 +1691,16 @@ async def department_throughput_report(
             held_days,
         )
         .join(Department, Department.id == JobLeg.department_id)
-        .where(JobLeg.status == LegStatus.received, JobLeg.received_at.is_not(None))
+        .where(
+            JobLeg.status == LegStatus.received,
+            JobLeg.received_at.is_not(None),
+            JobLeg.metal == metal,
+            # Wastage is issued less received. A leg that issued nothing is the
+            # maker working on his own gold, where that subtraction is not a
+            # loss but the whole weight of the piece arriving — counted here it
+            # reads as a large gain and hides every real loss beside it.
+            JobLeg.gold_issued_g > 0,
+        )
         .group_by(Department.id, Department.name, Department.code)
         .order_by(Department.sequence, Department.name)
     )
@@ -1294,7 +1858,16 @@ async def gold_movement_report(
             func.coalesce(
                 func.sum(_fine_sql(JobLeg.wastage_excess_g, JobLeg.gold_issued_purity)), 0
             ),
-        ).where(JobLeg.status == LegStatus.received, JobLeg.received_at.is_not(None)),
+        # Gold only, and not merely by convention: `_fine_sql` scales by
+        # `purity / 24`, which is the karat scale. A silver leg carries no karat
+        # at all — its fineness lives in the tunch column — so it would be read
+        # as pure and a kilo of silver would land in this report as a kilo of
+        # fine gold.
+        ).where(
+            JobLeg.status == LegStatus.received,
+            JobLeg.received_at.is_not(None),
+            JobLeg.metal == Metal.gold,
+        ),
         JobLeg.received_at,
     )
     received_g, wastage_g, excess_g = [_d(v) for v in (await db.execute(recv_q)).one()]
@@ -1402,4 +1975,173 @@ async def gold_movement_report(
         closing_finished_goods_g=finished,
         closing_total_g=in_hand + with_workers + finished,
         notes=notes,
+    )
+
+
+@router.get(
+    "/material-outside",
+    response_model=MaterialOutsideReport,
+    dependencies=[Depends(require_perm("report:stock"))],
+)
+async def material_outside(db: DbSession) -> MaterialOutsideReport:
+    """
+    Who is holding the shop's material right now, and for how long.
+
+    Every other view of this answers a different question. The position report
+    gives one total — "412 grams are with workers" — which is true and useless
+    when you need to know whose. A party statement gives one party in full,
+    which is what you read *after* you already know which party to worry about.
+    Nothing said which parties, in one list, ranked by exposure.
+
+    Three units side by side and never added, for the reason they are never
+    added anywhere else in this system: a gram of gold and a gram of silver
+    differ a hundredfold, and a carat is not a gram at all. A single "material
+    out" column would be a number in no unit.
+
+    Age is carried beside the weight because it is what turns an ordinary
+    balance into a problem. Three hundred grams issued yesterday is a workshop
+    running normally; the same three hundred grams issued in March is a
+    conversation somebody has been avoiding. `overdue_legs` counts the legs
+    whose agreed metal-return date has passed — the shop's own deadline, not an
+    arbitrary ageing bucket.
+
+    Read from the ledger rather than from open job legs. The legs say what was
+    *issued*; the ledger says what is still out after everything that has come
+    back, which is the question. A worker with ten closed legs and one gram
+    unaccounted for appears here with one gram, and the legs alone would have
+    shown him as clear.
+    """
+    accounts = {
+        SystemAccount.GOLD_WITH_WORKERS.value: (Commodity.GOLD, "gold_g"),
+        SystemAccount.SILVER_WITH_WORKERS.value: (Commodity.SILVER, "silver_g"),
+        SystemAccount.STONES_WITH_WORKERS.value: (Commodity.STONE, "stone_ct"),
+    }
+
+    rows: dict[tuple[str, int], dict] = {}
+
+    for code, (commodity, field) in accounts.items():
+        # Account *and* commodity together, the same pairing the position
+        # report uses: a line posted to the silver account carrying the gold
+        # commodity — the one mistake a metal-aware path can make — falls out
+        # of both readings rather than quietly inflating one.
+        stmt = (
+            select(
+                JournalLine.party_type,
+                JournalLine.party_id,
+                func.coalesce(func.sum(JournalLine.quantity), 0),
+            )
+            .join(Account, Account.id == JournalLine.account_id)
+            .where(
+                Account.code == code,
+                JournalLine.commodity == commodity,
+                JournalLine.party_id.is_not(None),
+            )
+            .group_by(JournalLine.party_type, JournalLine.party_id)
+        )
+        for party_type, party_id, qty in (await db.execute(stmt)).all():
+            if _d(qty) == _ZERO:
+                continue
+            key = (party_type.value, party_id)
+            rows.setdefault(
+                key, {"party_type": party_type, "party_id": party_id}
+            )[field] = _d(qty)
+
+    # The money half. Fetched for parties already on the list rather than for
+    # everyone: this report is about material, and a worker owed labour who
+    # holds nothing does not belong on a page titled "material outside".
+    if rows:
+        cash_stmt = (
+            select(
+                JournalLine.party_type,
+                JournalLine.party_id,
+                func.coalesce(func.sum(JournalLine.value_pkr), 0),
+            )
+            .join(Account, Account.id == JournalLine.account_id)
+            .where(
+                Account.code == SystemAccount.WORKERS_PAYABLE.value,
+                JournalLine.party_id.is_not(None),
+            )
+            .group_by(JournalLine.party_type, JournalLine.party_id)
+        )
+        for party_type, party_id, amount in (await db.execute(cash_stmt)).all():
+            row = rows.get((party_type.value, party_id))
+            if row is not None:
+                # Negated so positive reads "the shop owes them", which is how
+                # a payable is spoken about; the ledger carries it as a credit.
+                row["cash_balance"] = -_d(amount)
+
+    # Names, trades, and how long the oldest open leg has been out.
+    worker_ids = [pid for (ptype, pid) in rows if ptype == PartyType.worker.value]
+    vendors: dict[int, Vendor] = {}
+    if worker_ids:
+        vendors = {
+            v.id: v
+            for v in (
+                (
+                    await db.execute(
+                        select(Vendor).where(Vendor.id.in_(worker_ids))
+                    )
+                )
+                .unique()
+                .scalars()
+                .all()
+            )
+        }
+
+    ages: dict[int, tuple[int, date | None, int]] = {}
+    if worker_ids:
+        age_stmt = (
+            select(
+                JobLeg.worker_id,
+                func.count(JobLeg.id),
+                func.min(JobLeg.issued_at),
+                func.count(JobLeg.id).filter(
+                    JobLeg.metal_due_date.is_not(None),
+                    JobLeg.metal_due_date < clock.today(),
+                ),
+            )
+            .where(
+                JobLeg.worker_id.in_(worker_ids),
+                JobLeg.status == LegStatus.issued,
+            )
+            .group_by(JobLeg.worker_id)
+        )
+        for wid, open_legs, oldest, overdue in (await db.execute(age_stmt)).all():
+            ages[wid] = (int(open_legs), oldest.date() if oldest else None, int(overdue or 0))
+
+    today = clock.today()
+    out: list[MaterialOutsideRow] = []
+    for (ptype, pid), data in rows.items():
+        vendor = vendors.get(pid) if ptype == PartyType.worker.value else None
+        open_legs, oldest, overdue = ages.get(pid, (0, None, 0))
+        out.append(
+            MaterialOutsideRow(
+                party_type=data["party_type"],
+                party_id=pid,
+                party_name=vendor.name if vendor else None,
+                department=(
+                    vendor.department.name if vendor and vendor.department else None
+                ),
+                gold_g=data.get("gold_g", _ZERO),
+                silver_g=data.get("silver_g", _ZERO),
+                stone_ct=data.get("stone_ct", _ZERO),
+                cash_balance=data.get("cash_balance", _ZERO),
+                open_legs=open_legs,
+                oldest_issue_date=oldest,
+                days_out=(today - oldest).days if oldest else None,
+                overdue_legs=overdue,
+            )
+        )
+
+    # Ranked by gold, which is what a jeweller means by exposure. Silver and
+    # stones break the tie rather than being added to it.
+    out.sort(key=lambda r: (r.gold_g, r.silver_g, r.stone_ct), reverse=True)
+
+    return MaterialOutsideReport(
+        as_of=today,
+        rows=out,
+        total_gold_g=sum((r.gold_g for r in out), _ZERO),
+        total_silver_g=sum((r.silver_g for r in out), _ZERO),
+        total_stone_ct=sum((r.stone_ct for r in out), _ZERO),
+        parties=len(out),
     )

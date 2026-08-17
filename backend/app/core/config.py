@@ -15,9 +15,24 @@ class Settings(BaseSettings):
     )
 
     app_name: str = "Jewelry ERP"
+    # The shop's own timezone, which is what "today" means everywhere in the
+    # system: today's gold rate, today's takings, whether a memo is overdue.
+    # Timestamps are still stored in UTC — this only decides where a day
+    # begins. See app/core/clock.py for why it cannot be left to the server's.
+    shop_timezone: str = "Asia/Karachi"
     environment: str = "development"
     api_v1_prefix: str = "/api/v1"
     debug: bool = True
+
+    # Four eyes on a metal write-off: the person who submitted a stock count
+    # may not be the one who posts it.
+    #
+    # Off by default, and that is deliberate rather than lax. A shop with a
+    # single admin would otherwise be unable to post a count at all — the
+    # control would not make them safer, it would make the feature unusable and
+    # push the reconciliation back onto paper, which is strictly worse. A shop
+    # with two or more people turns it on.
+    require_two_person_approval: bool = False
 
     # NoDecode skips pydantic-settings' default JSON-parse of complex types so our
     # comma-separated env value reaches the field_validator below as a raw string.
@@ -109,6 +124,11 @@ class Settings(BaseSettings):
     twilio_auth_token: str | None = None
     # Twilio sandbox or business sender — must include 'whatsapp:' prefix.
     twilio_whatsapp_from: str | None = None
+
+    # Live metal rates from goldpricez.com (optional). Without a key the live
+    # tab says so rather than failing: the rate the shop *sets* drives every
+    # calculation, and this feed is never allowed near pricing.
+    goldpricez_api_key: str | None = None
 
     @field_validator("cors_origins", mode="before")
     @classmethod

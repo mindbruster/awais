@@ -23,7 +23,10 @@ class ProductBase(BaseModel):
 
 
 class ProductCreate(ProductBase):
-    pass
+    # Which shop this belongs to. Optional: left unset it falls back to the
+    # user's own branch, then to the default, so a single-shop business
+    # never sees the field and a multi-shop one can be explicit.
+    branch_id: int | None = None
 
 
 class ProductUpdate(BaseModel):
@@ -41,6 +44,9 @@ class ProductUpdate(BaseModel):
 
 
 class ProductRead(TimestampedRead, ProductBase):
+    # Which shop holds this. Always set on a stored row, so the client can
+    # show and filter by it without a second lookup.
+    branch_id: int | None = None
     stones: list[ProductStoneRead] = Field(default_factory=list)
     # Read-only: locked by the costing service on the first pass, never set by
     # the caller. Exposed so the UI can show what rate a piece was costed at.

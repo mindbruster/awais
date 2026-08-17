@@ -5,6 +5,7 @@ from sqlalchemy import DateTime, Enum, ForeignKey, Integer, Numeric, String, Tex
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
+from app.models.branch import Branch
 from app.models.mixins import TimestampMixin
 
 
@@ -20,6 +21,13 @@ class Product(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     serial_no: Mapped[str] = mapped_column(String(50), unique=True, index=True, nullable=False)
+    # The showroom the piece is sitting in. A finished piece is somewhere
+    # specific — in a case, in a shop — and "which branch has it" is the
+    # question a counter asks before promising it to a customer.
+    branch_id: Mapped[int] = mapped_column(
+        ForeignKey("branches.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    branch: Mapped[Branch] = relationship(lazy="joined")
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     category: Mapped[str | None] = mapped_column(String(80), index=True)
     description: Mapped[str | None] = mapped_column(Text)
@@ -27,6 +35,20 @@ class Product(Base, TimestampMixin):
     # Weights (precision: 4 decimal places — enough for grams & carats)
     gold_weight_g: Mapped[float] = mapped_column(Numeric(12, 4), default=0, nullable=False)
     gold_purity: Mapped[int | None] = mapped_column(Integer)  # 9, 14, 18, 22, 24
+    # Fineness as the trade quotes it: 91.6, 99.5, 75.0 — percent, not karat.
+    #
+    # `gold_purity` above is a karat integer, and a karat integer cannot tell
+    # 91.6 apart from 92.0. Between a wholesaler and his counterparty that
+    # distinction is money: on a five-kilo lot the two differ by twenty fine
+    # grams, and both sides are weighing to three decimals precisely because
+    # they intend to argue about it.
+    #
+    # Nullable, and never backfilled from the karat column. `fine_grams()`
+    # prefers this when set and falls back to karat/24 when it is not, so every
+    # row written before tunch existed still computes to the same last decimal
+    # it always did. Precision arrives for new documents without restating old
+    # ones — which is the only safe way to change a unit on a live ledger.
+    gold_tunch_pct: Mapped[float | None] = mapped_column(Numeric(6, 3))
     stone_weight_ct: Mapped[float] = mapped_column(Numeric(12, 4), default=0, nullable=False)
 
     image_url: Mapped[str | None] = mapped_column(String(500))

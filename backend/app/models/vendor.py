@@ -15,15 +15,39 @@ class VendorType(str, enum.Enum):
     other = "other"
 
 
+# The department a worker belongs to, said again in the old three-role
+# vocabulary the loss report still groups on. Derived rather than asked for:
+# the department is the routing key, and a form offering both invites a worker
+# filed under Maker while typed `polish`, which the report would then believe.
+#
+# Unknown codes fall to `other` on purpose. Departments are editable data, so a
+# shop that adds a fourth stage tomorrow gets a worker who is simply absent
+# from the two legacy roll-ups — never one filed under a stage he never worked.
+LEGACY_TYPE_BY_DEPARTMENT_CODE = {
+    "MAKE": VendorType.karigar,
+    "SET": VendorType.stone_fixer,
+    # A lacker is not a polisher. `other` says so rather than guessing.
+    "LAC": VendorType.other,
+}
+
+
+def legacy_type_for(department: "Department | None") -> VendorType:
+    if department is None:
+        return VendorType.other
+    return LEGACY_TYPE_BY_DEPARTMENT_CODE.get(department.code, VendorType.other)
+
+
 class Vendor(Base, TimestampMixin):
     """
     A worker the shop gives material to — karigar, stone fixer, polisher.
 
-    `type` is the original fixed three-role enum and `department_id` is what
-    replaces it: a foreign key into the editable department list, so a shop
-    running nine stages isn't limited to three. Both are present while the
-    manufacturing module still routes on the enum; the enum goes away with the
-    routing engine, when this table is also renamed to `workers`.
+    `department_id` is the routing key: a foreign key into the editable
+    department list, so the floor is configured rather than compiled in.
+
+    `type` is the original fixed three-role enum, kept only because the loss
+    report still reports two all-time totals against it. Nobody sets it by
+    hand any more — see `legacy_type_for`, which derives it from the department
+    so the two cannot disagree.
     """
 
     __tablename__ = "vendors"

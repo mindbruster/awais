@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from app.models.account import AccountType
 from app.models.journal import Commodity, PartyType
+from app.models.metal import Metal
 from app.schemas.common import ORMModel, TimestampedRead
 
 
@@ -175,6 +176,102 @@ class StatementReport(BaseModel):
 
 
 # --------------------------------------------------------------------------
+# Party statement — the wholesale account, in metal and money at once
+# --------------------------------------------------------------------------
+class PartyStatementRow(BaseModel):
+    """
+    One document's effect on a trade party's account, in both units.
+
+    A row carries a metal side and a cash side because a single document
+    routinely moves both and moves them by unrelated amounts: a bill for twelve
+    rings adds fine grams to what the jeweller owes in metal and rupees to what
+    he owes in making. Splitting that across two statements would mean reading
+    two pages to find out where one document left the account.
+
+    Either side may be zero. Metal-only rows are ordinary — a jeweller dropping
+    off 500g for job work moves no money at all — and so are cash-only ones.
+    """
+
+    entry_id: int
+    entry_no: str
+    entry_date: date
+    memo: str | None = None
+    # What kind of document this was — 'invoice', 'payment', 'gold_purchase'.
+    # Taken from the entry's own source_type so the statement names the
+    # document rather than describing the posting.
+    source_type: str | None = None
+    source_id: int | None = None
+
+    # Fine grams. Positive is metal the party has taken on — it increases what
+    # they owe. Negative is metal received from them.
+    metal_in_g: Decimal = Decimal("0")
+    metal_out_g: Decimal = Decimal("0")
+    metal_balance_g: Decimal = Decimal("0")
+    # As weighed, when the document said. Display only.
+    native_weight_g: Decimal | None = None
+    native_purity: int | None = None
+    native_tunch_pct: Decimal | None = None
+
+    cash_debit: Decimal = Decimal("0")
+    cash_credit: Decimal = Decimal("0")
+    cash_balance: Decimal = Decimal("0")
+
+    # Silver in grams and stones in carats, each in its own unit and held well
+    # away from the cash side — which is what they are not. A worker holding a
+    # kilo of silver is not a worker who owes money, and a setter short 0.20ct
+    # cannot settle it by paying. Both used to land in `cash_*` by their rupee
+    # value, so a statement asked them to pay for metal they were holding.
+    #
+    # Signed rather than split into debit and credit: these move in one
+    # direction per document and a pair of columns would leave one of them
+    # empty on every row.
+    silver_delta_g: Decimal = Decimal("0")
+    silver_balance_g: Decimal = Decimal("0")
+    stone_delta_ct: Decimal = Decimal("0")
+    stone_balance_ct: Decimal = Decimal("0")
+
+
+class PartyStatementReport(BaseModel):
+    """
+    A trade party's whole position: what they owe in gold, and what in rupees.
+
+    The two balances are reported separately and are never netted. Converting
+    the metal side to money to produce a single figure would price grams the
+    party has not agreed to sell yet — the entire point of settling in metal is
+    that the rate is decided on the day the metal moves, not on the day the
+    bill was written.
+    """
+
+    party_type: PartyType
+    party_id: int
+    party_name: str | None = None
+    date_from: date | None = None
+    date_to: date | None = None
+
+    opening_metal_g: Decimal = Decimal("0")
+    opening_cash: Decimal = Decimal("0")
+    opening_silver_g: Decimal = Decimal("0")
+    opening_stone_ct: Decimal = Decimal("0")
+
+    rows: list[PartyStatementRow]
+
+    metal_in_total_g: Decimal = Decimal("0")
+    metal_out_total_g: Decimal = Decimal("0")
+    cash_debit_total: Decimal = Decimal("0")
+    cash_credit_total: Decimal = Decimal("0")
+
+    # Positive means the party owes the shop. Negative on the metal side means
+    # the shop is holding their gold, which is the normal state during job work.
+    closing_metal_g: Decimal = Decimal("0")
+    closing_cash: Decimal = Decimal("0")
+    closing_silver_g: Decimal = Decimal("0")
+    closing_stone_ct: Decimal = Decimal("0")
+
+    total_rows: int = 0
+    truncated: bool = False
+
+
+# --------------------------------------------------------------------------
 # Trial balance / position
 # --------------------------------------------------------------------------
 class TrialBalanceRow(BaseModel):
@@ -203,6 +300,13 @@ class PositionReport(BaseModel):
     cash_in_hand: Decimal
     gold_in_hand_g: Decimal
     gold_with_workers_g: Decimal
+    # Silver's own pair, in fine grams. Reported beside gold rather than added
+    # to it: the two differ a hundredfold in value, and one "metal in hand"
+    # figure covering both is a number in no unit at all.
+    silver_in_hand_g: Decimal = Decimal("0")
+    silver_with_workers_g: Decimal = Decimal("0")
+    # Carats a worker owes the shop for stones he could not produce.
+    stones_with_workers_ct: Decimal = Decimal("0")
     customer_receivable: Decimal
     # Payables are shown as the shop reads them: positive means money owed out,
     # even though a liability carries a credit (negative) balance in the ledger.
@@ -243,3 +347,35 @@ __all__ = [
     "PositionReport",
     "OpeningBalancePosted", "OpeningBalanceSkipped", "OpeningBalanceResult",
 ]
+
+
+# --------------------------------------------------------------------------
+# Metal revaluation
+# --------------------------------------------------------------------------
+class MetalValuationRead(BaseModel):
+    """One metal: what it is on the books at, and what it is worth."""
+
+    metal: Metal
+    fine_grams: Decimal
+    # Null when no rate is on record. The metal is then reported unvalued
+    # rather than at zero — revaluing an unpriced holding to nothing would
+    # write the whole of it off as a loss.
+    rate_per_fine_g: Decimal | None = None
+    book_value: Decimal
+    market_value: Decimal | None = None
+    # Positive is a gain the books have not yet recognised.
+    difference: Decimal | None = None
+    unpriced: str | None = None
+
+
+class RevaluationPreview(BaseModel):
+    as_of: date
+    metals: list[MetalValuationRead] = []
+    total_difference: Decimal = Decimal("0")
+
+
+class RevaluationResult(RevaluationPreview):
+    # Null when nothing needed moving, which is a real outcome on a quiet day
+    # and must not read as a failure.
+    entry_id: int | None = None
+    entry_no: str | None = None

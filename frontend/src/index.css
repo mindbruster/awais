@@ -2,15 +2,59 @@
 @tailwind components;
 @tailwind utilities;
 
-/* Print styles — used by /invoices/:id printable view */
+/* Print styles — used by /invoices/:id printable view.
+   The bill is the one thing this system produces that leaves the shop, so the
+   printed page is a design target, not a fallback rendering of a screen. */
 @media print {
+  /* A4 is what the shop's printer is loaded with, and 12mm keeps the ruled
+     grid clear of the unprintable margin on cheap laser printers. */
+  @page { size: A4 portrait; margin: 12mm; }
   body { background: white !important; }
   .no-print { display: none !important; }
-  .print-page { padding: 0 !important; box-shadow: none !important; border: none !important; max-width: none !important; }
+  .print-page {
+    padding: 0 !important;
+    box-shadow: none !important;
+    border: none !important;
+    max-width: none !important;
+    overflow: visible !important;
+  }
   aside { display: none !important; }
+  /* The app shell is built for a wide screen: a 15rem sidebar gutter and a
+     72rem centred column. On paper that box is wider than the sheet, so the
+     right-hand columns fall off the edge — which is exactly what a clipped
+     Amount column looks like. Collapse the whole chain to the page width. */
+  html, body { width: 100% !important; margin: 0 !important; }
   main { padding-left: 0 !important; }
-  /* Force colors for receipts */
+  main > div {
+    max-width: none !important;
+    width: 100% !important;
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+  .print-page, .print-doc { width: 100% !important; max-width: 100% !important; }
+  /* Navy headings and ruled borders are the document, not decoration. Browsers
+     drop background and colour by default to save toner; this puts them back. */
   * { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+  /* A bill split across a page break mid-table is unreadable and, worse, looks
+     like two documents. Keep each row whole and never orphan the totals. */
+  .print-doc table { page-break-inside: auto; }
+  .print-doc tr { page-break-inside: avoid; page-break-after: auto; }
+  .print-doc thead { display: table-header-group; }
+
+  /* Nine columns have to fit 186mm — about 700px. At the screen's 13px a
+     figure like 2,752,972.50 is wider than the Amount column, and a number has
+     no break opportunity in it, so it does not wrap: it runs straight over the
+     rule into the next cell. Smaller type and tighter cells are what make the
+     grid hold. */
+  .print-doc { font-size: 9.5px !important; line-height: 1.35 !important; }
+  .print-doc table td, .print-doc table th { padding: 3px 4px !important; }
+  /* Last-resort guard for a figure longer than anything anticipated: wrap it
+     inside its own cell rather than let it cross the border. */
+  .print-doc table td, .print-doc table th { overflow-wrap: anywhere; }
+  /* The photograph carries the row height. At screen size four lines would run
+     off the bottom of the sheet. */
+  .print-doc table td img { max-height: 22mm !important; }
+  .print-doc table td.h-40 { height: 24mm !important; }
 }
 
 @layer components {
@@ -26,7 +70,53 @@
   .input {
     @apply block w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm placeholder:text-slate-400 focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500;
   }
+  .btn-outline {
+    @apply btn border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 focus:ring-brand-500;
+  }
+  .btn-danger {
+    @apply btn bg-red-600 text-white hover:bg-red-700 focus:ring-red-500;
+  }
   .card {
     @apply rounded-xl border border-slate-200 bg-white p-5 shadow-sm;
+  }
+  /* Same card, no padding — for tables and lists that own their own edges. */
+  .card-flush {
+    @apply overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm;
+  }
+
+  /* Weights and money are read down a column, not across a line. Lining,
+     tabular digits keep every decimal point on one vertical axis, which is
+     what makes a shortfall visible at a glance instead of on inspection. */
+  .num {
+    font-variant-numeric: tabular-nums lining-nums;
+    font-feature-settings: "tnum" 1, "lnum" 1;
+  }
+  .num-lg {
+    @apply num text-xl font-semibold tracking-tight text-slate-900;
+  }
+
+  /* One label style for every figure caption on the workshop screens. */
+  .eyebrow {
+    @apply text-[11px] font-semibold uppercase tracking-wider text-slate-500;
+  }
+
+  /* Status colour is semantic and fixed across the whole design feature:
+     amber = out with someone, emerald = back and settled, red = owed to the
+     shop, sky = came back heavier, slate = closed or inert, gold = identity. */
+  .chip {
+    @apply inline-flex items-center gap-1.5 whitespace-nowrap rounded-full px-2.5 py-1 text-xs font-medium;
+  }
+  .chip-out   { @apply chip bg-amber-100 text-amber-900; }
+  .chip-back  { @apply chip bg-emerald-100 text-emerald-900; }
+  .chip-owed  { @apply chip bg-red-100 text-red-800; }
+  .chip-gain  { @apply chip bg-sky-100 text-sky-900; }
+  .chip-idle  { @apply chip bg-slate-100 text-slate-600; }
+  .chip-dead  { @apply chip bg-slate-200 text-slate-500; }
+  .chip-gold  { @apply chip bg-brand-100 text-brand-800; }
+
+  /* A dot that carries the same semantics as the chip, for dense rows where a
+     full chip would crowd the line. */
+  .dot {
+    @apply inline-block h-1.5 w-1.5 flex-none rounded-full;
   }
 }

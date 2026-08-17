@@ -6,11 +6,12 @@ import { TextField } from "@/components/Field";
 import { apiError } from "@/lib/api-error";
 import { Currency, fmtMoney, fmtWeight } from "@/lib/money";
 import { MarginReportPage } from "@/pages/reports/MarginReportPage";
+import { CustomerReportPage } from "@/pages/reports/CustomerReportPage";
 import { WorkerReportPage } from "@/pages/reports/WorkerReportPage";
 import { OperationsReportPage } from "@/pages/reports/OperationsReportPage";
 
 /**
- * Reports — one route, four views.
+ * Reports — one route, five views.
  *
  * The sidebar and the router are shared surfaces this section does not own, so
  * the sub-reports are tabs under `?tab=` rather than routes of their own. That
@@ -27,6 +28,7 @@ import { OperationsReportPage } from "@/pages/reports/OperationsReportPage";
 const TABS = [
   { key: "overview", label: "Overview" },
   { key: "margin", label: "Margin" },
+  { key: "customers", label: "Customers" },
   { key: "workers", label: "Workers" },
   { key: "operations", label: "Operations" },
 ] as const;
@@ -66,6 +68,7 @@ export function ReportsPage() {
 
       {tab === "overview" && <OverviewTab />}
       {tab === "margin" && <MarginReportPage />}
+      {tab === "customers" && <CustomerReportPage />}
       {tab === "workers" && <WorkerReportPage />}
       {tab === "operations" && <OperationsReportPage />}
     </div>

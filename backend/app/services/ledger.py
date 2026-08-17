@@ -22,6 +22,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import Integer, cast, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import clock
 from app.core import lock_keys
 from app.models.account import Account, SystemAccount
 from app.models.journal import Commodity, JournalEntry, JournalLine, PartyType
@@ -38,15 +39,38 @@ def d(v) -> Decimal:
     return Decimal(str(v if v is not None else 0))
 
 
-def fine_grams(weight_g: Decimal | float, purity: int | None) -> Decimal:
+def fine_grams(
+    weight_g: Decimal | float,
+    purity: int | None,
+    tunch_pct: Decimal | float | None = None,
+) -> Decimal:
     """
     Convert an as-weighed amount to fine (24k-equivalent) grams.
 
     The ledger holds gold in fine grams so that 10g of 22k and 10g of 24k are
     not silently treated as the same asset. A missing purity is taken as pure,
     which matches how raw bullion is entered.
+
+    Two ways of saying the same thing, and the order matters. `tunch_pct` is
+    the fineness as the trade actually quotes it — 91.6, 99.5, 75.0 — and wins
+    whenever it is present. `purity` is the karat integer this system started
+    with, kept as the fallback.
+
+    That fallback is not politeness, it is the migration's whole safety
+    property. A karat integer cannot express 91.6 as distinct from 92.0, and on
+    a five-kilo lot those differ by twenty fine grams — which is why tunch had
+    to exist. But converting the karat rows to tunch would move them: 22/24 is
+    0.9166666..., and any decimal tunch written in its place is a rounding of
+    that. So historic rows are left with `tunch_pct` NULL and keep computing
+    exactly as they always did, to the last decimal. Nothing already on the
+    books moves; only new documents get to be precise.
     """
-    factor = d(purity) / Decimal("24") if purity else Decimal("1")
+    if tunch_pct:
+        factor = d(tunch_pct) / Decimal("100")
+    elif purity:
+        factor = d(purity) / Decimal("24")
+    else:
+        factor = Decimal("1")
     return (d(weight_g) * factor).quantize(Decimal("0.0001"))
 
 
@@ -64,6 +88,12 @@ class Posting:
     party_id: int | None = None
     native_weight_g: Decimal | None = None
     native_purity: int | None = None
+    # The assayed fineness the document was struck at, when it had one. Carried
+    # alongside the karat for the same reason as the weight: so a statement can
+    # show what the counter actually read on the scale, rather than the karat
+    # band the system rounded it into. Display only — `quantity` is already
+    # fine grams and stays the only figure any balance is computed from.
+    native_tunch_pct: Decimal | None = None
     memo: str | None = None
 
     def value_pkr(self) -> Decimal:
@@ -161,7 +191,7 @@ async def post_entry(
 
     entry = JournalEntry(
         entry_no=await next_entry_no(db),
-        entry_date=draft.entry_date or datetime.now(timezone.utc).date(),
+        entry_date=draft.entry_date or clock.today(),
         memo=draft.memo,
         source_type=draft.source_type,
         source_id=draft.source_id,
@@ -183,6 +213,7 @@ async def post_entry(
                 value_pkr=value,
                 native_weight_g=p.native_weight_g,
                 native_purity=p.native_purity,
+                native_tunch_pct=p.native_tunch_pct,
                 party_type=p.party_type,
                 party_id=p.party_id,
                 memo=p.memo,
@@ -222,7 +253,7 @@ async def reverse_entry(
 
     reversal = JournalEntry(
         entry_no=await next_entry_no(db),
-        entry_date=datetime.now(timezone.utc).date(),
+        entry_date=clock.today(),
         memo=memo,
         source_type=entry.source_type,
         source_id=entry.source_id,
@@ -233,7 +264,29 @@ async def reverse_entry(
     db.add(reversal)
     await db.flush()
 
-    for line in entry.lines:
+    # Selected rather than read off `entry.lines`. The relationship is only
+    # populated when the entry was loaded by a query; an entry posted earlier in
+    # this same session has it empty, and touching it then either lazy-loads —
+    # which async SQLAlchemy refuses outright — or, worse, reads as empty and
+    # posts a reversal with no lines at all. A reversal that silently reverses
+    # nothing is the most dangerous failure this module has.
+    original_lines = list(
+        (
+            await db.execute(
+                select(JournalLine)
+                .where(JournalLine.entry_id == entry.id)
+                .order_by(JournalLine.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not original_lines:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Entry {entry.entry_no} has no lines, so there is nothing to reverse.",
+        )
+    for line in original_lines:
         db.add(
             JournalLine(
                 entry_id=reversal.id,
@@ -244,6 +297,7 @@ async def reverse_entry(
                 value_pkr=-d(line.value_pkr),
                 native_weight_g=line.native_weight_g,
                 native_purity=line.native_purity,
+                native_tunch_pct=line.native_tunch_pct,
                 party_type=line.party_type,
                 party_id=line.party_id,
                 memo=f"Reversal of {entry.entry_no}",

@@ -17,6 +17,7 @@ from decimal import Decimal
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import desc, select
 
+from app.core import clock
 from app.api.deps import CurrentUser, DbSession, require_password_confirm, require_perm
 from app.models.bank import BankAccount
 from app.models.customer import Customer
@@ -25,7 +26,7 @@ from app.models.journal import JournalEntry
 from app.models.payment import Payment, PaymentDirection, PaymentMethod
 from app.models.stock_movement import MovementType
 from app.schemas.payment import PaymentCreate, PaymentRead, PaymentReverseRequest
-from app.services import fx, purchasing, sales
+from app.services import branches, fx, purchasing, sales
 from app.services.audit import log_action
 from app.services.inventory import post_movement
 from app.services.ledger import d
@@ -258,8 +259,8 @@ async def create_payment(
         # of a foreign bill look like a hundredfold overpayment.
         offered = amount
         if payload.currency is not invoice.currency:
-            pay_rate = await fx.require_rate(db, payload.currency, as_of=date.today())
-            inv_rate = await fx.require_rate(db, invoice.currency, as_of=date.today())
+            pay_rate = await fx.require_rate(db, payload.currency, as_of=clock.today())
+            inv_rate = await fx.require_rate(db, invoice.currency, as_of=clock.today())
             offered = (amount * pay_rate / inv_rate).quantize(Decimal("0.01"))
         if offered > outstanding:
             over = (offered - outstanding).quantize(Decimal("0.01"))
@@ -303,7 +304,11 @@ async def create_payment(
     # the raw-gold stock disagreeing by the weight of every exchange ever
     # taken — and the two are supposed to be the same metal counted two ways.
     if payment.method is PaymentMethod.gold_exchange:
-        pot = await purchasing.raw_gold_item(db, purity=int(payment.gold_purity))
+        # The pot at the counter that took the metal, not a shop-wide one.
+        pot_branch = await branches.resolve_branch(db, requested_id=None, user=current)
+        pot = await purchasing.raw_gold_item(
+            db, purity=int(payment.gold_purity), branch_id=pot_branch.id
+        )
         weight = Decimal(str(payment.gold_weight_g))
         await post_movement(
             db,
@@ -370,7 +375,10 @@ async def reverse_payment(
     # takes it off 1130; without this the stock ledger keeps counting grams the
     # shop returned across the counter.
     if payment.method is PaymentMethod.gold_exchange and payment.gold_purity is not None:
-        pot = await purchasing.raw_gold_item(db, purity=int(payment.gold_purity))
+        pot_branch = await branches.resolve_branch(db, requested_id=None, user=current)
+        pot = await purchasing.raw_gold_item(
+            db, purity=int(payment.gold_purity), branch_id=pot_branch.id
+        )
         weight = Decimal(str(payment.gold_weight_g or 0))
         if weight:
             await post_movement(
