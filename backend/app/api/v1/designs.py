@@ -51,7 +51,7 @@ from app.schemas.design import (
     TraceStone,
     TraceTotals,
 )
-from app.services import fx, stone_costing
+from app.services import fx, purchasing, stone_costing
 from app.services.audit import log_action
 from app.services.inventory import post_movement
 from app.services.ledger import d
@@ -65,6 +65,7 @@ from app.services.routing import (
     post_leg_cancel,
     post_leg_issue,
     post_leg_receive,
+    received_purity,
     agreed_wastage_pct,
     settle_stones,
     settle_wastage,
@@ -272,6 +273,50 @@ async def _get_inventory(db: DbSession, item_id: int) -> InventoryItem:
 
 
 BROKEN_STONE_LABEL = "Broken / miscellaneous stones"
+
+
+async def _return_pot(db: DbSession, leg: JobLeg) -> InventoryItem:
+    """
+    The pot returned metal belongs in — the one for *its own* purity.
+
+    Metal used to go back into whichever pot it left from, whatever it came
+    back as. A maker handed 100 g of pure gold returns 102 g of 18k, and that
+    18k landed in a pot labelled "24k pure": the pot then claimed 102 fine
+    grams where there were 76.5. Across a few jobs that was 92.7 fine grams the
+    stock report insisted existed — around Rs 9.3 million of gold — while the
+    ledger, which converts at the returned purity, had it right all along.
+
+    It matters beyond the valuation. A melt pot is a physical bucket, and the
+    reconciliation count weighs it: a pot whose label disagrees with its
+    contents makes the count itself meaningless, and issuing "24k" from it
+    later sends a karigar alloy under the name of pure.
+
+    Same get-or-create the purchase path uses, so 18k back from a maker lands
+    in the same 18k pot as 18k bought from a dealer. When the returned purity
+    matches the source pot — the ordinary case, a polish leg or lacquer — the
+    source pot is returned unchanged and nothing new is minted.
+    """
+    source = await _get_inventory(db, leg.gold_source_inventory_id)
+    recv_purity, recv_tunch = received_purity(leg)
+
+    same_karat = recv_purity is not None and source.purity == recv_purity
+    same_tunch = recv_tunch is not None and d(source.tunch_pct) == d(recv_tunch)
+    if (recv_purity is None and recv_tunch is None) or same_karat or same_tunch:
+        return source
+
+    if (leg.metal or Metal.gold) is Metal.silver:
+        fineness = d(recv_tunch) if recv_tunch else None
+        if not fineness:
+            # No fineness on a silver return leaves nothing to key a pot on.
+            # The source pot is the honest fallback: it is where the metal came
+            # from, and inventing a fineness would be worse than not splitting.
+            return source
+        return await purchasing.raw_silver_item(
+            db, tunch_pct=fineness, branch_id=source.branch_id
+        )
+
+    karat = recv_purity or purchasing.karat_from_tunch(recv_tunch)
+    return await purchasing.raw_gold_item(db, purity=karat, branch_id=source.branch_id)
 
 
 async def _broken_stone_item(db: DbSession, leg: JobLeg, *, user) -> InventoryItem:
@@ -1005,9 +1050,11 @@ async def receive_leg(
         )
 
     if net_g > 0 and leg.gold_source_inventory_id is not None:
+        # Into the pot for the purity that actually came back, not the one it
+        # left from — see `_return_pot`.
         await post_movement(
             db,
-            item=await _get_inventory(db, leg.gold_source_inventory_id),
+            item=await _return_pot(db, leg),
             type=MovementType.manufacturing_in,
             weight_g_delta=net_g,
             reference_type="job_leg",

@@ -299,6 +299,15 @@ export const SECTIONS: NavSection[] = [
     roles: ["admin", "accountant"],
     items: [
       {
+        to: "/overview",
+        label: "Business overview",
+        hint: "What the shop is worth, and how it is trading",
+        keywords: [
+          "overview", "net worth", "summary", "owner", "how are we doing",
+          "balance sheet", "capital", "worth", "month", "print", "report",
+        ],
+      },
+      {
         to: "/cash",
         label: "Cash & expenses",
         hint: "Money in and out, and where it went",

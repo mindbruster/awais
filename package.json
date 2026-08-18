@@ -29,6 +29,7 @@
     "migrate": "node scripts/python.js -m alembic upgrade head",
     "check:schema": "node scripts/python.js -m tools.check_schema_drift",
     "check:images": "node scripts/python.js -m tools.check_images",
+    "check:stock": "node scripts/python.js -m tools.check_stock_ledger",
     "seed": "node scripts/python.js -m app.seed",
     "test": "node scripts/python.js -m tests.e2e",
     "test:smoke": "npm run test:smoke:twoperson && npm run test:smoke:branches && npm run test:smoke:orders && npm run test:smoke:risk && npm run test:smoke:notify && npm run test:smoke:approvals && npm run test:smoke:goldbuy && npm run test:smoke:partymetal && npm run test:smoke:trade",

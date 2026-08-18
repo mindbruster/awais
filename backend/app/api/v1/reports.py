@@ -24,7 +24,7 @@ from sqlalchemy.orm import joinedload, selectinload
 
 from app.core import clock
 from app.core.config import settings
-from app.api.deps import DbSession, require_perm
+from app.api.deps import CurrentUser, DbSession, require_perm
 from app.models.account import Account, SystemAccount
 from app.models.currency import Currency
 from app.models.customer import Customer
@@ -53,6 +53,10 @@ from app.schemas.reports import (
     MarginReport,
     MaterialOutsideReport,
     MaterialOutsideRow,
+    NetWorth,
+    OverviewReport,
+    PeriodSummary,
+    WorthLine,
     ProfitCurrencyTotal,
     ProfitReport,
     ProfitRow,
@@ -71,7 +75,9 @@ from app.schemas.reports import (
     WorkerPerformanceReport,
     WorkerPerformanceRow,
 )
-from app.services import ledger, margin
+from app.api.v1.cash import cash_flow
+from app.api.v1.ledger import position as position_report
+from app.services import ledger, margin, purchasing
 from app.services.gold_rate import fine_rate_per_g, rate_in_force
 from app.services.ledger import fine_grams
 
@@ -2262,4 +2268,189 @@ async def material_outside(db: DbSession) -> MaterialOutsideReport:
         total_silver_g=sum((r.silver_g for r in out), _ZERO),
         total_stone_ct=sum((r.stone_ct for r in out), _ZERO),
         parties=len(out),
+    )
+
+
+def _window_before(start: date, end: date) -> tuple[date, date]:
+    """
+    The equal stretch immediately before this one.
+
+    Equal in *days*, not in calendar months. Comparing a 31-day August against
+    a 28-day February would make February look like a collapse, and the shop
+    would go looking for a problem that was a calendar.
+    """
+    span = (end - start).days
+    prev_end = start - timedelta(days=1)
+    return prev_end - timedelta(days=span), prev_end
+
+
+async def _trading(
+    db: DbSession, *, label: str, start: date, end: date, basis: ProfitBasis
+) -> tuple[PeriodSummary, list[str]]:
+    """One period's trading, from the same report the Profit screen reads."""
+    split = await profit_split_report(
+        db, date_from=start, date_to=end, currency=Currency.PKR, basis=basis, format="json"
+    )
+    flow = await cash_flow(db, date_from=start, date_to=end, format="json")
+
+    # Money out of the drawer and the bank together. Not the same as "expenses"
+    # in the accounting sense — it includes suppliers paid and wages, which are
+    # cash leaving whether or not they are a cost of this period — and the page
+    # says so rather than labelling it profit.
+    expenses = _d(flow.money_out)
+    margin = _d(split.gross_margin)
+    return (
+        PeriodSummary(
+            label=label,
+            date_from=start,
+            date_to=end,
+            invoices=split.lines,
+            sales=_d(split.revenue),
+            cost_of_goods=_d(split.cost),
+            gross_margin=margin,
+            margin_pct=_pct(margin, _d(split.revenue)) if _d(split.revenue) else None,
+            expenses=expenses,
+            net=(margin - expenses).quantize(_PKR),
+            cash_opened=(_d(flow.opening_cash) + _d(flow.opening_bank)).quantize(_PKR),
+            cash_closed=(_d(flow.closing_cash) + _d(flow.closing_bank)).quantize(_PKR),
+        ),
+        list(split.assumptions),
+    )
+
+
+@router.get(
+    "/overview",
+    response_model=OverviewReport,
+    dependencies=[Depends(require_perm("report:profit"))],
+)
+async def business_overview(
+    db: DbSession,
+    current: CurrentUser,
+    date_from: date | None = Query(default=None),
+    date_to: date | None = Query(default=None),
+    basis: ProfitBasis | None = Query(default=None),
+):
+    """
+    The whole business on one page: what it is worth, and how it is trading.
+
+    **Every figure is fetched from the screen that owns it** — stock values from
+    the stock position, trading from the profit split, cash from the cash flow —
+    rather than re-derived here. A second definition of net worth is a second
+    thing to disagree with the first, and this page exists to be the one a
+    partner is shown.
+
+    It is also only honest because the shelves and the books now agree. Until
+    the four write paths that moved stock without the ledger were closed, the
+    metal line alone could have been out by a hundred and twenty million rupees
+    depending on which table it read.
+
+    **Worth and trading are never added together.** A shop can trade flat and be
+    materially richer because the rate moved, or trade well and be poorer.
+    Adding them produces a number that answers neither question.
+    """
+    chosen = basis or ProfitBasis(settings.default_profit_basis)
+    today = clock.today()
+    end = date_to or today
+    start = date_from or end.replace(day=1)
+
+    stock = await stock_position(db)
+    pos = await position_report(db)
+
+    owned: list[WorthLine] = [
+        WorthLine(key="cash", label="Cash in hand", amount=_d(pos.cash_in_hand), to="/cash"),
+        WorthLine(
+            key="bank",
+            label="Bank",
+            amount=await ledger.balance_pkr(db, account_code=SystemAccount.BANK.value),
+            to="/cash",
+        ),
+    ]
+    for m in stock.metals:
+        owned.append(
+            WorthLine(
+                key=m.metal.value,
+                label=f"{m.metal.value.title()} in hand",
+                amount=_d(m.value) if m.value is not None else _ZERO,
+                detail=f"{m.fine_weight_g} fine g"
+                + ("" if m.value is not None else " — no rate on record"),
+                to="/stock",
+            )
+        )
+    owned.append(
+        WorthLine(
+            key="stones",
+            label="Stones at cost",
+            amount=_d(stock.stone_value),
+            detail=f"{stock.stone_weight_ct} ct",
+            to="/purchasing/stone-stock",
+        )
+    )
+    owned.append(
+        WorthLine(
+            key="finished",
+            label="Finished pieces at cost",
+            amount=_d(stock.finished_value),
+            detail=f"{stock.finished_pieces} piece(s)",
+            to="/products",
+        )
+    )
+    owned.append(
+        WorthLine(
+            key="receivable",
+            label="Owed to us by customers",
+            amount=_d(pos.customer_receivable),
+            to="/customers",
+        )
+    )
+
+    # Payables are held as positive numbers on the position report — the shop
+    # reads them as "what we owe" — so they are negated here to sit in a column
+    # that sums.
+    owed: list[WorthLine] = [
+        WorthLine(
+            key="suppliers",
+            label="Owed to dealers",
+            amount=-_d(pos.supplier_payable),
+            to="/purchasing/bills",
+        ),
+        WorthLine(
+            key="workers",
+            label="Owed to workers",
+            amount=-_d(pos.worker_payable),
+            to="/material-outside",
+        ),
+    ]
+
+    total_owned = sum((l.amount for l in owned), _ZERO).quantize(_PKR)
+    total_owed = sum((l.amount for l in owed), _ZERO).quantize(_PKR)
+
+    period, assumptions = await _trading(
+        db, label="This period", start=start, end=end, basis=chosen
+    )
+    p_start, p_end = _window_before(start, end)
+    previous, _ = await _trading(
+        db, label="Previous", start=p_start, end=p_end, basis=chosen
+    )
+
+    bills = await purchasing.supplier_bills(db)
+    overdue = [b for b in bills if b.status is purchasing.BillStatus.overdue]
+
+    return OverviewReport(
+        as_of=today,
+        worth=NetWorth(
+            as_of=today,
+            owned=owned,
+            owed=owed,
+            total_owned=total_owned,
+            total_owed=total_owed,
+            net_worth=(total_owned + total_owed).quantize(_PKR),
+            unpriced=list(stock.unpriced_metals),
+        ),
+        period=period,
+        previous=previous,
+        metal_outside_g=_d(pos.gold_with_workers_g),
+        overdue_bills=len(overdue),
+        overdue_bill_amount=sum((b.outstanding for b in overdue), _ZERO).quantize(_PKR),
+        basis=chosen.value,
+        assumptions=assumptions,
     )

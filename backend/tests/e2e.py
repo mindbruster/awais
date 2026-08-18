@@ -224,18 +224,46 @@ def main() -> int:
         and all(v["department_id"] == depts_by_code["SET"] for v in r.json()),
     )
 
+    def open_pot(body, *, weight_g="0", weight_ct="0", quantity=0,
+                 rate_per_g=None, value=None):
+        """
+        Create a pot and record what it held when the books opened.
+
+        Two calls, because that is now the only honest way in: `POST /inventory`
+        opens an empty container and `POST /inventory/{id}/opening` puts a
+        quantity in it *and* the matching value into 3200 Opening Balance
+        Equity. Setting a weight on the create used to work and posted nothing,
+        which is how the shelves and the books drifted 1,195 fine grams apart.
+        """
+        pot = client.post("/inventory", headers=auth, json=body)
+        assert pot.status_code == 201, f"pot create failed: {pot.status_code} {pot.text[:200]}"
+        pot = pot.json()
+        payload = {"weight_g": weight_g, "weight_ct": weight_ct, "quantity": quantity}
+        if rate_per_g is not None:
+            payload["rate_per_g"] = rate_per_g
+        if value is not None:
+            payload["value"] = value
+        # Its own confirm header rather than the module-level `pwd_h`, which is
+        # not bound until later in the file — a closure that reads it here would
+        # fail on the first pot with a name error, not a useful message.
+        r = client.post(
+            f"/inventory/{pot['id']}/opening",
+            headers={**auth, "X-Confirm-Password": "admin123"},
+            json=payload,
+        )
+        assert r.status_code == 201, f"opening failed: {r.status_code} {r.text[:250]}"
+        return r.json()
+
     # ----- INVENTORY (raw) -----
     section("Inventory (raw)")
-    raw_gold = client.post(
-        "/inventory",
-        headers=auth,
-        json={"type": "raw_gold", "label": "22k bullion", "weight_g": "500", "purity": 22, "location": "vault"},
-    ).json()
-    raw_stones = client.post(
-        "/inventory",
-        headers=auth,
-        json={"type": "raw_stone", "label": "diamonds VS1", "weight_ct": "20"},
-    ).json()
+    raw_gold = open_pot(
+        {"type": "raw_gold", "label": "22k bullion", "purity": 22, "location": "vault"},
+        weight_g="500", rate_per_g="30000",
+    )
+    raw_stones = open_pot(
+        {"type": "raw_stone", "label": "diamonds VS1"},
+        weight_ct="20", value="80000",
+    )
     check("raw gold created (500g)", Decimal(str(raw_gold["weight_g"])) == Decimal("500"))
     check("raw stones created (20ct)", Decimal(str(raw_stones["weight_ct"])) == Decimal("20"))
 
@@ -286,6 +314,10 @@ def main() -> int:
     )
     check("stock movement without password → 401", r.status_code == 401)
 
+    # Metal can no longer be adjusted straight onto the shelf. This was the
+    # last of four doors that moved stock without the books hearing: it wrote
+    # the pot and nothing else, so 1130 and the pot disagreed immediately with
+    # neither able to say which was right.
     r = client.post(
         "/stock-movements",
         headers=pwd_h,
@@ -296,23 +328,47 @@ def main() -> int:
             "notes": "weighing correction",
         },
     )
-    check("adjustment posted (with password)", r.status_code == 201, str(r.status_code))
-
-    # Verify snapshot updated to 498.5
+    check(
+        "a direct metal adjustment is refused → 409",
+        r.status_code == 409,
+        f"got {r.status_code}: {r.text[:160]}",
+    )
+    check(
+        "and it says where to do it properly",
+        "reconciliation" in r.text.lower() or "count" in r.text.lower(),
+        r.text[:160],
+    )
     r = client.get(f"/inventory/{raw_gold['id']}", headers=auth)
     check(
-        "raw gold snapshot decremented",
-        Decimal(str(r.json()["weight_g"])) == Decimal("498.5"),
-        f"got {r.json()['weight_g']}",
+        "the pot is untouched by the refusal",
+        Decimal(str(r.json()["weight_g"])) == Decimal("500"),
+        f"got {r.json()['weight_g']} — a refused adjustment must not half-apply",
     )
 
-    # Underflow guard
+    # Stones keep the direct path: their inventory is carried in money at cost
+    # and a carat adjustment moves no metal control account.
     r = client.post(
         "/stock-movements",
         headers=pwd_h,
-        json={"inventory_item_id": raw_gold["id"], "type": "adjustment", "weight_g_delta": "-100000"},
+        json={
+            "inventory_item_id": raw_stones["id"],
+            "type": "adjustment",
+            "weight_ct_delta": "-1",
+            "notes": "recount",
+        },
     )
-    check("underflow rejected → 400", r.status_code == 400)
+    check("a stone adjustment still posts → 201", r.status_code == 201,
+          f"got {r.status_code}: {r.text[:160]}")
+    check(
+        "underflow is still refused → 400",
+        client.post(
+            "/stock-movements",
+            headers=pwd_h,
+            json={"inventory_item_id": raw_stones["id"], "type": "adjustment",
+                  "weight_ct_delta": "-100000"},
+        ).status_code == 400,
+        "a pot cannot hold less than nothing",
+    )
 
     # ----- THE RETIRED MANUFACTURING MODULE -----
     section("Retired manufacturing module")
@@ -342,14 +398,12 @@ def main() -> int:
     })
     check("create a finished piece → 201", fp.status_code == 201, f"got {fp.status_code}")
     finished_product_id = fp.json()["id"]
-    r = client.post("/inventory", headers=auth, json={
-        "type": "finished_product", "label": "Finished Test Ring",
-        "location": "showroom", "quantity": 1,
-        "weight_g": "9.6", "weight_ct": "1.8", "purity": 22,
-        "product_id": finished_product_id,
-    })
-    check("stock it as finished goods → 201", r.status_code == 201, f"got {r.status_code}")
-    finished_inv = r.json()
+    finished_inv = open_pot(
+        {"type": "finished_product", "label": "Finished Test Ring",
+         "location": "showroom", "purity": 22, "product_id": finished_product_id},
+        weight_g="9.6", weight_ct="1.8", quantity=1, value="120000",
+    )
+    check("stock it as finished goods → 201", bool(finished_inv.get("id")), str(finished_inv)[:120])
     check(
         "finished-goods inventory carries the piece's weights",
         finished_inv["quantity"] == 1
@@ -469,10 +523,11 @@ def main() -> int:
     p2_id = client.post("/products", headers=auth, json={
         "name": "Ring 2", "category": "ring", "gold_weight_g": "7.9", "gold_purity": 22,
     }).json()["id"]
-    p2_inv = client.post("/inventory", headers=auth, json={
-        "type": "finished_product", "label": "Ring 2", "location": "showroom",
-        "quantity": 1, "weight_g": "7.9", "purity": 22, "product_id": p2_id,
-    }).json()
+    p2_inv = open_pot(
+        {"type": "finished_product", "label": "Ring 2", "location": "showroom",
+         "purity": 22, "product_id": p2_id},
+        weight_g="7.9", quantity=1, value="95000",
+    )
     check("ring 2 inventory has qty 1", p2_inv.get("quantity") == 1, str(p2_inv)[:120])
 
     inv2 = client.post("/invoices", headers=auth, json={
@@ -1072,10 +1127,11 @@ def main() -> int:
         "name": "Issue Weight Ring", "category": "ring",
         "gold_weight_g": "8", "gold_purity": 22,
     }).json()["id"]
-    client.post("/inventory", headers=auth, json={
-        "type": "finished_product", "label": "Issue Weight Ring", "location": "showroom",
-        "quantity": 1, "weight_g": "8", "purity": 22, "product_id": d7_prod_id,
-    })
+    open_pot(
+        {"type": "finished_product", "label": "Issue Weight Ring", "location": "showroom",
+         "purity": 22, "product_id": d7_prod_id},
+        weight_g="8", quantity=1, value="96000",
+    )
 
     # Bill a wildly different weight than the piece actually carries. Previously
     # this either drifted the snapshot or tripped the negative-stock guard.
@@ -1395,6 +1451,13 @@ def main() -> int:
     cash_before = Decimal(
         str(client.get("/ledger/position", headers=auth).json()["cash_in_hand"])
     )
+    # The metal is a delta for the same reason, and now more so: opening stock
+    # posts into 1130 as well, so "gold in hand" is no longer only what this
+    # section bought. Before that path existed the pots held metal the ledger
+    # had never heard of — the whole reason it exists.
+    gold_before_buy = Decimal(
+        str(client.get("/ledger/position", headers=auth).json()["gold_in_hand_g"])
+    )
 
     # Capital injection: 500,000 cash in, against capital.
     r = client.post(
@@ -1481,8 +1544,10 @@ def main() -> int:
     )
     check(
         "gold in hand carried in fine grams",
-        Decimal(str(pos["gold_in_hand_g"])) == Decimal("91.6667"),
-        f"got {pos['gold_in_hand_g']}",
+        Decimal(str(pos["gold_in_hand_g"])) - gold_before_buy == Decimal("91.6667"),
+        f"moved {Decimal(str(pos['gold_in_hand_g'])) - gold_before_buy}, expected 91.6667 "
+        "— 100g of 22k is 91.6667 fine, and booking the gross would overstate the "
+        "shop's metal by the alloy",
     )
 
     # --- statement: opening balance, running balance, closing ---
@@ -2208,12 +2273,11 @@ def main() -> int:
     # 100.8375g and leaves the shop owing him 0.8375g on a job that came out
     # square. The client confirmed the alloy reading, so it is asserted here.
     make_dept_id = next(d_["id"] for d_ in depts if d_["code"] == "MAKE")
-    pure_gold = client.post(
-        "/inventory",
-        headers=auth,
-        json={"type": "raw_gold", "label": "24k pure for maker", "weight_g": "500",
-              "purity": 24, "location": "vault"},
-    ).json()
+    pure_gold = open_pot(
+        {"type": "raw_gold", "label": "24k pure for maker",
+         "purity": 24, "location": "vault"},
+        weight_g="500", rate_per_g="30000",
+    )
     maker_design = client.post("/designs", headers=auth, json={"item_id": taka_id}).json()
     r = client.post(
         f"/designs/{maker_design['id']}/legs",
@@ -2680,12 +2744,14 @@ def main() -> int:
     check("a stone can carry a selling rate apart from its cost → 201",
           setting_stone.status_code == 201, f"got {setting_stone.status_code}: {setting_stone.text[:200]}")
     setting_stone_id = setting_stone.json()["id"]
-    set_stock = client.post("/inventory", headers=auth, json={
-        "type": "raw_stone", "label": "12 PTR parcel", "weight_ct": "100",
-    }).json()
-    piece_gold = client.post("/inventory", headers=auth, json={
-        "type": "raw_gold", "label": "21k for setting", "weight_g": "300", "purity": 21,
-    }).json()
+    set_stock = open_pot(
+        {"type": "raw_stone", "label": "12 PTR parcel"},
+        weight_ct="100", value="400000",
+    )
+    piece_gold = open_pot(
+        {"type": "raw_gold", "label": "21k for setting", "purity": 21},
+        weight_g="300", rate_per_g="30000",
+    )
 
     full_design = client.post("/designs", headers=auth, json={"item_id": taka_id}).json()
     r = client.post(
@@ -2807,9 +2873,10 @@ def main() -> int:
     norate_stone = client.post("/stones", headers=auth, json={
         "name": "Unpriced chips", "kind": "diamond", "category": "diamond",
     }).json()
-    norate_stock = client.post("/inventory", headers=auth, json={
-        "type": "raw_stone", "label": "unpriced chips packet", "weight_ct": "50",
-    }).json()
+    norate_stock = open_pot(
+        {"type": "raw_stone", "label": "unpriced chips packet"},
+        weight_ct="50", value="150000",
+    )
     nr_design = client.post("/designs", headers=auth, json={"item_id": taka_id}).json()
     nr_leg = client.post(
         f"/designs/{nr_design['id']}/legs",
@@ -2912,13 +2979,13 @@ def main() -> int:
     check("the silver rate is fetched apart from the gold rate", r.status_code == 200,
           f"got {r.status_code}: {r.text[:200]}")
 
-    silver_stock = client.post("/inventory", headers=auth, json={
-        "type": "raw_silver", "label": "999 silver bullion", "weight_g": "5000",
-        "tunch_pct": "99.9",
-    })
-    check("silver has its own stock category → 201", silver_stock.status_code == 201,
-          f"got {silver_stock.status_code}: {silver_stock.text[:200]}")
-    silver_stock = silver_stock.json()
+    silver_stock_row = open_pot(
+        {"type": "raw_silver", "label": "999 silver bullion", "tunch_pct": "99.9"},
+        weight_g="5000", rate_per_g="340",
+    )
+    check("silver has its own stock category", silver_stock_row["type"] == "raw_silver",
+          str(silver_stock_row)[:160])
+    silver_stock = silver_stock_row
 
     silver_design = client.post("/designs", headers=auth, json={"item_id": taka_id}).json()
     r = client.post(
@@ -4803,6 +4870,96 @@ def main() -> int:
           client.get("/products/999999/timeline", headers=auth).status_code == 404)
 
     # ----------------------------------------------------------------------
+    # The business overview
+    #
+    # One page a partner gets shown, so the thing to hold is that it never
+    # invents a number: every figure is fetched from the screen that owns it.
+    # A second definition of net worth is a second thing to disagree with the
+    # first, and this is the page where that would be noticed last.
+    # ----------------------------------------------------------------------
+    section("Business overview")
+    r = client.get("/reports/overview", headers=auth)
+    check("overview → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:220]}")
+    ov = r.json()
+    w = ov["worth"]
+
+    check(
+        "net worth is what is owned less what is owed",
+        abs(Decimal(str(w["net_worth"]))
+            - (Decimal(str(w["total_owned"])) + Decimal(str(w["total_owed"]))))
+        <= Decimal("0.01"),
+        f"{w['net_worth']} against {w['total_owned']} + {w['total_owed']}",
+    )
+    check(
+        "what is owed is carried negative, so the column sums",
+        all(Decimal(str(l["amount"])) <= 0 for l in w["owed"]),
+        str([(l["label"], l["amount"]) for l in w["owed"]]),
+    )
+    check(
+        "every line says where to go and read it",
+        all(l["to"] for l in w["owned"] + w["owed"]),
+        str([l["label"] for l in w["owned"] + w["owed"] if not l["to"]]),
+    )
+
+    # The figures must be the ones the owning screens report, not a second
+    # derivation that happens to look similar.
+    stock = client.get("/reports/stock-position", headers=auth).json()
+    pos = client.get("/ledger/position", headers=auth).json()
+    gold_line = next(l for l in w["owned"] if l["key"] == "gold")
+    check(
+        "the gold value is the stock position's, not a re-derivation",
+        Decimal(str(gold_line["amount"]))
+        == Decimal(str(next(m["value"] for m in stock["metals"] if m["metal"] == "gold"))),
+        f"overview {gold_line['amount']} vs stock position",
+    )
+    check(
+        "the cash figure is the position report's",
+        Decimal(str(next(l["amount"] for l in w["owned"] if l["key"] == "cash")))
+        == Decimal(str(pos["cash_in_hand"])),
+        "two readings of the shop's cash is one too many",
+    )
+    check(
+        "what customers owe comes from the same place too",
+        Decimal(str(next(l["amount"] for l in w["owned"] if l["key"] == "receivable")))
+        == Decimal(str(pos["customer_receivable"])),
+        "a receivable that differs between two screens is unusable on both",
+    )
+
+    split = client.get("/reports/profit-split", headers=auth,
+                       params={"date_from": ov["period"]["date_from"],
+                               "date_to": ov["period"]["date_to"]}).json()
+    check(
+        "the trading figures are the profit split's",
+        Decimal(str(ov["period"]["sales"])) == Decimal(str(split["revenue"]))
+        and Decimal(str(ov["period"]["gross_margin"])) == Decimal(str(split["gross_margin"])),
+        f"overview {ov['period']['sales']}/{ov['period']['gross_margin']} vs "
+        f"split {split['revenue']}/{split['gross_margin']}",
+    )
+    check(
+        "and it says what basis they were struck on",
+        ov["basis"] in ("cost", "replacement") and len(ov["assumptions"]) > 0,
+        f"basis {ov.get('basis')}, {len(ov.get('assumptions', []))} assumptions",
+    )
+
+    check(
+        "the comparison period is the equal stretch immediately before",
+        ov["previous"] and ov["previous"]["date_to"] < ov["period"]["date_from"],
+        str(ov.get("previous", {}).get("date_to")),
+    )
+    prev, cur = ov["previous"], ov["period"]
+    check(
+        "and it is equal in days, so a short month is not read as a collapse",
+        (date.fromisoformat(cur["date_to"]) - date.fromisoformat(cur["date_from"])).days
+        == (date.fromisoformat(prev["date_to"]) - date.fromisoformat(prev["date_from"])).days,
+        f"{cur['date_from']}..{cur['date_to']} vs {prev['date_from']}..{prev['date_to']}",
+    )
+    check(
+        "worth and trading are never added together",
+        "net_worth" not in ov["period"] and "sales" not in w,
+        "one number covering both answers neither question",
+    )
+
+    # ----------------------------------------------------------------------
     # Profit: two bases, and what each one assumes
     #
     # The shop never wrote its profit formulas down, so a conventional method
@@ -5259,9 +5416,10 @@ def main() -> int:
 
     # More on the shelf than the two parcels account for, which is the ordinary
     # case: a shop's opening stock predates every bill the system has seen.
-    fifo_stock = client.post("/inventory", headers=auth, json={
-        "type": "raw_stone", "label": "FIFO 10 PTR parcel", "weight_ct": "200",
-    }).json()
+    fifo_stock = open_pot(
+        {"type": "raw_stone", "label": "FIFO 10 PTR parcel"},
+        weight_ct="200", value="600000",
+    )
 
     def issue_fifo(carats: str) -> dict:
         dsn = client.post("/designs", headers=auth, json={"item_id": taka_id}).json()

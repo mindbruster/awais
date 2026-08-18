@@ -71,7 +71,7 @@ two bills discount different things.
 | Manual bank / cash entry for receipts and expenses | **done** | `method` is cash or bank; a bank entry must name its account and a cash one must not. Receipts that are not customer settlements post to the new **4400 Other Income**. |
 | Daily cash report / money flow | **done** | `GET /cash/flow`, defaulting to today. Reads the **journal**, not the cash-entry table, so bills settled, suppliers paid, wages and the till float appear side by side. Opening + net = closing is asserted. |
 | Reports for every cash flow | **done** | Same endpoint with `date_from` / `date_to`, grouped by ledger head. |
-| Business overview | **partial** | `/dashboard` and `/ledger/position` exist. "Complete" needs scoping — see open question 2. |
+| Business overview | **done** | `/overview` — net worth, the period against the one before, and a printable sheet. See 4l. |
 
 Still to build on the cash book: a **screen** for it (all of the above is API-only),
 and a CSV export to match every other report.
@@ -97,6 +97,84 @@ and a CSV export to match every other report.
 | Vendor bills and due dates | **exists** | `due_date` on bullion and stone bills; `/purchasing/bills` ages them. See 4b. |
 | Add new vendor | **exists** | |
 | Every cash flow with a vendor | **exists** | Bills, payments and the running balance, all on `/purchasing/bills`. |
+
+---
+
+## 4l · The business overview — **done**
+
+The last open question in this document, and it needed the shop to answer it:
+all three of what it is worth, how the month went, and a page to print.
+
+- **Worth** — cash, bank, metal at today's rate, stones and finished pieces at
+  cost, plus what customers owe, less what dealers and workers are owed. Every
+  line clicks through to the screen behind it.
+- **Trading** — the period against the equal stretch immediately before it.
+  Equal in *days*, not calendar months: comparing a 31-day August with a 28-day
+  February makes February look like a collapse that was really a calendar.
+- **Print** — the whole thing as one sheet, blocks kept whole across page
+  breaks, links stripped of their colour because paper has nowhere to click.
+
+Three rules:
+
+- **Nothing is re-derived.** Stock values come from the stock position, trading
+  from the profit split, cash from the cash flow — by calling those functions,
+  not by writing the query again. A second definition of net worth is a second
+  thing to disagree, and this is the page where it would be noticed last. The
+  e2e asserts each figure equals the owning screen's.
+- **Worth and trading are never added.** A shop can trade flat and be richer
+  because the rate moved, or trade well and be poorer. One number covering both
+  answers neither.
+- **Exceptions lead.** Overdue bills and metal outside the building sit above
+  the net-worth figure. A beautiful total does not matter if fifty grams are
+  unaccounted for at a setter.
+
+`money out` is named as what it is — everything that left the drawer and the
+bank, wages and suppliers included — so the last line is called *margin less
+money out* rather than profit, which it is not.
+
+This page is only honest because of 4k. Until the four write paths that moved
+stock without the ledger were closed, the metal line alone could have been out
+by about Rs 120 million depending on which table it read.
+
+---
+
+## 4k · Closing the doors between the shelf and the books — **done**
+
+Found while building the business overview: **the stock records and the ledger
+disagreed by 1,195 fine grams of gold** and 4,995 of silver. A net-worth figure
+would have differed by about Rs 120 million depending on which table it read.
+
+Four separate paths moved stock without the books hearing about it:
+
+| Door | What it did | Now |
+|---|---|---|
+| `PATCH /inventory/{id}` | `weight_g` was settable, wrote straight to the row, posted nothing | weight removed from the schema |
+| `POST /inventory` | same, on creation | creates an empty **container** only |
+| Returned metal | went back into the pot it *left from*, whatever purity came back | routed to the pot for its own purity |
+| `POST /stock-movements` | adjusted a melt pot with no journal entry | metal refused, pointed at Reconciliation |
+
+The third was the real correctness bug and the most expensive. A maker handed
+100 g of pure gold returns 102 g of 18k, and that 18k landed in a pot labelled
+"24k pure": the pot then claimed 102 fine grams where there were 76.5. Across
+the test data, **92.725 fine grams overstated** — roughly Rs 9.3 million of gold
+the stock report insisted existed. The ledger had it right all along; only the
+pot was wrong, which matters most because the pot is what a stock count weighs.
+
+Three of the four nearly cancelled each other, which is why the total looked
+almost clean at −0.3166 g. That is the argument for the invariant check rather
+than eyeballing a total.
+
+**The legitimate way in** is `POST /inventory/{id}/opening` — go-live stock,
+posting the metal into 1130 and its value into 3200 Opening Balance Equity, once
+per pot, behind a password. A second opening balance is a correction, and
+corrections are counts.
+
+**`tools/check_stock_ledger.py`** (`npm run check:stock`, and in CI after the
+e2e) compares every melt pot against its control account, converting pot by pot
+at each pot's own purity. It **attributes** rather than just failing: a manual
+voucher can legitimately move a metal account without touching a pot — that is
+how an accountant corrects the books — so those grams are named and subtracted,
+and only what is left over is called unexplained.
 
 ---
 
@@ -526,8 +604,9 @@ consumed. This is a presentation of data the system already holds.
 
 1. **Invoice type 2** — is the second column layout the loose-materials bill?
    (See 1.2.)
-2. **"Business overview complete"** — what is missing from the dashboard as it
-   stands? Easier to answer against the screen than in the abstract.
+2. ~~**"Business overview complete"**~~ — answered. The shop wanted all three:
+   what the business is worth today, how the month went against the last, and
+   one page to print. Built as `/overview`.
 3. **Gold revaluation** — reported, or posted to the ledger? (See 7.)
 4. **Live rate source** — which feed, quoted in what unit? (See 8.)
 5. **Targets** — are company, customer and salesman targets in money, in

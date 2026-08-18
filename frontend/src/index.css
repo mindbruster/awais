@@ -51,6 +51,21 @@
   /* Last-resort guard for a figure longer than anything anticipated: wrap it
      inside its own cell rather than let it cross the border. */
   .print-doc table td, .print-doc table th { overflow-wrap: anywhere; }
+  /* --- the owner's summary ---------------------------------------------
+     The business overview prints as a handout for a partner or an accountant,
+     so it loses the app furniture and keeps its blocks whole. A net-worth
+     table split across a page break is one somebody misreads. */
+  .print-block {
+    break-inside: avoid;
+    page-break-inside: avoid;
+    box-shadow: none !important;
+    border: 1px solid #cbd5e1 !important;
+    margin-bottom: 10mm;
+  }
+  /* Links are navigation on screen and noise on paper — a printed sheet has
+     nowhere to click, and blue underlined text reads as emphasis nobody meant. */
+  .print-block a { color: inherit !important; text-decoration: none !important; }
+
   /* The photograph carries the row height. At screen size four lines would run
      off the bottom of the sheet. */
   .print-doc table td img { max-height: 22mm !important; }
