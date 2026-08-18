@@ -5019,40 +5019,32 @@ def main() -> int:
         "it would leave their accounts pointing at nothing",
     )
 
-    # --- the roles the specification asked for --------------------------
-    expected = {"manager", "inventory_manager", "sales_manager",
-                "salesman", "maker_manager", "viewer"}
+    # --- the four roles this shop keeps ---------------------------------
+    # Nine were seeded to start with, because the specification listed nine.
+    # The shop wanted four. Asserting the *exact* set rather than a subset is
+    # the point: a role nobody asked for is a door nobody is watching, and the
+    # next person to add one should have to say so here.
     check(
-        "the roles §11 asks for are seeded",
-        expected <= set(roles),
-        f"missing {sorted(expected - set(roles))}",
+        "exactly four roles are seeded, and no more",
+        set(roles) == {"superadmin", "admin", "accountant", "staff"},
+        f"got {sorted(roles)}",
     )
     check(
-        "they are editable, not system roles",
-        all(not roles[n]["is_system"] for n in expected),
-        "the shop is meant to rename and re-scope these; marking them system "
-        "would stop it",
+        "all four are system roles and cannot be renamed or deleted",
+        all(roles[n]["is_system"] for n in roles),
+        str({n: roles[n]["is_system"] for n in roles}),
     )
     check(
-        "each holds something, and none holds everything",
-        all(0 < len(roles[n]["permissions"]) < len(cat) for n in expected),
-        str({n: len(roles[n]["permissions"]) for n in expected}),
+        "staff holds something, and not everything",
+        0 < len(roles["staff"]["permissions"]) < len(cat),
+        f"staff holds {len(roles['staff']['permissions'])} of {len(cat)}",
     )
-    # The safe direction for a guess is narrow. These are starting points the
-    # shop will adjust, and a default that quietly handed a salesman the ledger
-    # would be discovered long after it mattered.
     for sensitive in ("ledger:read", "audit:read", "report:profit", "user:manage"):
         check(
-            f"no seeded role reaches {sensitive} by default",
-            all(sensitive not in roles[n]["permissions"] for n in expected),
-            f"{[n for n in expected if sensitive in roles[n]['permissions']]} holds it — "
-            "the owner's information should be granted deliberately, not inherited",
+            f"staff cannot reach {sensitive}",
+            sensitive not in roles["staff"]["permissions"],
+            "the owner's information should not sit behind a day-to-day login",
         )
-    check(
-        "the viewer can read and cannot write",
-        all(p.endswith(":read") for p in roles["viewer"]["permissions"]),
-        str([p for p in roles["viewer"]["permissions"] if not p.endswith(":read")]),
-    )
 
     # --- modules -------------------------------------------------------
     mods = {m["key"]: m for m in client.get("/admin/modules", headers=sa).json()}

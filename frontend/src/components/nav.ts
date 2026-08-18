@@ -478,8 +478,18 @@ export const SECTIONS: NavSection[] = [
   },
 ];
 
-/** The sections and items this role may actually reach. */
+/**
+ * The sections and items this role may actually reach.
+ *
+ * The super admin is exempt from every gate below, and has to be: it holds the
+ * whole permission catalogue, so there is no link here it would be refused on.
+ * Without this it fell through the `["admin", "accountant"]` gates on Finance
+ * and Settings and lost the sidebar entry for `Modules & roles` — the one
+ * screen only it may open. A role that cannot navigate to its own panel is
+ * indistinguishable from a role that does not exist.
+ */
 export function visibleSections(role: string): NavSection[] {
+  if (role === "superadmin") return SECTIONS;
   return SECTIONS.map((s) => ({
     ...s,
     items: s.items.filter((i) => !i.roles || i.roles.includes(role)),
