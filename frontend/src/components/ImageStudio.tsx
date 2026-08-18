@@ -7,6 +7,7 @@ import { TextArea } from "@/components/Field";
 import { toast } from "@/components/Toast";
 import { apiError } from "@/lib/api-error";
 import { staticUrl } from "@/lib/url";
+import { Img } from "@/components/Img";
 
 /**
  * Draw a proposal for a piece, optionally from photographs of others.
@@ -140,10 +141,13 @@ export function ImageStudio({
 
         {result && (
           <div className="space-y-2 rounded-lg border border-slate-200 p-3">
-            <img
-              src={staticUrl(result.image_url)}
+            <Img
+              src={result.image_url}
               alt="Generated proposal"
+              loading="eager"
               className="aspect-square w-full rounded-md object-cover"
+              fallbackClassName="flex aspect-square w-full items-center justify-center rounded-md bg-slate-100 text-xs text-slate-400"
+              fallback="The drawing could not be loaded"
             />
             <p className="text-xs text-slate-500">
               Drawn by {result.model}

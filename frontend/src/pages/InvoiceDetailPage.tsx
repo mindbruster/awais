@@ -1,6 +1,7 @@
 import { FormEvent, useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api } from "@/api/client";
+import { Img } from "@/components/Img";
 import { Modal } from "@/components/Modal";
 import { SelectField, TextArea, TextField } from "@/components/Field";
 import { PasswordConfirm } from "@/components/PasswordConfirm";
@@ -293,10 +294,17 @@ export function InvoiceDetailPage() {
                     <td className="py-3 pr-3">
                       <div className="flex items-start gap-3">
                         {it.product_image_url ? (
-                          <img
+                          /* Through `staticUrl`, not raw. A bare "/static/..."
+                             resolves against the *frontend* origin, which serves
+                             the SPA shell for any unknown path — so the browser
+                             was handed HTML where it expected a PNG and every
+                             photo on every bill showed as broken. */
+                          <Img
                             src={it.product_image_url}
                             alt={it.product_name ?? it.description}
                             className="h-12 w-12 flex-none rounded object-cover ring-1 ring-slate-200"
+                            fallbackClassName="flex h-12 w-12 flex-none items-center justify-center rounded bg-slate-100 text-[10px] text-slate-400 ring-1 ring-slate-200"
+                            fallback="none"
                           />
                         ) : (
                           <div

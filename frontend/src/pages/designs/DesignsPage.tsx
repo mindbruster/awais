@@ -16,7 +16,7 @@ import { Modal } from "@/components/Modal";
 import { FilterSelect, SearchBox } from "@/components/Toolbar";
 import { toast } from "@/components/Toast";
 import { apiError } from "@/lib/api-error";
-import { staticUrl } from "@/lib/url";
+import { Img } from "@/components/Img";
 import { DESIGN_STATUSES, DesignStatusChip, age } from "@/pages/designs/parts";
 
 interface Design {
@@ -335,23 +335,18 @@ function Thumb({
 }) {
   const box =
     size === "sm" ? "h-9 w-9 text-[9px]" : size === "md" ? "h-12 w-12 text-[10px]" : "h-full w-full";
-  if (url) {
-    return (
-      <img
-        src={staticUrl(url)}
-        alt={label}
-        loading="lazy"
-        className={`${box} flex-none rounded-lg border border-slate-200 object-cover`}
-      />
-    );
-  }
+  // One component for both states: a URL that fails to load falls back to the
+  // same dashed box a piece with no photograph shows, rather than the browser's
+  // torn-page glyph — which reads as "the software is broken", not "this photo
+  // is missing".
   return (
-    <div
-      className={`${box} num flex flex-none items-center justify-center rounded-lg border border-dashed border-slate-200 bg-slate-50 font-medium text-slate-400`}
-      aria-hidden
-    >
-      {label.split("-")[0]}
-    </div>
+    <Img
+      src={url}
+      alt={label}
+      className={`${box} flex-none rounded-lg border border-slate-200 object-cover`}
+      fallbackClassName={`${box} num flex flex-none items-center justify-center rounded-lg border border-dashed border-slate-200 bg-slate-50 font-medium text-slate-400`}
+      fallback={label.split("-")[0]}
+    />
   );
 }
 
@@ -366,11 +361,12 @@ function Gallery({ items }: { items: Design[] }) {
         >
           <div className="aspect-square overflow-hidden bg-slate-50">
             {d.image_url ? (
-              <img
-                src={staticUrl(d.image_url)}
+              <Img
+                src={d.image_url}
                 alt={d.design_no}
-                loading="lazy"
                 className="h-full w-full object-cover transition duration-300 group-hover:scale-[1.03]"
+                fallbackClassName="num flex h-full w-full items-center justify-center text-2xl font-semibold text-slate-200"
+                fallback={d.design_no}
               />
             ) : (
               <div className="num flex h-full w-full items-center justify-center text-2xl font-semibold text-slate-200">

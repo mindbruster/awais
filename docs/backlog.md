@@ -17,7 +17,7 @@ the bottom; none of them block the items that don't depend on them.
 
 The shop writes two different bills and the system has one layout.
 
-### 1.1 Finished product invoice — **partial**
+### 1.1 Finished product invoice — **done**
 
 Columns, in order:
 
@@ -38,7 +38,7 @@ what lets a customer check the box against the paper. `invoice_items` already
 carries `product_image_url` and the e2e suite asserts it reaches the client, so
 the field exists and the layout does not.
 
-### 1.2 Loose materials invoice — **new**
+### 1.2 Loose materials invoice — **done**
 
 Selling stones on their own — no gold, so no gold column and no wastage.
 
@@ -83,9 +83,9 @@ and a CSV export to match every other report.
 | Item | State | Notes |
 |---|---|---|
 | Customer ledger / statements | **exists** | `/ledger/party-statement` and the Statements screen. Worth reviewing against what is wanted rather than rebuilding. |
-| Customers ranked top spend → low | **new** | |
-| Profit margin per customer | **partial** | `/reports/margin` and `/reports/profit` exist but are not cut by customer. |
-| Customer sales targets — by date range, monthly, annually | **new** | Needs a target record per customer per period, and actuals read from invoices. |
+| Customers ranked top spend → low | **exists** | `/reports/customers`, and the Customers tab under Reports. |
+| Profit margin per customer | **exists** | Same report — revenue, cost, margin and margin % per customer. |
+| Customer sales targets — by date range, monthly, annually | **exists** | `SalesTarget` with `scope=customer`; actuals read from invoices, never stored. |
 
 ---
 
@@ -97,6 +97,43 @@ and a CSV export to match every other report.
 | Vendor bills and due dates | **exists** | `due_date` on bullion and stone bills; `/purchasing/bills` ages them. See 4b. |
 | Add new vendor | **exists** | |
 | Every cash flow with a vendor | **exists** | Bills, payments and the running balance, all on `/purchasing/bills`. |
+
+---
+
+## 4j · The two printed bills, and images that never break — **done**
+
+**The loose-materials layout.** The backend has had two invoice kinds for a
+while — a loose bill refuses gold weight and wastage — but the *printed* page
+had one layout for both, with a Gold Weight column on a bill that has no gold
+on it. Now:
+
+| Finished piece | Loose material |
+|---|---|
+| Sr · Product Details · **Gold Weight** · Discount · Diamond CT · Diamond Price · Image | Sr · Product Details · Diamond CT · Diamond Price · **Discount** · Amount |
+
+The discount **moves**, and that is the point of two layouts rather than one
+with blanks: on a piece it is ratti argued against the metal, on a parcel it is
+money off the stone price. The column order says which conversation the bill
+was. No photograph on a parcel either — there is no piece to show, and an empty
+frame prints as a form half filled in.
+
+**Images.** A real bug, found while auditing: the invoice detail screen rendered
+`product_image_url` **raw**, without `staticUrl()`. A bare `/static/...`
+resolves against the *frontend* origin, which serves the SPA shell for any
+unknown path — so the browser was handed `text/html` where it expected a PNG,
+and every product photo on every bill was broken. Confirmed by content type
+before fixing.
+
+All eleven image sites now go through one `<Img>` component that falls back
+instead of showing the browser's torn-page glyph. Two failures are kept
+distinct: *no src* is a piece never photographed and ordinary; *a src that
+404s* is a file that was expected and is gone, so it carries a title on hover.
+`onError` fires once and does not retry — a missing file does not become present
+because the page asked twice.
+
+`tools/check_images.py` (`npm run check:images`) walks every record carrying an
+image and checks the file behind it, reporting missing files **and** orphans on
+disk. Local storage only, and it says so rather than implying it covered S3.
 
 ---
 
@@ -428,7 +465,7 @@ money. Same firm assets, obligations that settle in different units.
 
 ---
 
-## 6 · Company targets — **new**
+## 6 · Company targets — **done**
 
 Company sales target, alongside the per-customer and per-salesman targets
 above. All three want the same shape — a figure, a period, and actuals read
@@ -436,7 +473,7 @@ from the same place — so they should be one mechanism, not three.
 
 ---
 
-## 7 · Profit, two ways — **new**
+## 7 · Profit, two ways — **done** — see 4h
 
 Two separate profit setups, kept apart rather than blended:
 
@@ -456,7 +493,7 @@ this answerable at all.
 
 ---
 
-## 8 · Live metal rates — **new**
+## 8 · Live metal rates — **done**
 
 Fetch gold and silver rates live, shown in **their own tab** — deliberately not
 wired into pricing, which continues to use the rate the shop sets. A live feed
@@ -471,7 +508,7 @@ somewhere to land for both metals.
 
 ---
 
-## 9 · Product photography for marketing — **new**
+## 9 · Product photography for marketing — **done**
 
 A tab of product pictures, its own screen:
 

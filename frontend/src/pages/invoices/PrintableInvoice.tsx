@@ -19,7 +19,7 @@
  * rounding step is worse than no document.
  */
 import { Invoice, InvoiceItem } from "./parts";
-import { staticUrl } from "@/lib/url";
+import { Img } from "@/components/Img";
 
 /**
  * How this shop writes currency on a bill: `Rs. 355,600.00`, `US$ 187.00`.
@@ -110,6 +110,12 @@ export function PrintableInvoice({ invoice, customerName, accountNo }: {
 }) {
   const shop = invoice.letterhead;
   const items = invoice.items;
+  // Which of the shop's two bills this is. The two are not one document with
+  // some columns blank: a parcel of stones has no gold to weigh, no wastage,
+  // and its discount is argued against the stone price rather than in ratti
+  // against the metal. Printing one layout for both would put a Gold Weight
+  // column on a bill that has no gold on it.
+  const loose = invoice.kind === "loose_material";
   const symbol = PRINTED_CURRENCY[invoice.currency] ?? invoice.currency;
 
   // Both weights are totalled. Metal and stones settle differently in this
@@ -133,10 +139,14 @@ export function PrintableInvoice({ invoice, customerName, accountNo }: {
       {/* --- letterhead: mark left, name right --- */}
       <header className="flex items-start justify-between gap-6">
         {shop?.logo_url ? (
-          <img
-            src={staticUrl(shop.logo_url)}
+          /* On paper a missing logo leaves the space blank rather than
+             printing the word "missing" across the top of a customer's bill. */
+          <Img
+            src={shop.logo_url}
             alt=""
+            loading="eager"
             className="h-28 w-28 flex-none object-contain"
+            fallbackClassName="h-28 w-28 flex-none"
           />
         ) : (
           <div className="h-28 w-28 flex-none" />
@@ -180,16 +190,55 @@ export function PrintableInvoice({ invoice, customerName, accountNo }: {
             is two purchases in one line — so many grams of gold at today's
             rate, and so many carats at the agreed rate — and a customer
             checking the bill wants to see the two settled separately. */}
-        <colgroup>
-          <col className="w-[5%]" />
-          <col className="w-[29%]" />
-          <col className="w-[12%]" />
-          <col className="w-[12%]" />
-          <col className="w-[9%]" />
-          <col className="w-[12%]" />
-          <col className="w-[21%]" />
-        </colgroup>
+        {loose ? (
+          /* No gold column and no photograph. A parcel of stones is not a
+             piece: there is nothing to weigh in grams and nothing to show a
+             picture of, and leaving both in blank would print a form that
+             looks half filled in rather than one that fits what was sold. */
+          <colgroup>
+            <col className="w-[6%]" />
+            <col className="w-[40%]" />
+            <col className="w-[12%]" />
+            <col className="w-[14%]" />
+            <col className="w-[12%]" />
+            <col className="w-[16%]" />
+          </colgroup>
+        ) : (
+          <colgroup>
+            <col className="w-[5%]" />
+            <col className="w-[29%]" />
+            <col className="w-[12%]" />
+            <col className="w-[12%]" />
+            <col className="w-[9%]" />
+            <col className="w-[12%]" />
+            <col className="w-[21%]" />
+          </colgroup>
+        )}
         <thead>
+          {loose ? (
+            /* The discount sits *after* the stone price here, and that is the
+               point of having two layouts rather than one with blanks. On a
+               finished piece the discount is argued in ratti against the gold;
+               on a parcel there is no gold to argue against, so it comes off
+               the stone price. The column order says which conversation this
+               bill was. */
+            <tr>
+              <th className={head}>Sr</th>
+              <th className={head}>Product Details</th>
+              <th className={`${head} text-right`}>
+                Diamond
+                <br />
+                CT
+              </th>
+              <th className={`${head} text-right`}>
+                Diamond
+                <br />
+                Price
+              </th>
+              <th className={`${head} text-right`}>Discount</th>
+              <th className={`${head} text-right`}>Amount</th>
+            </tr>
+          ) : (
           <tr>
             <th className={head}>Sr</th>
             <th className={head}>Product Details</th>
@@ -215,6 +264,7 @@ export function PrintableInvoice({ invoice, customerName, accountNo }: {
             </th>
             <th className={`${head} text-center`}>Image</th>
           </tr>
+          )}
         </thead>
         <tbody>
           {items.map((it, i) => {
@@ -253,44 +303,72 @@ export function PrintableInvoice({ invoice, customerName, accountNo }: {
                     </div>
                   )}
                 </td>
-                <td className={`${cell} text-right`}>{weight ? num(weight, 3) : ""}</td>
+                {/* Gold only on a finished piece. */}
+                {!loose && (
+                  <td className={`${cell} text-right`}>{weight ? num(weight, 3) : ""}</td>
+                )}
                 {/* Blank when nothing was given away. A nought here would read
                     as a discount of zero that somebody negotiated, which is a
                     different conversation from one that never happened. */}
-                <td className={`${cell} text-right`}>
-                  {ratti > 0 ? (
-                    <>
-                      <div>
-                        {num(ratti, ratti % 1 ? 2 : 0)}/{it.ratti_base || 96}
-                      </div>
-                      {rattiGrams > 0 && (
-                        <div className="text-[0.85em] text-neutral-600">
-                          −{num(rattiGrams, 3)} g
+                {/* Ratti off the metal on a finished piece; on a parcel the
+                    discount is money off the stone price and moves after it. */}
+                {!loose && (
+                  <td className={`${cell} text-right`}>
+                    {ratti > 0 ? (
+                      <>
+                        <div>
+                          {num(ratti, ratti % 1 ? 2 : 0)}/{it.ratti_base || 96}
                         </div>
-                      )}
-                    </>
-                  ) : (
-                    ""
-                  )}
-                </td>
+                        {rattiGrams > 0 && (
+                          <div className="text-[0.85em] text-neutral-600">
+                            −{num(rattiGrams, 3)} g
+                          </div>
+                        )}
+                      </>
+                    ) : (
+                      ""
+                    )}
+                  </td>
+                )}
                 <td className={`${cell} text-right`}>{ct ? num(ct, 2) : ""}</td>
                 <td className={`${cell} text-right`}>
                   {ct ? num(it.stone_rate_per_ct, 0) : ""}
                 </td>
+                {loose && (
+                  <>
+                    {/* Blank when nothing was given away. A nought would read as
+                        a discount somebody negotiated down to zero, which is a
+                        different conversation from one that never happened. */}
+                    <td className={`${cell} text-right`}>
+                      {Number(it.line_discount || 0) > 0 ? num(it.line_discount, 0) : ""}
+                    </td>
+                    <td className={`${cell} text-right`}>{num(it.line_total, 0)}</td>
+                  </>
+                )}
                 {/* A fixed height, not one that follows the photograph: rows of
                     equal height are what makes the grid readable across a bill
                     of ten pieces, and a portrait shot next to a landscape one
                     would otherwise stagger every row. The column is always
                     here, empty or not — it is part of the form. */}
-                <td className={`${cell} h-40 text-center`}>
-                  {it.product_image_url ? (
-                    <img
-                      src={staticUrl(it.product_image_url)}
-                      alt=""
-                      className="mx-auto max-h-36 object-contain"
-                    />
-                  ) : null}
-                </td>
+                {/* No photograph on a parcel of stones — there is no piece to
+                    show, and an empty frame prints as a form half filled in. */}
+                {!loose && (
+                  <td className={`${cell} h-40 text-center`}>
+                    {it.product_image_url ? (
+                      /* On paper a missing photograph leaves the cell empty
+                         rather than printing a placeholder across a customer's
+                         bill. The row keeps its fixed height either way, so a
+                         bill of ten pieces stays on its grid. */
+                      <Img
+                        src={it.product_image_url}
+                        alt=""
+                        loading="eager"
+                        className="mx-auto max-h-36 object-contain"
+                        fallbackClassName=""
+                      />
+                    ) : null}
+                  </td>
+                )}
               </tr>
             );
           })}

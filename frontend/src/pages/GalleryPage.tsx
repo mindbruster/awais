@@ -15,9 +15,9 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "@/api/client";
+import { Img } from "@/components/Img";
 import { SearchBox, Toolbar } from "@/components/Toolbar";
 import { apiError } from "@/lib/api-error";
-import { staticUrl } from "@/lib/url";
 
 interface Product {
   id: number;
@@ -103,11 +103,12 @@ export function GalleryPage() {
           >
             <div className="aspect-square w-full overflow-hidden bg-slate-100">
               {p.image_url ? (
-                <img
-                  src={staticUrl(p.image_url)}
+                <Img
+                  src={p.image_url}
                   alt={p.name}
-                  loading="lazy"
                   className="h-full w-full object-cover transition group-hover:scale-105"
+                  fallbackClassName="flex h-full w-full items-center justify-center bg-slate-100 text-xs text-slate-400"
+                  fallback="photograph missing"
                 />
               ) : (
                 <div className="flex h-full w-full items-center justify-center text-xs text-slate-400">
