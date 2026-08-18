@@ -53,6 +53,7 @@ import { StoneStockPage } from "@/pages/purchasing/StoneStockPage";
 import { MaterialOutsidePage } from "@/pages/workshop/MaterialOutsidePage";
 import { BillsPage } from "@/pages/purchasing/BillsPage";
 import { ReconciliationPage } from "@/pages/reconciliation/ReconciliationPage";
+import { OverviewPage } from "@/pages/reports/OverviewPage";
 
 function ProtectedRoute() {
   const token = useAuthStore((s) => s.token);
@@ -119,6 +120,7 @@ export const router = createBrowserRouter([
           { path: "/material-outside", element: <MaterialOutsidePage /> },
           { path: "/purchasing/bills", element: <BillsPage /> },
           { path: "/reconciliation", element: <ReconciliationPage /> },
+          { path: "/overview", element: <OverviewPage /> },
           { path: "/purchasing/old-gold", element: <OldGoldPage /> },
           { path: "/purchasing/stones", element: <StonePurchasePage /> },
           { path: "/purchasing/stone-stock", element: <StoneStockPage /> },

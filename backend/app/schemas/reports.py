@@ -506,3 +506,91 @@ class MaterialOutsideReport(BaseModel):
     total_silver_g: Decimal = Decimal("0")
     total_stone_ct: Decimal = Decimal("0")
     parties: int = 0
+
+
+# ---------------------------------------------------------------------------
+# The business, on one page
+# ---------------------------------------------------------------------------
+class WorthLine(BaseModel):
+    """One thing the shop owns or owes, and where to go and read it."""
+
+    key: str
+    label: str
+    # Positive is owned, negative is owed. Signed so the page can sum the
+    # column and get the answer, rather than the reader doing the arithmetic.
+    amount: Decimal = Decimal("0")
+    # The quantity behind the money, in its own unit — "1,272.180 fine g".
+    # Null where there is no quantity, as with cash.
+    detail: str | None = None
+    to: str | None = None
+
+
+class NetWorth(BaseModel):
+    """
+    What the business is worth this morning.
+
+    Assembled by calling the same functions the Stock and Position screens
+    call, not by re-deriving from the tables. A second definition of net worth
+    is a second thing to disagree — and this figure only means anything because
+    the shelves and the books now agree, which they did not until the four
+    write paths that bypassed the ledger were closed.
+    """
+
+    as_of: date
+    owned: list[WorthLine] = []
+    owed: list[WorthLine] = []
+    total_owned: Decimal = Decimal("0")
+    total_owed: Decimal = Decimal("0")
+    net_worth: Decimal = Decimal("0")
+    # Metals held but not valued, because no rate is on record. Named so the
+    # total reads as "everything except these" rather than as complete.
+    unpriced: list[str] = []
+
+
+class PeriodSummary(BaseModel):
+    """How a stretch of trading went."""
+
+    label: str
+    date_from: date | None = None
+    date_to: date | None = None
+    invoices: int = 0
+    sales: Decimal = Decimal("0")
+    cost_of_goods: Decimal = Decimal("0")
+    gross_margin: Decimal = Decimal("0")
+    margin_pct: Decimal | None = None
+    # Everything that left the drawer and the bank in the period — suppliers
+    # paid and wages included, not only what an accountant calls an expense.
+    # Named `money_out` on the cash flow it comes from, and the page repeats
+    # that wording rather than implying these are all costs of the period.
+    expenses: Decimal = Decimal("0")
+    # Margin less money out. A working figure, not a statutory profit: it
+    # subtracts cash that may belong to another period entirely.
+    net: Decimal = Decimal("0")
+    cash_opened: Decimal = Decimal("0")
+    cash_closed: Decimal = Decimal("0")
+
+
+class OverviewReport(BaseModel):
+    """
+    The whole business on one page: what it is worth, and how it is trading.
+
+    Two questions that are routinely confused and answer differently. A shop
+    can have a flat month on the floor and be materially richer because the
+    rate moved, or a good month and be poorer. Neither figure alone says so,
+    which is why both are here and why they are never added together.
+    """
+
+    as_of: date
+    worth: NetWorth
+    period: PeriodSummary
+    previous: PeriodSummary | None = None
+    # What is out of the building and what is late — the two things an owner
+    # checks before anything else on this page.
+    metal_outside_g: Decimal = Decimal("0")
+    overdue_bills: int = 0
+    overdue_bill_amount: Decimal = Decimal("0")
+    open_alerts: int = 0
+    # The profit basis these trading figures were struck on, carried through so
+    # the page can say it rather than implying one.
+    basis: str = "cost"
+    assumptions: list[str] = []

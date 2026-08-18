@@ -4870,6 +4870,96 @@ def main() -> int:
           client.get("/products/999999/timeline", headers=auth).status_code == 404)
 
     # ----------------------------------------------------------------------
+    # The business overview
+    #
+    # One page a partner gets shown, so the thing to hold is that it never
+    # invents a number: every figure is fetched from the screen that owns it.
+    # A second definition of net worth is a second thing to disagree with the
+    # first, and this is the page where that would be noticed last.
+    # ----------------------------------------------------------------------
+    section("Business overview")
+    r = client.get("/reports/overview", headers=auth)
+    check("overview → 200", r.status_code == 200, f"got {r.status_code}: {r.text[:220]}")
+    ov = r.json()
+    w = ov["worth"]
+
+    check(
+        "net worth is what is owned less what is owed",
+        abs(Decimal(str(w["net_worth"]))
+            - (Decimal(str(w["total_owned"])) + Decimal(str(w["total_owed"]))))
+        <= Decimal("0.01"),
+        f"{w['net_worth']} against {w['total_owned']} + {w['total_owed']}",
+    )
+    check(
+        "what is owed is carried negative, so the column sums",
+        all(Decimal(str(l["amount"])) <= 0 for l in w["owed"]),
+        str([(l["label"], l["amount"]) for l in w["owed"]]),
+    )
+    check(
+        "every line says where to go and read it",
+        all(l["to"] for l in w["owned"] + w["owed"]),
+        str([l["label"] for l in w["owned"] + w["owed"] if not l["to"]]),
+    )
+
+    # The figures must be the ones the owning screens report, not a second
+    # derivation that happens to look similar.
+    stock = client.get("/reports/stock-position", headers=auth).json()
+    pos = client.get("/ledger/position", headers=auth).json()
+    gold_line = next(l for l in w["owned"] if l["key"] == "gold")
+    check(
+        "the gold value is the stock position's, not a re-derivation",
+        Decimal(str(gold_line["amount"]))
+        == Decimal(str(next(m["value"] for m in stock["metals"] if m["metal"] == "gold"))),
+        f"overview {gold_line['amount']} vs stock position",
+    )
+    check(
+        "the cash figure is the position report's",
+        Decimal(str(next(l["amount"] for l in w["owned"] if l["key"] == "cash")))
+        == Decimal(str(pos["cash_in_hand"])),
+        "two readings of the shop's cash is one too many",
+    )
+    check(
+        "what customers owe comes from the same place too",
+        Decimal(str(next(l["amount"] for l in w["owned"] if l["key"] == "receivable")))
+        == Decimal(str(pos["customer_receivable"])),
+        "a receivable that differs between two screens is unusable on both",
+    )
+
+    split = client.get("/reports/profit-split", headers=auth,
+                       params={"date_from": ov["period"]["date_from"],
+                               "date_to": ov["period"]["date_to"]}).json()
+    check(
+        "the trading figures are the profit split's",
+        Decimal(str(ov["period"]["sales"])) == Decimal(str(split["revenue"]))
+        and Decimal(str(ov["period"]["gross_margin"])) == Decimal(str(split["gross_margin"])),
+        f"overview {ov['period']['sales']}/{ov['period']['gross_margin']} vs "
+        f"split {split['revenue']}/{split['gross_margin']}",
+    )
+    check(
+        "and it says what basis they were struck on",
+        ov["basis"] in ("cost", "replacement") and len(ov["assumptions"]) > 0,
+        f"basis {ov.get('basis')}, {len(ov.get('assumptions', []))} assumptions",
+    )
+
+    check(
+        "the comparison period is the equal stretch immediately before",
+        ov["previous"] and ov["previous"]["date_to"] < ov["period"]["date_from"],
+        str(ov.get("previous", {}).get("date_to")),
+    )
+    prev, cur = ov["previous"], ov["period"]
+    check(
+        "and it is equal in days, so a short month is not read as a collapse",
+        (date.fromisoformat(cur["date_to"]) - date.fromisoformat(cur["date_from"])).days
+        == (date.fromisoformat(prev["date_to"]) - date.fromisoformat(prev["date_from"])).days,
+        f"{cur['date_from']}..{cur['date_to']} vs {prev['date_from']}..{prev['date_to']}",
+    )
+    check(
+        "worth and trading are never added together",
+        "net_worth" not in ov["period"] and "sales" not in w,
+        "one number covering both answers neither question",
+    )
+
+    # ----------------------------------------------------------------------
     # Profit: two bases, and what each one assumes
     #
     # The shop never wrote its profit formulas down, so a conventional method
