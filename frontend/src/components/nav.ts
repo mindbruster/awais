@@ -46,6 +46,11 @@ export interface NavItem {
 }
 
 export interface NavSection {
+  /**
+   * Also the module key. The sidebar hides a section whose module is switched
+   * off — and the server refuses its endpoints regardless, because a control
+   * that lives only in the sidebar is not a control.
+   */
   id: string;
   label: string;
   /** Shown beside the heading; a shape, not decoration — see `SectionIcon`. */
@@ -445,6 +450,19 @@ export const SECTIONS: NavSection[] = [
         label: "Countries & cities",
         hint: "Address options",
         keywords: ["country", "city", "location", "address"],
+      },
+      {
+        to: "/settings/modules",
+        label: "Modules & roles",
+        hint: "What this shop uses, and what each role may do",
+        // Super admin only. Offering a link that answers 403 is worse than not
+        // offering it — but the page itself explains rather than 404s, because
+        // an admin who lands here deserves to know the tier exists and why.
+        roles: ["superadmin"],
+        keywords: [
+          "module", "feature", "flag", "enable", "disable", "switch off",
+          "rbac", "role", "permission", "access", "who can", "superadmin",
+        ],
       },
       {
         to: "/settings/audit-log",

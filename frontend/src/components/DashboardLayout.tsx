@@ -20,6 +20,7 @@
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
+import { api } from "@/api/client";
 import { useAuthStore } from "@/store/auth";
 import { CommandPalette } from "@/components/CommandPalette";
 import { NavSection, sectionForPath, visibleSections } from "@/components/nav";
@@ -158,7 +159,25 @@ export function DashboardLayout() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const role = user?.role.name ?? "";
 
-  const sections = useMemo(() => visibleSections(role), [role]);
+  // Which modules this shop uses. Fetched once; a failure leaves every section
+  // showing, which is the safe direction — a sidebar that hides itself because
+  // a request failed is indistinguishable from a shop that switched everything
+  // off, and the server refuses what it must regardless.
+  const [enabled, setEnabled] = useState<string[] | null>(null);
+  useEffect(() => {
+    api
+      .get<{ key: string; enabled: boolean }[]>("/modules")
+      .then((r) => setEnabled(r.data.filter((m) => m.enabled).map((m) => m.key)))
+      .catch(() => setEnabled(null));
+  }, []);
+
+  const sections = useMemo(
+    () =>
+      visibleSections(role).filter(
+        (s) => enabled === null || enabled.includes(s.id) || s.id === "settings",
+      ),
+    [role, enabled],
+  );
   const active = useMemo(
     () => sectionForPath(location.pathname, role),
     [location.pathname, role],

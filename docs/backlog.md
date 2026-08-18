@@ -100,6 +100,61 @@ and a CSV export to match every other report.
 
 ---
 
+## 5x · Module flags and real RBAC — **done** (0043)
+
+Two features answering the same question from opposite sides: *what is this
+person allowed to reach.*
+
+### RBAC
+
+**Roles were a table with no permissions in it.** `roles` held a name; the
+permissions lived in a Python dict keyed by that name. A shop could create a
+role called "Manager" through the API and it would silently hold **zero**
+permissions — the dict had no entry, every check returned False, and nothing
+said why. The guide asked for nine roles; three existed and none could change
+without a deploy.
+
+| | |
+|---|---|
+| Grants | rows in `role_permissions`, seeded from the same dict so nothing changed on the day |
+| Catalogue | built from what `require_perm` actually guards, so it cannot be incomplete |
+| Editing | `/admin/roles` — create, rename, replace grants, delete |
+| Guard rails | superadmin role uneditable; system roles unrenameable; a role with users undeletable; unknown permissions 422 |
+
+**Two bugs this surfaced.** `require_perm("*")` gated user management and the
+audit log — a wildcard that worked while permissions were a dict literal and
+meant nothing once they were rows. It failed *closed*: admin quietly lost both,
+and the only symptom was a 403 on screens that had always worked. They are real
+permissions now (`user:manage`, `audit:read`), which is also more honest.
+
+Then the catalogue itself was derived from what roles *held*, so `master:delete`
+and `ledger:delete` — checked by real endpoints, granted to nobody, reached by
+admin through `*` — vanished, breaking six delete buttons. It is now built by
+`require_perm` registering each permission as it guards it: a permission cannot
+be enforced and missing from the list, because enforcing it is what adds it.
+
+### Module flags
+
+One switch per sidebar section, managed by a super admin.
+
+- **Off means off on the server.** 21 routers carry the guard, applied at the
+  router so an endpoint added later is covered by default. Hiding a link changes
+  nothing — the POST still arrives.
+- **A module holding live work cannot be switched off**, and the refusal names
+  what: *"3 jobs still out with workers; 1,272.180 fine g outside"*. Hiding it
+  would strand real metal behind an unreachable screen.
+- **Dashboard and Settings can never be switched off.** A shop that turned off
+  Settings could never turn anything back on.
+
+### The super admin tier
+
+New, above admin, holding feature flags and role editing and nothing else — an
+admin who can widen their own permissions is not really constrained by them. It
+holds **no permissions at all**: its authority is its name, checked directly, so
+nothing can strip it and leave the installation with no way back in.
+
+---
+
 ## 4l · The business overview — **done**
 
 The last open question in this document, and it needed the shop to answer it:

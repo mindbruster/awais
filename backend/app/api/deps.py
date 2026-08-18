@@ -7,7 +7,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_db
-from app.core.permissions import role_has
+from app.core.permissions import role_has, user_has, register
+from app.services import modules
 from app.core.security import decode_token, verify_password
 from app.models.user import User
 
@@ -41,10 +42,17 @@ CurrentUser = Annotated[User, Depends(get_current_user)]
 
 
 def require_perm(perm: str):
-    """Dependency-factory: require the current user to hold `<resource>:<action>`."""
+    """
+    Dependency-factory: require the current user to hold `<resource>:<action>`.
+
+    Registers the permission as it goes, so the catalogue the super admin panel
+    offers is exactly the set the application enforces — no more, and crucially
+    no less.
+    """
+    register(perm)
 
     async def _checker(user: CurrentUser) -> User:
-        if not role_has(user.role.name, perm):
+        if not user_has(user, perm):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Missing permission: {perm}",
@@ -88,3 +96,23 @@ async def require_password_confirm(
             detail="Password confirmation failed",
         )
     return user
+
+
+def require_module(key: str):
+    """
+    Refuse a request into a module this shop has switched off.
+
+    Applied at the router, not the handler, so a module that is off is off for
+    every endpoint under it — including any added later by somebody who does
+    not know the feature exists. A guard that has to be remembered per handler
+    is one that will be forgotten on the handler that matters.
+
+    Server-side is the whole point. Hiding a link changes nothing: the POST
+    still arrives, and a shop that believes Manufacturing is switched off while
+    jobs can still be created has a control that exists only in the sidebar.
+    """
+
+    async def _checker(db: DbSession) -> None:
+        await modules.assert_enabled(db, key)
+
+    return _checker

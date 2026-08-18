@@ -4870,6 +4870,164 @@ def main() -> int:
           client.get("/products/999999/timeline", headers=auth).status_code == 404)
 
     # ----------------------------------------------------------------------
+    # Roles that mean something, and modules that can be switched off
+    #
+    # Two features answering the same question from opposite sides: what is
+    # this person allowed to reach. The assertions that matter are the ones
+    # about failing closed — a permission system that quietly grants nothing,
+    # or a module that is off in the sidebar and on at the endpoint, is worse
+    # than none, because both look like they are working.
+    # ----------------------------------------------------------------------
+    section("RBAC and modules")
+
+    check(
+        "an admin cannot reach the super admin panel",
+        client.get("/admin/modules", headers=auth).status_code == 403,
+        "an admin who can widen their own permissions is not limited by them",
+    )
+
+    sa_user = client.post("/users", headers=auth, json={
+        "email": "root_e2e@jewelryerp.com", "full_name": "Root",
+        "password": "root12345", "role_id": 1,
+    })
+    check("admin can still manage users", sa_user.status_code == 201,
+          f"got {sa_user.status_code}: {sa_user.text[:160]} — this broke once when the "
+          "wildcard permission stopped being a stored grant")
+    sr = client.post("/auth/login", json={"email": "root_e2e@jewelryerp.com",
+                                          "password": "root12345"}).json()
+    sa = {"Authorization": f"Bearer {sr['access_token']}"}
+    sa_pwd = {**sa, "X-Confirm-Password": "root12345"}
+
+    # --- the catalogue -------------------------------------------------
+    cat = client.get("/admin/permissions", headers=sa).json()
+    keys = {p["key"] for p in cat}
+    check("the catalogue lists every permission", len(cat) > 50, f"got {len(cat)}")
+    check(
+        "including ones no seeded role holds",
+        "master:delete" in keys and "ledger:delete" in keys,
+        "these are checked by real endpoints and belonged to no role — deriving the "
+        "catalogue from grants dropped them and quietly broke six delete buttons",
+    )
+
+    roles = {r["name"]: r for r in client.get("/admin/roles", headers=sa).json()}
+    check("admin holds the whole catalogue", len(roles["admin"]["permissions"]) == len(cat),
+          f"admin {len(roles['admin']['permissions'])} vs catalogue {len(cat)}")
+    check("staff holds fewer", len(roles["staff"]["permissions"]) < len(cat),
+          "a role that holds everything is not a role")
+    check(
+        "the super admin role holds no permissions at all",
+        roles["superadmin"]["permissions"] == [],
+        "its authority is its name, checked directly, so no grant can be taken from it",
+    )
+
+    # --- a role the shop creates itself --------------------------------
+    made = client.post("/admin/roles", headers=sa, json={
+        "name": "Viewer", "description": "Reads and nothing else",
+        "permissions": ["customer:read", "invoice:read"],
+    })
+    check("create a role → 201", made.status_code == 201, f"got {made.status_code}: {made.text[:180]}")
+    made = made.json()
+    check("it holds exactly what was asked for",
+          sorted(made["permissions"]) == ["customer:read", "invoice:read"], str(made["permissions"]))
+
+    # The trap this feature exists to remove: before permissions were rows, a
+    # role created this way silently held nothing.
+    client.post("/users", headers=auth, json={
+        "email": "viewer_e2e@jewelryerp.com", "full_name": "Viewer",
+        "password": "view12345", "role_id": made["id"],
+    })
+    vr = client.post("/auth/login", json={"email": "viewer_e2e@jewelryerp.com",
+                                          "password": "view12345"}).json()
+    vw = {"Authorization": f"Bearer {vr['access_token']}"}
+    check(
+        "a shop-created role actually works",
+        client.get("/customers", headers=vw).status_code == 200,
+        "before this, a custom role held nothing and no error said why",
+    )
+    check(
+        "and is limited to what it was granted",
+        client.get("/ledger/entries", headers=vw).status_code == 403,
+        "a role that was granted two permissions must not reach a third",
+    )
+
+    check(
+        "a permission nothing checks is refused",
+        client.patch(f"/admin/roles/{made['id']}", headers=sa_pwd,
+                     json={"permissions": ["invoice:read", "not:areal"]}).status_code == 422,
+        "granting it would confer nothing while looking like it did",
+    )
+    check(
+        "revoking works, not just granting",
+        sorted(client.patch(f"/admin/roles/{made['id']}", headers=sa_pwd,
+                            json={"permissions": ["invoice:read"]}).json()["permissions"])
+        == ["invoice:read"],
+        "a merge-only endpoint can add a permission and never take one away",
+    )
+    check(
+        "the super admin role cannot be edited",
+        client.patch(f"/admin/roles/{roles['superadmin']['id']}", headers=sa_pwd,
+                     json={"permissions": []}).status_code == 409,
+        "stripping it would leave nobody able to grant anything, with no way back",
+    )
+    check(
+        "a system role cannot be renamed",
+        client.patch(f"/admin/roles/{roles['staff']['id']}", headers=sa_pwd,
+                     json={"name": "peon"}).status_code == 409,
+        "the seed and the migrations look it up by name",
+    )
+    check(
+        "a role with users on it cannot be deleted",
+        client.delete(f"/admin/roles/{made['id']}", headers=sa_pwd).status_code == 409,
+        "it would leave their accounts pointing at nothing",
+    )
+
+    # --- modules -------------------------------------------------------
+    mods = {m["key"]: m for m in client.get("/admin/modules", headers=sa).json()}
+    check("every sidebar section has a switch", len(mods) >= 10, str(sorted(mods)))
+    check(
+        "dashboard and settings cannot be switched off",
+        not mods["settings"]["can_disable"] and not mods["dashboard"]["can_disable"],
+        "a shop that turned off Settings could never turn anything back on",
+    )
+    check(
+        "manufacturing is held open by live work",
+        mods["manufacturing"]["blockers"] and not mods["manufacturing"]["can_switch_off"],
+        f"blockers {mods['manufacturing']['blockers']} — metal is out with workers",
+    )
+    r = client.patch("/admin/modules/manufacturing", headers=sa_pwd, json={"enabled": False})
+    check("and switching it off is refused → 409", r.status_code == 409,
+          f"got {r.status_code}: {r.text[:180]}")
+    check(
+        "the refusal names what is holding it",
+        "out with workers" in r.text or "outside the building" in r.text,
+        r.text[:200],
+    )
+
+    # A module with nothing live in it switches off — and is off on the server,
+    # not merely hidden in the sidebar.
+    r = client.patch("/admin/modules/rates", headers=sa_pwd, json={"enabled": False})
+    check("a quiet module switches off → 200", r.status_code == 200, f"got {r.status_code}")
+    check(
+        "and its endpoints refuse, not just its links",
+        client.get("/gold-rates", headers=auth).status_code == 403,
+        "hiding a link changes nothing — the POST still arrives",
+    )
+    check(
+        "other modules are unaffected",
+        client.get("/customers", headers=auth).status_code == 200,
+        "one switch must not take the shop down",
+    )
+    client.patch("/admin/modules/rates", headers=sa_pwd, json={"enabled": True})
+    check("switching back on restores it",
+          client.get("/gold-rates", headers=auth).status_code == 200)
+    check(
+        "an admin cannot switch modules",
+        client.patch("/admin/modules/rates", headers=pwd_h, json={"enabled": False}).status_code
+        == 403,
+        "flags belong to somebody who is not also running the counter",
+    )
+
+    # ----------------------------------------------------------------------
     # The business overview
     #
     # One page a partner gets shown, so the thing to hold is that it never

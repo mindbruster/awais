@@ -8,6 +8,7 @@ from app.api.deps import (
     require_password_confirm,
     require_perm,
 )
+from app.core.permissions import USER_MANAGE
 from app.core.security import hash_password
 from app.models.role import Role
 from app.models.user import User
@@ -17,7 +18,7 @@ router = APIRouter()
 
 # All user management is admin-only — there is no fine-grained perm key for it
 # because it controls who has *any* perms in the first place.
-admin_only = Depends(require_perm("*"))
+admin_only = Depends(require_perm(USER_MANAGE))
 
 
 @router.get("", response_model=list[UserRead], dependencies=[admin_only])

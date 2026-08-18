@@ -2,12 +2,13 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import desc, select
 
 from app.api.deps import DbSession, require_perm
+from app.core.permissions import AUDIT_READ
 from app.models.audit_log import AuditLog
 from app.schemas.audit_log import AuditLogRead
 
 router = APIRouter()
 # Audit log is admin-only — accountant/staff should not see who did what.
-admin_only = Depends(require_perm("*"))
+admin_only = Depends(require_perm(AUDIT_READ))
 
 
 @router.get("", response_model=list[AuditLogRead], dependencies=[admin_only])
