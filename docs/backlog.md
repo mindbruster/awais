@@ -148,10 +148,27 @@ One switch per sidebar section, managed by a super admin.
 
 ### The super admin tier
 
-New, above admin, holding feature flags and role editing and nothing else — an
-admin who can widen their own permissions is not really constrained by them. It
-holds **no permissions at all**: its authority is its name, checked directly, so
-nothing can strip it and leave the installation with no way back in.
+New, above admin, holding feature flags and role editing — an admin who can
+widen their own permissions is not really constrained by them.
+
+It holds **the whole catalogue *and* is recognised by name**, and the two
+mechanisms fail in opposite directions on purpose. The grants make the role
+honest: a panel showing an empty role that mysteriously works is one somebody
+eventually tidies away. The name check means that even with every grant gone,
+whoever holds it can still sign in and put them back — so the installation can
+never be locked out of its own permission system.
+
+Seeded as its own account:
+
+```
+SEED_SUPERADMIN_EMAIL=superadmin@jewelryerp.com
+SEED_SUPERADMIN_PASSWORD=superadmin123     ← change before deploying
+```
+
+Each seeded account is guarded independently rather than the seed returning
+early on the first one found — an existing installation already has an admin,
+and bailing there would mean the super admin never got created and the tier
+existed with nobody able to reach it.
 
 ---
 

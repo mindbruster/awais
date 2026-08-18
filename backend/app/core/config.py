@@ -59,6 +59,15 @@ class Settings(BaseSettings):
     seed_admin_password: str = "admin123"
     seed_admin_name: str = "System Admin"
 
+    # The tier above admin: feature flags and role permissions. Seeded as its
+    # own account rather than layered onto the admin login, because the point
+    # of the tier is that the person running the counter is not the person who
+    # decides what everybody may reach. Sharing one login would collapse the
+    # two back together.
+    seed_superadmin_email: str = "superadmin@jewelryerp.com"
+    seed_superadmin_password: str = "superadmin123"
+    seed_superadmin_name: str = "Super Admin"
+
     @field_validator("database_url", mode="before")
     @classmethod
     def normalise_db_driver(cls, v):
@@ -94,6 +103,10 @@ class Settings(BaseSettings):
             insecure.append("JWT_SECRET (must be at least 32 characters)")
         if self.seed_admin_password == "admin123":
             insecure.append("SEED_ADMIN_PASSWORD")
+        # Held to the same standard, and it matters more: this account can
+        # switch modules off and rewrite what every role may do.
+        if self.seed_superadmin_password == "superadmin123":
+            insecure.append("SEED_SUPERADMIN_PASSWORD")
         if self.debug:
             insecure.append("DEBUG (must be false outside development)")
 

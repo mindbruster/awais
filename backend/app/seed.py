@@ -15,7 +15,7 @@ from app.core.security import hash_password
 # permission catalogue, and seeding grants against an empty catalogue would
 # create roles that hold nothing.
 import app.api.v1  # noqa: F401
-from app.core.permissions import SUPERADMIN, default_permissions
+from app.core.permissions import SUPERADMIN, all_permissions, default_permissions
 from app.models.role import Role, RolePermission
 from app.models.user import User
 
@@ -64,12 +64,19 @@ async def seed() -> None:
             role = (
                 await db.execute(select(Role).where(Role.name == name))
             ).unique().scalar_one()
-            if name == SUPERADMIN:
-                # Holds nothing. Its authority is its name, checked directly,
-                # so that no grant can be taken away from it by accident.
-                continue
+            # The super admin holds the whole catalogue *as well as* being
+            # recognised by name. Two mechanisms rather than one, and they fail
+            # in opposite directions: the grants make the role honest — the
+            # panel can show 60 of 60 rather than an empty role that mysteriously
+            # works — while the name check means that even if every grant were
+            # somehow removed, whoever holds it can still get back in and put
+            # them back. A role whose power is invisible is one somebody
+            # eventually "tidies up".
+            wanted = (
+                all_permissions() if name == SUPERADMIN else default_permissions(name)
+            )
             held = role.permission_names
-            for perm in sorted(default_permissions(name) - held):
+            for perm in sorted(wanted - held):
                 db.add(RolePermission(role_id=role.id, permission=perm))
                 granted += 1
         if granted:
@@ -80,27 +87,52 @@ async def seed() -> None:
             await db.execute(select(Role).where(Role.name == "admin"))
         ).scalar_one()
 
-        admin_email = settings.seed_admin_email.lower()
-        existing_admin = (
-            await db.execute(select(User).where(User.email == admin_email))
-        ).scalar_one_or_none()
-        if existing_admin:
-            log.info("admin already exists", extra={"email": admin_email})
-            return
+        # Each account is guarded on its own rather than the whole block
+        # returning early on the first one found. An existing installation
+        # already has an admin, and bailing there would mean the super admin
+        # this release introduces never got created — the tier would exist in
+        # the schema with nobody able to reach it.
+        superadmin_role = (
+            await db.execute(select(Role).where(Role.name == SUPERADMIN))
+        ).unique().scalar_one()
 
-        admin = User(
-            email=admin_email,
-            full_name=settings.seed_admin_name,
-            hashed_password=hash_password(settings.seed_admin_password),
-            is_active=True,
-            role_id=admin_role.id,
-        )
-        db.add(admin)
-        await db.commit()
-        log.warning(
-            "admin created — change password on first login",
-            extra={"email": admin_email},
-        )
+        for email, name, password, role, note in (
+            (
+                settings.seed_superadmin_email,
+                settings.seed_superadmin_name,
+                settings.seed_superadmin_password,
+                superadmin_role,
+                "owns feature flags and role permissions",
+            ),
+            (
+                settings.seed_admin_email,
+                settings.seed_admin_name,
+                settings.seed_admin_password,
+                admin_role,
+                "runs the shop",
+            ),
+        ):
+            addr = email.lower()
+            found = (
+                await db.execute(select(User).where(User.email == addr))
+            ).scalar_one_or_none()
+            if found is not None:
+                log.info("user already exists", extra={"email": addr})
+                continue
+            db.add(
+                User(
+                    email=addr,
+                    full_name=name,
+                    hashed_password=hash_password(password),
+                    is_active=True,
+                    role_id=role.id,
+                )
+            )
+            await db.commit()
+            log.warning(
+                "account created — change the password on first login",
+                extra={"email": addr, "role": role.name, "note": note},
+            )
 
 
 if __name__ == "__main__":

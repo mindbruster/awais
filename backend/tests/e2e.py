@@ -107,21 +107,38 @@ def main() -> int:
     r = client.get("/users", headers=auth)
     check("admin can list users", r.status_code == 200 and len(r.json()) >= 1)
 
-    r = client.post(
-        "/users",
-        headers=auth,
-        json={
-            "email": "staff1@jewelry.local",
-            "full_name": "Staff One",
-            "password": "staff123",
-            "role_id": next(role["id"] for role in [r.json()[0]["role"]] if role["name"] == "admin") + 2,  # crude; we'll fix
-        },
-    )
-    # Actually, look up role_id properly:
-    # Re-list roles via a user record's role; simpler: hit /auth/me which gave admin role id
+    # Roles looked up by name, not by arithmetic on an id.
+    #
+    # This used to read the first user's role and add two, on the assumption
+    # that roles were seeded admin-first in a fixed order. Adding the super
+    # admin put a different account first and the whole suite stopped at line
+    # one hundred and seventeen — which is the argument against deriving an
+    # identifier from insertion order in the first place.
+    role_ids = {u["role"]["name"]: u["role"]["id"] for u in r.json() if u.get("role")}
     admin_role_id = me["role"]["id"]
-    # We seeded 3 roles; staff is admin_role_id + 2 (insertion order)
-    staff_role_id = admin_role_id + 2
+    role_ids.setdefault("admin", admin_role_id)
+    staff_role_id = role_ids.get("staff")
+    if staff_role_id is None:
+        # No user holds it yet, which is the ordinary case on a fresh database.
+        # Seeded in a known order after the two accounts, so it is one of the
+        # ids near admin's — probe rather than guess.
+        for candidate in range(admin_role_id + 1, admin_role_id + 4):
+            probe = client.post("/users", headers=auth, json={
+                "email": f"probe{candidate}@jewelryerp.com", "full_name": "probe",
+                "password": "probe12345", "role_id": candidate,
+            })
+            if probe.status_code == 201 and probe.json()["role"]["name"] == "staff":
+                staff_role_id = candidate
+                # Its own confirm header: `pwd_h` is not bound until later in
+                # the file, and a closure reading it here fails with a name
+                # error rather than a useful message.
+                client.delete(
+                    f"/users/{probe.json()['id']}",
+                    headers={**auth, "X-Confirm-Password": "admin123"},
+                )
+                break
+    check("the staff role can be found by name", staff_role_id is not None,
+          f"roles seen: {sorted(role_ids)}")
 
     # Re-create with correct id
     r = client.post(
@@ -4915,9 +4932,30 @@ def main() -> int:
     check("staff holds fewer", len(roles["staff"]["permissions"]) < len(cat),
           "a role that holds everything is not a role")
     check(
-        "the super admin role holds no permissions at all",
-        roles["superadmin"]["permissions"] == [],
-        "its authority is its name, checked directly, so no grant can be taken from it",
+        "the super admin holds the whole catalogue too",
+        len(roles["superadmin"]["permissions"]) == len(cat),
+        f"holds {len(roles['superadmin']['permissions'])} of {len(cat)}",
+    )
+    # Two mechanisms, failing in opposite directions: the grants make the role
+    # honest — a panel showing an empty role that mysteriously works invites
+    # somebody to tidy it away — while the name check means that even with
+    # every grant gone, whoever holds it can still get in and restore them.
+    check(
+        "and is still recognised by name, so it cannot be stripped",
+        client.patch(f"/admin/roles/{roles['superadmin']['id']}", headers=sa_pwd,
+                     json={"permissions": []}).status_code == 409,
+        "stripping it would leave nobody able to grant anything, with no way back",
+    )
+    sa_login = client.post("/auth/login", json={
+        "email": "superadmin@jewelryerp.com", "password": "superadmin123"})
+    check("the seeded super admin account signs in", sa_login.status_code == 200,
+          f"got {sa_login.status_code} — the tier is useless if nobody holds it")
+    seeded = {"Authorization": f"Bearer {sa_login.json()['access_token']}"}
+    check(
+        "and it reaches both the panel and the ordinary screens",
+        client.get("/admin/modules", headers=seeded).status_code == 200
+        and client.get("/customers", headers=seeded).status_code == 200,
+        "a super admin who cannot open an invoice cannot check what they just changed",
     )
 
     # --- a role the shop creates itself --------------------------------
