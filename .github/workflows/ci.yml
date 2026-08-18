@@ -104,6 +104,14 @@ jobs:
         working-directory: backend
         run: python -m tests.e2e
 
+      # After the suite, not before: the invariant is about what a full run of
+      # the business leaves behind. Four separate paths once moved stock
+      # without telling the books, and the largest left 1,195 fine grams of
+      # gold in the pots that 1130 had never seen.
+      - name: Shelves against books
+        working-directory: backend
+        run: python -m tools.check_stock_ledger
+
       # Four-eyes approval is switched by configuration, so it cannot be
       # exercised against the server the E2E suite talks to. This runs the
       # guards directly, with the rule both off and on.
