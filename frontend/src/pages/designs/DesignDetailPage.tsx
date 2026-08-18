@@ -16,7 +16,7 @@ import { PasswordConfirm } from "@/components/PasswordConfirm";
 import { toast } from "@/components/Toast";
 import { apiError } from "@/lib/api-error";
 import { fmtMoney } from "@/lib/money";
-import { staticUrl } from "@/lib/url";
+import { Img } from "@/components/Img";
 import { IssueSheet } from "@/pages/designs/IssueSheet";
 import {
   DesignStatusChip,
@@ -224,10 +224,12 @@ function JobCard({
 
         <div className="mt-3 flex flex-wrap items-start gap-4">
           {design.image_url && (
-            <img
-              src={staticUrl(design.image_url)}
+            <Img
+              src={design.image_url}
               alt={design.design_no}
               className="h-20 w-20 flex-none rounded-xl border border-slate-200 object-cover"
+              fallbackClassName="num flex h-20 w-20 flex-none items-center justify-center rounded-xl border border-dashed border-slate-200 bg-slate-50 text-[10px] text-slate-400"
+              fallback={design.design_no}
             />
           )}
           <div className="min-w-0 flex-1">

@@ -3091,6 +3091,55 @@ def main() -> int:
         f"got {mk['wastage_excess_fine_g']}, expected 0.0028",
     )
 
+    # --- 1b. THE MAKER, THE SHOP'S SECOND WORKED EXAMPLE -----------------
+    #   The owner wrote this one out in full, so it is asserted in his own
+    #   arithmetic rather than mine:
+    #
+    #     100 g pure gold given to the maker
+    #     102 g of 18k received back
+    #     102 / 96 * 10          = 10.625 g allowance at 10 ratti
+    #     102 + 10.625           = 112.625 g adjusted
+    #     112.625 / 24 * 18      = 84.469 g of pure equivalent
+    #     100 - 84.469           = 15.531 g the maker owes the shop
+    #
+    #   The system reaches it the other way round — issued fine, less received
+    #   fine, less the allowance in fine — which is the same identity
+    #   rearranged. Asserting the *answer* rather than the route is what makes
+    #   that safe: if either derivation drifts, this fails.
+    m2_design = client.post("/designs", headers=auth, json={"item_id": taka_id}).json()
+    m2_leg = client.post(
+        f"/designs/{m2_design['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": make_dept_id, "worker_id": karigar["id"],
+            "gold_issued_g": "100", "gold_issued_purity": 24,
+            "gold_source_inventory_id": pure_gold["id"],
+            "wastage_basis": "ratti_of_received", "wastage_ratti": "10",
+            "piece_count": 1, "labour_basis": "flat", "labour_rate": "0",
+        },
+    ).json()
+    m2 = client.post(
+        f"/designs/legs/{m2_leg['id']}/receive",
+        headers=auth,
+        json={"gold_received_g": "102", "gold_received_purity": 18},
+    ).json()
+    check(
+        "MAKER 2: 10 ratti on 102g received allows 10.625g",
+        Decimal(str(m2["wastage_allowed_g"])) == Decimal("10.625"),
+        f"got {m2['wastage_allowed_g']} — 102/96*10",
+    )
+    check(
+        "MAKER 2: the shop is owed 15.531g of pure gold — the owner's own figure",
+        abs(Decimal(str(m2["wastage_excess_fine_g"])) - Decimal("15.5312")) <= Decimal("0.0002"),
+        f"got {m2['wastage_excess_fine_g']}, expected 15.5312 "
+        "(100 - (102 + 10.625) / 24 * 18)",
+    )
+    check(
+        "MAKER 2: and it is a debt to the shop, not a credit to him",
+        Decimal(str(m2["wastage_excess_fine_g"])) > 0,
+        "a negative here would mean the shop owed the maker",
+    )
+
     # --- 2. THE STONE SETTER --------------------------------------------
     #   100.000 g of 21k product + 30.00 ct of stones out.
     #     30.00 / 5              =   6.000 g of stones
@@ -4752,6 +4801,88 @@ def main() -> int:
 
     check("a timeline for a piece that does not exist → 404",
           client.get("/products/999999/timeline", headers=auth).status_code == 404)
+
+    # ----------------------------------------------------------------------
+    # Profit: two bases, and what each one assumes
+    #
+    # The shop never wrote its profit formulas down, so a conventional method
+    # was implemented and every judgement it makes is stated on the response.
+    # These assertions hold that contract: the two bases must differ only where
+    # they are supposed to, and the report must never go quiet about what it
+    # assumed.
+    # ----------------------------------------------------------------------
+    section("Profit basis")
+
+    def split(**params):
+        return client.get("/reports/profit-split", headers=auth, params=params).json()
+
+    cost_b = split(basis="cost")
+    repl_b = split(basis="replacement")
+    check("cost basis → figures", "basis" in cost_b and cost_b["basis"] == "cost", str(cost_b)[:120])
+    check("replacement basis → figures", repl_b["basis"] == "replacement", str(repl_b)[:120])
+    check(
+        "the default is the cost basis",
+        split()["basis"] == "cost",
+        "an accountant's gross profit is the safer thing to open on",
+    )
+
+    by = {s_["stream"]: s_ for s_ in cost_b["streams"]}
+    by_r = {s_["stream"]: s_ for s_ in repl_b["streams"]}
+    check(
+        "revenue is identical on both — only the valuation of metal changes",
+        cost_b["revenue"] == repl_b["revenue"],
+        f"{cost_b['revenue']} vs {repl_b['revenue']}",
+    )
+    for stream in ("stones", "making"):
+        check(
+            f"the {stream} stream is untouched by the basis",
+            by[stream]["cost"] == by_r[stream]["cost"],
+            f"{stream}: {by[stream]['cost']} vs {by_r[stream]['cost']} — only gold "
+            "may move, because only gold has a market rate",
+        )
+    check(
+        "the whole difference lands on gold",
+        abs(
+            (Decimal(str(cost_b["gross_margin"])) - Decimal(str(repl_b["gross_margin"])))
+            - (Decimal(str(by["gold"]["gross_margin"])) - Decimal(str(by_r["gold"]["gross_margin"])))
+        )
+        <= Decimal("0.02"),
+        "a difference appearing outside the gold stream means the basis leaked",
+    )
+
+    check(
+        "every run says what it assumed",
+        len(cost_b["assumptions"]) >= 5 and len(repl_b["assumptions"]) >= 5,
+        f"{len(cost_b['assumptions'])} / {len(repl_b['assumptions'])} — a figure built "
+        "on an unwritten rule must not look authoritative",
+    )
+    check(
+        "the cost basis says where the rate movement went instead",
+        any("revaluation" in a for a in cost_b["assumptions"]),
+        "otherwise a reader concludes the shop ignored the rate entirely",
+    )
+    check(
+        "the replacement basis warns against double counting",
+        any("do not add the two together" in a for a in repl_b["assumptions"]),
+        "reading replacement AND adding the revaluation counts the holding gain twice",
+    )
+    check(
+        "both say stones are at parcel cost, because no market rate exists for a grade",
+        all(any("parcel cost" in a for a in b["assumptions"]) for b in (cost_b, repl_b)),
+        "a replacement value for a diamond grade would be invented",
+    )
+    if cost_b["unsplit_lines"]:
+        check(
+            "and an unsplit line count is confessed rather than buried",
+            any("could not be split" in a for a in cost_b["assumptions"]),
+            "a split built mostly from unsplit lines is not a split",
+        )
+    check(
+        "an unknown basis is refused rather than silently defaulted",
+        client.get("/reports/profit-split", headers=auth,
+                   params={"basis": "whatever"}).status_code == 422,
+        "silently falling back would report one method under another's name",
+    )
 
     # ----------------------------------------------------------------------
     # Audit log: before and after

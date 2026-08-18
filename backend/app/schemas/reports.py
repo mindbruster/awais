@@ -439,6 +439,21 @@ class ProfitSplitReport(BaseModel):
     # buried: a split built mostly from these is not a split.
     unsplit_lines: int = 0
 
+    # Which method produced these figures.
+    basis: str = "cost"
+    basis_label: str = ""
+    # Every judgement the report made, in plain sentences, shown on the screen
+    # rather than kept in a docstring.
+    #
+    # This list exists because the shop never wrote the profit formulas down.
+    # A conventional method was implemented, and the honest way to ship that is
+    # to say out loud what was assumed — so a figure built on a rule the owner
+    # would not have chosen is visible rather than authoritative-looking.
+    assumptions: list[str] = []
+    # Set when the chosen basis needs a rate that is not on record. The report
+    # still returns, on the other basis, saying so.
+    basis_fallback: str | None = None
+
 
 # --------------------------------------------------------------------------
 # Material outside the company

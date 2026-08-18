@@ -1,7 +1,7 @@
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "@/api/client";
-import { staticUrl } from "@/lib/url";
+import { Img } from "@/components/Img";
 import { Modal } from "@/components/Modal";
 import { SelectField, TextField, TextArea } from "@/components/Field";
 import { SearchBox, FilterSelect, Toolbar } from "@/components/Toolbar";
@@ -118,15 +118,12 @@ export function ProductsPage() {
               {filtered.map((p) => (
                 <tr key={p.id} className="hover:bg-slate-50">
                   <td className="px-4 py-3">
-                    {p.image_url ? (
-                      <img
-                        src={staticUrl(p.image_url)}
-                        alt={p.name}
-                        className="h-10 w-10 rounded object-cover"
-                      />
-                    ) : (
-                      <div className="h-10 w-10 rounded bg-slate-100" />
-                    )}
+                    <Img
+                      src={p.image_url}
+                      alt={p.name}
+                      className="h-10 w-10 rounded object-cover"
+                      fallbackClassName="h-10 w-10 rounded bg-slate-100"
+                    />
                   </td>
                   <td className="px-4 py-3 font-mono text-xs">
                     <Link to={`/products/${p.id}`} className="text-brand-700 hover:underline">

@@ -13,7 +13,7 @@ import { MasterTable, MasterRow } from "@/components/MasterTable";
 import { toast } from "@/components/Toast";
 import { apiError } from "@/lib/api-error";
 import { fmtWeight } from "@/lib/money";
-import { staticUrl } from "@/lib/url";
+import { Img } from "@/components/Img";
 
 interface BranchStock {
   branch_id: number;
@@ -226,7 +226,13 @@ export function BranchLogo({
     <div className="flex items-center gap-4 border-b border-slate-100 py-3 last:border-0">
       <div className="flex h-16 w-16 flex-none items-center justify-center border border-slate-200 bg-white">
         {branch.logo_url ? (
-          <img src={staticUrl(branch.logo_url)} alt="" className="max-h-14 max-w-14 object-contain" />
+          <Img
+            src={branch.logo_url}
+            alt=""
+            className="max-h-14 max-w-14 object-contain"
+            fallbackClassName="text-[10px] text-slate-400"
+            fallback="logo missing"
+          />
         ) : (
           <span className="text-[10px] text-slate-400">no logo</span>
         )}

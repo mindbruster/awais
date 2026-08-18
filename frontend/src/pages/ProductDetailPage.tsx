@@ -1,6 +1,7 @@
 import { FormEvent, useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api } from "@/api/client";
+import { Img } from "@/components/Img";
 import { Modal } from "@/components/Modal";
 import { SelectField, TextField } from "@/components/Field";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
@@ -8,7 +9,6 @@ import { toast } from "@/components/Toast";
 import { apiError } from "@/lib/api-error";
 import { ProductTimeline } from "@/pages/products/ProductTimeline";
 import { Currency, fmtMoney } from "@/lib/money";
-import { staticUrl } from "@/lib/url";
 import { ImageStudio } from "@/components/ImageStudio";
 
 interface Stone {
@@ -111,10 +111,12 @@ export function ProductDetailPage() {
       <div className="grid gap-4 lg:grid-cols-3">
         <section className="card lg:col-span-1">
           {product.image_url ? (
-            <img
-              src={staticUrl(product.image_url)}
+            <Img
+              src={product.image_url}
               alt={product.name}
               className="aspect-square w-full rounded-lg object-cover"
+              fallbackClassName="flex aspect-square w-full items-center justify-center rounded-lg bg-slate-100 text-sm text-slate-400"
+              fallback="Photograph missing"
             />
           ) : (
             <div className="flex aspect-square w-full items-center justify-center rounded-lg bg-slate-100 text-sm text-slate-400">
