@@ -23,6 +23,7 @@ from sqlalchemy import case, func, select
 from sqlalchemy.orm import joinedload, selectinload
 
 from app.core import clock
+from app.core.config import settings
 from app.api.deps import DbSession, require_perm
 from app.models.account import Account, SystemAccount
 from app.models.currency import Currency
@@ -30,6 +31,7 @@ from app.models.customer import Customer
 from app.models.department import Department
 from app.models.design import Design, JobLeg, LegStatus
 from app.models.metal import Metal
+from app.models.profit import ProfitBasis
 from app.models.inventory import InventoryItem
 from app.models.invoice import Invoice, InvoiceItem, InvoiceStatus
 from app.models.item import Item
@@ -215,6 +217,10 @@ async def profit_split_report(
     date_from: date | None = Query(default=None),
     date_to: date | None = Query(default=None),
     currency: Currency = Query(default=Currency.PKR),
+    basis: ProfitBasis | None = Query(
+        default=None,
+        description="cost = metal at what we paid; replacement = metal at today's rate",
+    ),
     format: Format = Query(default="json"),
 ):
     """
@@ -241,9 +247,35 @@ async def profit_split_report(
     `unsplit_lines` rather than guessed at — a guess here would move margin
     from one business to the other and nothing on the report would say so.
 
+    **The two bases.** `cost` values metal at the rate locked onto the piece
+    when it was stocked — gross profit as an accountant means it, and the only
+    one of the two that reconciles to the ledger unaided. `replacement` values
+    it at today's rate, answering the different and equally real question of
+    whether the shop can restock what it just sold.
+
+    The gap between them is the holding gain, and it is **not** trading profit.
+    It is already reported on its own by the metal revaluation, so a shop
+    reading `replacement` here and adding the revaluation would count the same
+    money twice. The report says so in `assumptions` rather than leaving it to
+    be discovered.
+
+    Stones stay at parcel cost under both. There is no market rate for a grade
+    of diamond the way there is for metal — a price for "12 PTR commercial VS1"
+    is a negotiation, not a quotation — so a replacement value for stones would
+    be a number somebody invented.
+
     One currency at a time. Rupees and dollars do not add.
     """
+    chosen = basis or ProfitBasis(settings.default_profit_basis)
     start, end = _window(date_from, date_to)
+
+    # Today's rate, needed only for the replacement basis. Fetched once: a rate
+    # looked up per line could change mid-report and value two identical pieces
+    # differently.
+    today_rate: Decimal | None = None
+    if chosen is ProfitBasis.replacement:
+        rate_row = await rate_in_force(db, metal=Metal.gold, as_of=clock.today())
+        today_rate = fine_rate_per_g(rate_row) if rate_row else None
 
     stmt = (
         select(
@@ -311,13 +343,33 @@ async def profit_split_report(
         material = _d(mat_cost) * n
         if p_rate and _d(p_rate) > 0 and _d(p_gold_g) > 0:
             fine = fine_grams(p_gold_g, p_purity, p_tunch)
-            metal_part = (fine * _d(p_rate) * n).quantize(_PKR)
-            # Never more than the material actually cost: a rate keyed after
-            # the fact could otherwise make the metal alone exceed the whole,
-            # handing the stone business a negative cost and a false margin.
-            metal_part = min(metal_part, material)
-            gold_cost += metal_part
-            stone_cost += material - metal_part
+            # The one line the basis actually changes. Under `cost` the metal is
+            # valued at the rate locked when the piece was stocked; under
+            # `replacement`, at today's. Everything else on this report is
+            # identical between the two, which is worth knowing when the totals
+            # move: only the gold stream can have moved.
+            valued_at = (
+                today_rate
+                if chosen is ProfitBasis.replacement and today_rate
+                else _d(p_rate)
+            )
+            metal_part = (fine * valued_at * n).quantize(_PKR)
+            if chosen is ProfitBasis.cost:
+                # Never more than the material actually cost: a rate keyed after
+                # the fact could otherwise make the metal alone exceed the whole,
+                # handing the stone business a negative cost and a false margin.
+                metal_part = min(metal_part, material)
+                gold_cost += metal_part
+                stone_cost += material - metal_part
+            else:
+                # Under replacement the metal is *expected* to exceed what the
+                # piece cost — that is the whole point in a rising market — so
+                # the cap would defeat it. The stones keep their own historic
+                # cost, taken from the split the locked rate gives, so a higher
+                # gold valuation cannot silently eat into them.
+                historic_metal = min((fine * _d(p_rate) * n).quantize(_PKR), material)
+                gold_cost += metal_part
+                stone_cost += material - historic_metal
         else:
             # The piece has no locked rate, so its material cannot be split
             # honestly. Charged whole to metal — most pieces are mostly metal —
@@ -349,6 +401,66 @@ async def profit_split_report(
             ["stream", "revenue", "cost", "gross_margin", "margin_pct"],
             [[s.stream, s.revenue, s.cost, s.gross_margin, s.margin_pct] for s in streams],
         )
+    # ---- what this report assumed, said out loud ----
+    #
+    # The shop never wrote its profit formulas down, so a conventional method
+    # was implemented. The honest way to ship that is to state every judgement
+    # on the face of the report rather than bury it in a docstring nobody
+    # opens.
+    assumptions: list[str] = [
+        "Revenue excludes tax — that is the government's money passing through, "
+        "and counting it would inflate every margin here.",
+        "A line discount is taken off the largest component of that line, not "
+        "spread across all three. That is what the counter was arguing about "
+        "when it was given.",
+        "Making is the shop's own labour sold on, costed at what the workers "
+        "were actually paid for the piece.",
+        "Wastage charged to the customer sits in the gold stream, because it is "
+        "billed as metal.",
+    ]
+    if chosen is ProfitBasis.cost:
+        assumptions.insert(
+            0,
+            "Metal is valued at the rate locked onto each piece when it was "
+            "stocked — what the shop actually paid. This is gross profit as an "
+            "accountant means it, and it reconciles to the ledger.",
+        )
+        assumptions.append(
+            "What the rate has done since is NOT in these figures. It is "
+            "reported separately as the metal revaluation, which is the correct "
+            "place for it.",
+        )
+    else:
+        assumptions.insert(
+            0,
+            "Metal is valued at today's rate, not what was paid — this answers "
+            "'can we restock what we sold?' rather than 'did we trade well?'.",
+        )
+        assumptions.insert(
+            1,
+            "The gap between this and the cost basis is the holding gain, and it "
+            "is NOT trading profit. The metal revaluation already reports it, so "
+            "do not add the two together.",
+        )
+    assumptions.append(
+        "Stones are at parcel cost under both methods. There is no market rate "
+        "for a grade of diamond the way there is for metal, so a replacement "
+        "value for them would be invented.",
+    )
+    if unsplit:
+        assumptions.append(
+            f"{unsplit} of {lines} lines could not be split between metal and "
+            "stones and were charged whole to gold. The two margins are firm "
+            "only to the extent that number is small.",
+        )
+
+    fallback = None
+    if chosen is ProfitBasis.replacement and today_rate is None:
+        fallback = (
+            "No gold rate is on record for today, so the replacement basis could "
+            "not be applied — these are cost-basis figures."
+        )
+
     return ProfitSplitReport(
         date_from=date_from,
         date_to=date_to,
@@ -359,6 +471,12 @@ async def profit_split_report(
         gross_margin=(total_rev - total_cost).quantize(_PKR),
         lines=lines,
         unsplit_lines=unsplit,
+        basis=chosen.value,
+        basis_label=(
+            "At what we paid" if chosen is ProfitBasis.cost else "At today's rate"
+        ),
+        assumptions=assumptions,
+        basis_fallback=fallback,
     )
 
 

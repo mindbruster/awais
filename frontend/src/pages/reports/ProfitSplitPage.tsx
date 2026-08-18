@@ -35,6 +35,14 @@ interface Split {
   gross_margin: string;
   lines: number;
   unsplit_lines: number;
+  basis: "cost" | "replacement";
+  basis_label: string;
+  // Every judgement the report made, in plain sentences. Shown in full rather
+  // than summarised: the shop never wrote its profit formulas down, so a
+  // conventional method was implemented, and the honest way to present that is
+  // to say what was assumed instead of letting the figures look authoritative.
+  assumptions: string[];
+  basis_fallback: string | null;
 }
 
 interface MetalValuation {
@@ -70,11 +78,12 @@ export function ProfitSplitPage() {
   const [reval, setReval] = useState<Revaluation | null>(null);
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
+  const [basis, setBasis] = useState<"cost" | "replacement">("cost");
   const [error, setError] = useState<string | null>(null);
   const [asking, setAsking] = useState(false);
 
   const load = useCallback(async () => {
-    const params: Record<string, string> = {};
+    const params: Record<string, string> = { basis };
     if (from) params.date_from = from;
     if (to) params.date_to = to;
     try {
@@ -89,7 +98,7 @@ export function ProfitSplitPage() {
     } catch {
       setReval(null);
     }
-  }, [from, to]);
+  }, [from, to, basis]);
 
   useEffect(() => {
     load();
@@ -127,6 +136,49 @@ export function ProfitSplitPage() {
         </p>
       </div>
 
+      {/* Two legitimate answers to "what did we make", not a display option.
+          Labelled by the question each one answers, because "cost" and
+          "replacement" mean nothing to somebody who has not read the code. */}
+      <div className="card">
+        <p className="eyebrow">How should metal be valued?</p>
+        <div className="mt-2 grid gap-2 sm:grid-cols-2">
+          {(
+            [
+              {
+                key: "cost" as const,
+                title: "At what we paid",
+                blurb:
+                  "The rate locked onto each piece when it was stocked. Gross profit as an accountant means it — and the only one that reconciles to the ledger unaided.",
+              },
+              {
+                key: "replacement" as const,
+                title: "At today's rate",
+                blurb:
+                  "What it would cost to restock what you just sold. In a rising market this is the smaller, more sobering number.",
+              },
+            ]
+          ).map((o) => (
+            <button
+              key={o.key}
+              onClick={() => setBasis(o.key)}
+              className={`rounded-xl border p-3 text-left transition ${
+                basis === o.key
+                  ? "border-brand-400 bg-brand-50"
+                  : "border-slate-200 hover:border-slate-300"
+              }`}
+            >
+              <p className="text-sm font-semibold text-slate-900">{o.title}</p>
+              <p className="mt-0.5 text-[11px] leading-relaxed text-slate-500">{o.blurb}</p>
+            </button>
+          ))}
+        </div>
+        {split?.basis_fallback && (
+          <p className="mt-2 rounded-lg bg-amber-50 px-3 py-2 text-[11px] text-amber-900">
+            {split.basis_fallback}
+          </p>
+        )}
+      </div>
+
       <div className="flex flex-wrap items-center gap-3">
         <label className="text-xs text-slate-500">
           From{" "}
@@ -148,7 +200,7 @@ export function ProfitSplitPage() {
         </label>
         <a
           className="btn-ghost ml-auto"
-          href={`/api/v1/reports/profit-split?format=csv${
+          href={`/api/v1/reports/profit-split?format=csv&basis=${basis}${
             from ? `&date_from=${from}` : ""
           }${to ? `&date_to=${to}` : ""}`}
         >
@@ -203,6 +255,32 @@ export function ProfitSplitPage() {
               </p>
             )}
           </div>
+
+          {/* Stated in full, never collapsed. These figures come from a
+              conventional method rather than one the shop wrote down, and a
+              reader deciding prices off them is entitled to know on what. */}
+          {split.assumptions.length > 0 && (
+            <div className="card mt-3 bg-slate-50/60">
+              <p className="eyebrow">What this assumes</p>
+              <ul className="mt-2 space-y-1.5">
+                {split.assumptions.map((a, i) => (
+                  <li
+                    key={i}
+                    className="flex gap-2 text-[11px] leading-relaxed text-slate-600"
+                  >
+                    <span className="flex-none text-slate-300">—</span>
+                    <span>{a}</span>
+                  </li>
+                ))}
+              </ul>
+              <p className="mt-2 border-t border-slate-200 pt-2 text-[11px] italic leading-relaxed text-slate-500">
+                The shop has not written its profit formulas down, so these follow the
+                common jeweller's convention. Tell us where one differs from how you
+                reckon it and it will be changed — nothing here is a rule the system
+                invented for its own convenience.
+              </p>
+            </div>
+          )}
         </section>
       )}
 

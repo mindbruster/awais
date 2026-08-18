@@ -34,6 +34,15 @@ class Settings(BaseSettings):
     # with two or more people turns it on.
     require_two_person_approval: bool = False
 
+    # Which of the two profit methods the shop reads by default. Either can be
+    # asked for per request; this is only what the screen opens on.
+    #
+    # `cost` — metal at what we paid for it. Gross profit as an accountant
+    #   means it, and the only one that reconciles to the ledger unaided.
+    # `replacement` — metal at today's rate. Answers "can we restock?", and
+    #   in a rising market shows a smaller, more sobering number.
+    default_profit_basis: str = "cost"
+
     # NoDecode skips pydantic-settings' default JSON-parse of complex types so our
     # comma-separated env value reaches the field_validator below as a raw string.
     cors_origins: Annotated[List[str], NoDecode] = Field(

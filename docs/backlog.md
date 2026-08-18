@@ -100,6 +100,65 @@ and a CSV export to match every other report.
 
 ---
 
+## 4i · The owner's second maker example — **pinned**
+
+Given after the fact and matching the implementation exactly:
+
+```
+100 g pure gold given to the maker
+102 g of 18k received back
+102 / 96 * 10      = 10.625 g allowance at 10 ratti
+102 + 10.625       = 112.625 g adjusted
+112.625 / 24 * 18  =  84.469 g pure equivalent
+100 - 84.469       =  15.531 g the maker owes the shop
+```
+
+The system computes **15.5312** by the other route — issued fine, less received
+fine, less the allowance in fine — which is the same identity rearranged.
+Asserting the *answer* rather than the route is what makes that safe: if either
+derivation drifts, the test fails.
+
+---
+
+## 4h · Profit, two ways — **done**
+
+Guide §41 named two profit setups and said the formulas were *"TBD and must be
+finalized with the business"*. They never were. Rather than leave the last item
+open indefinitely, the **common jeweller's convention** is implemented, both
+methods are selectable, and **every judgement the report makes is printed on the
+report** — so a figure built on a rule the owner did not choose is visible
+rather than authoritative-looking.
+
+| Basis | Metal valued at | Answers |
+|---|---|---|
+| `cost` *(default)* | the rate locked when the piece was stocked | *Did we trade well?* |
+| `replacement` | today's rate | *Can we restock what we sold?* |
+
+On the current data the two differ by **Rs 44,227** — and that gap is the
+holding gain, not trading profit.
+
+Three rules:
+
+- **Only the gold stream can move between bases.** Stones and making are
+  identical under both, and the e2e asserts it: a difference appearing anywhere
+  else means the basis leaked.
+- **Stones are at parcel cost under both.** There is no market rate for a grade
+  of diamond the way there is for metal — a price for "12 PTR commercial VS1" is
+  a negotiation, not a quotation — so a replacement value would be invented.
+- **The replacement basis warns against double counting.** The gap between the
+  two *is* the holding gain, and the metal revaluation already reports it. A
+  shop reading replacement here and adding the revaluation counts the same money
+  twice, so the report says so on its face.
+
+An unknown basis is a 422 rather than a silent fallback: reporting one method
+under another's name is worse than refusing.
+
+**Still not settled.** This is a convention, not the shop's own rule. The screen
+says so in as many words and invites correction. When the owner writes the two
+formulas down, they replace these and get pinned like the maker's 15.531 g.
+
+---
+
 ## 4g · Two-person approval on a write-off — **done** (0042)
 
 `stock_counts` already recorded the creator and the poster separately, so a shop
