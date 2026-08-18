@@ -5019,6 +5019,41 @@ def main() -> int:
         "it would leave their accounts pointing at nothing",
     )
 
+    # --- the roles the specification asked for --------------------------
+    expected = {"manager", "inventory_manager", "sales_manager",
+                "salesman", "maker_manager", "viewer"}
+    check(
+        "the roles §11 asks for are seeded",
+        expected <= set(roles),
+        f"missing {sorted(expected - set(roles))}",
+    )
+    check(
+        "they are editable, not system roles",
+        all(not roles[n]["is_system"] for n in expected),
+        "the shop is meant to rename and re-scope these; marking them system "
+        "would stop it",
+    )
+    check(
+        "each holds something, and none holds everything",
+        all(0 < len(roles[n]["permissions"]) < len(cat) for n in expected),
+        str({n: len(roles[n]["permissions"]) for n in expected}),
+    )
+    # The safe direction for a guess is narrow. These are starting points the
+    # shop will adjust, and a default that quietly handed a salesman the ledger
+    # would be discovered long after it mattered.
+    for sensitive in ("ledger:read", "audit:read", "report:profit", "user:manage"):
+        check(
+            f"no seeded role reaches {sensitive} by default",
+            all(sensitive not in roles[n]["permissions"] for n in expected),
+            f"{[n for n in expected if sensitive in roles[n]['permissions']]} holds it — "
+            "the owner's information should be granted deliberately, not inherited",
+        )
+    check(
+        "the viewer can read and cannot write",
+        all(p.endswith(":read") for p in roles["viewer"]["permissions"]),
+        str([p for p in roles["viewer"]["permissions"] if not p.endswith(":read")]),
+    )
+
     # --- modules -------------------------------------------------------
     mods = {m["key"]: m for m in client.get("/admin/modules", headers=sa).json()}
     check("every sidebar section has a switch", len(mods) >= 10, str(sorted(mods)))

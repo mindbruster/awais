@@ -141,6 +141,106 @@ def register(perm: str) -> str:
     return perm
 
 
+# The roles §11 of the specification asks for, beyond the three this system
+# started with. Seeded so a shop has somewhere to put people on day one rather
+# than building six roles by hand before it can add a second user.
+#
+# **Starting points, not policy.** Every one is editable by the super admin,
+# and the shop's own working arrangements are what should decide them — a
+# salesman who also takes stock counts is perfectly ordinary and no default can
+# know it. What the defaults do guarantee is that none of them can read the
+# ledger, the audit log or the profit reports unless somebody says so: those are
+# the owner's information, and the safe direction for a guess is narrow.
+EXTRA_ROLES: dict[str, tuple[str, set[str]]] = {
+    "manager": (
+        "Runs the floor day to day: sells, orders stock, moves work through the "
+        "workshop. Not the books.",
+        {
+            "customer:read", "customer:write",
+            "invoice:read", "invoice:write", "invoice:issue",
+            "approval:read", "approval:write",
+            "order:read", "order:write",
+            "design:read", "design:write",
+            "vendor:read", "vendor:write",
+            "product:read", "product:write",
+            "inventory:read", "inventory:write",
+            "stock_movement:read", "stock_movement:write",
+            "stone:read", "transfer:read", "transfer:write",
+            "seller:read", "master:read", "branch:read",
+            "gold_rate:read", "notification:read", "notification:send",
+            "payment:read", "payment:write",
+            "report:sales", "report:stock", "report:loss",
+        },
+    ),
+    "inventory_manager": (
+        "Holds the stock: what is in the safe, what came in, what moved between "
+        "shops.",
+        {
+            "inventory:read", "inventory:write",
+            "stock_movement:read", "stock_movement:write",
+            "product:read", "product:write",
+            "stone:read", "stone:write",
+            "transfer:read", "transfer:write",
+            "design:read", "vendor:read",
+            "master:read", "branch:read", "gold_rate:read",
+            "report:stock",
+        },
+    ),
+    "sales_manager": (
+        "Owns the counter and the people on it: bills, memos, salesmen and their "
+        "targets.",
+        {
+            "customer:read", "customer:write",
+            "invoice:read", "invoice:write", "invoice:issue", "invoice:mark_paid",
+            "approval:read", "approval:write",
+            "order:read", "order:write",
+            "payment:read", "payment:write",
+            "seller:read", "seller:write",
+            "product:read", "inventory:read", "stone:read",
+            "master:read", "branch:read", "gold_rate:read",
+            "notification:read", "notification:send",
+            "report:sales",
+        },
+    ),
+    "salesman": (
+        "Sells. Writes a bill and takes a payment, and sees the stock to sell "
+        "from — nothing behind it.",
+        {
+            "customer:read", "customer:write",
+            "invoice:read", "invoice:write",
+            "approval:read", "approval:write",
+            "order:read", "order:write",
+            "payment:read", "payment:write",
+            "product:read", "inventory:read", "stone:read",
+            "gold_rate:read", "master:read", "branch:read",
+        },
+    ),
+    "maker_manager": (
+        "Runs the workshop: issues metal, receives it back, settles with "
+        "karigars and setters.",
+        {
+            "design:read", "design:write",
+            "vendor:read", "vendor:write",
+            "inventory:read", "stock_movement:read",
+            "product:read", "product:write",
+            "stone:read", "order:read",
+            "master:read", "branch:read", "gold_rate:read",
+            "report:loss", "report:stock",
+        },
+    ),
+    "viewer": (
+        "Reads and changes nothing. For an accountant's assistant, an auditor, "
+        "or anybody who needs to look without the chance of a slip.",
+        {
+            "customer:read", "invoice:read", "approval:read", "order:read",
+            "design:read", "vendor:read", "product:read", "inventory:read",
+            "stock_movement:read", "stone:read", "transfer:read", "seller:read",
+            "master:read", "branch:read", "gold_rate:read", "payment:read",
+        },
+    ),
+}
+
+
 def all_permissions() -> set[str]:
     """
     Everything grantable: what the code checks, plus what the seeded roles hold.

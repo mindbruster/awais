@@ -15,7 +15,12 @@ from app.core.security import hash_password
 # permission catalogue, and seeding grants against an empty catalogue would
 # create roles that hold nothing.
 import app.api.v1  # noqa: F401
-from app.core.permissions import SUPERADMIN, all_permissions, default_permissions
+from app.core.permissions import (
+    EXTRA_ROLES,
+    SUPERADMIN,
+    all_permissions,
+    default_permissions,
+)
 from app.models.role import Role, RolePermission
 from app.models.user import User
 
@@ -27,6 +32,10 @@ DEFAULT_ROLES = [
     ("admin", "Full system access", True),
     ("accountant", "Sales, invoices, reports", True),
     ("staff", "Day-to-day operations", True),
+    # The rest of the roles §11 of the specification asks for. Not system
+    # roles: the shop is meant to rename, re-scope or delete these, and marking
+    # them system would stop it. They start life holding nobody.
+    *((name, desc, False) for name, (desc, _perms) in EXTRA_ROLES.items()),
 ]
 
 configure_logging()
@@ -72,9 +81,12 @@ async def seed() -> None:
             # somehow removed, whoever holds it can still get back in and put
             # them back. A role whose power is invisible is one somebody
             # eventually "tidies up".
-            wanted = (
-                all_permissions() if name == SUPERADMIN else default_permissions(name)
-            )
+            if name == SUPERADMIN:
+                wanted = all_permissions()
+            elif name in EXTRA_ROLES:
+                wanted = EXTRA_ROLES[name][1]
+            else:
+                wanted = default_permissions(name)
             held = role.permission_names
             for perm in sorted(wanted - held):
                 db.add(RolePermission(role_id=role.id, permission=perm))

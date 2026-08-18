@@ -146,6 +146,27 @@ One switch per sidebar section, managed by a super admin.
 - **Dashboard and Settings can never be switched off.** A shop that turned off
   Settings could never turn anything back on.
 
+### The nine roles §11 asked for
+
+Three existed. The other six are seeded and hold nobody until somebody is put
+on them:
+
+| Role | Holds | Reaches |
+|---|---|---|
+| `manager` | 33 | the floor: sells, orders stock, moves work through the workshop |
+| `sales_manager` | 23 | the counter and the people on it, including targets |
+| `inventory_manager` | 16 | the safe: what is in it, what came in, what moved |
+| `salesman` | 16 | writes a bill, takes a payment, sees stock to sell from |
+| `maker_manager` | 15 | issues metal, receives it, settles with karigars |
+| `viewer` | 16 | reads, and cannot write a single thing |
+
+**Starting points, not policy.** All six are editable — a salesman who also
+takes stock counts is perfectly ordinary and no default can know it. What they
+do guarantee is that **none reaches the ledger, the audit log, profit reports or
+user management** unless somebody grants it deliberately. That is the owner's
+information, and the safe direction for a guess is narrow. Asserted, so a later
+edit to the defaults cannot widen them by accident.
+
 ### The super admin tier
 
 New, above admin, holding feature flags and role editing — an admin who can
