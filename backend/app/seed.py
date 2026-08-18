@@ -16,7 +16,6 @@ from app.core.security import hash_password
 # create roles that hold nothing.
 import app.api.v1  # noqa: F401
 from app.core.permissions import (
-    EXTRA_ROLES,
     SUPERADMIN,
     all_permissions,
     default_permissions,
@@ -32,10 +31,6 @@ DEFAULT_ROLES = [
     ("admin", "Full system access", True),
     ("accountant", "Sales, invoices, reports", True),
     ("staff", "Day-to-day operations", True),
-    # The rest of the roles §11 of the specification asks for. Not system
-    # roles: the shop is meant to rename, re-scope or delete these, and marking
-    # them system would stop it. They start life holding nobody.
-    *((name, desc, False) for name, (desc, _perms) in EXTRA_ROLES.items()),
 ]
 
 configure_logging()
@@ -83,8 +78,6 @@ async def seed() -> None:
             # eventually "tidies up".
             if name == SUPERADMIN:
                 wanted = all_permissions()
-            elif name in EXTRA_ROLES:
-                wanted = EXTRA_ROLES[name][1]
             else:
                 wanted = default_permissions(name)
             held = role.permission_names
