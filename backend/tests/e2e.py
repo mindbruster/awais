@@ -107,21 +107,38 @@ def main() -> int:
     r = client.get("/users", headers=auth)
     check("admin can list users", r.status_code == 200 and len(r.json()) >= 1)
 
-    r = client.post(
-        "/users",
-        headers=auth,
-        json={
-            "email": "staff1@jewelry.local",
-            "full_name": "Staff One",
-            "password": "staff123",
-            "role_id": next(role["id"] for role in [r.json()[0]["role"]] if role["name"] == "admin") + 2,  # crude; we'll fix
-        },
-    )
-    # Actually, look up role_id properly:
-    # Re-list roles via a user record's role; simpler: hit /auth/me which gave admin role id
+    # Roles looked up by name, not by arithmetic on an id.
+    #
+    # This used to read the first user's role and add two, on the assumption
+    # that roles were seeded admin-first in a fixed order. Adding the super
+    # admin put a different account first and the whole suite stopped at line
+    # one hundred and seventeen — which is the argument against deriving an
+    # identifier from insertion order in the first place.
+    role_ids = {u["role"]["name"]: u["role"]["id"] for u in r.json() if u.get("role")}
     admin_role_id = me["role"]["id"]
-    # We seeded 3 roles; staff is admin_role_id + 2 (insertion order)
-    staff_role_id = admin_role_id + 2
+    role_ids.setdefault("admin", admin_role_id)
+    staff_role_id = role_ids.get("staff")
+    if staff_role_id is None:
+        # No user holds it yet, which is the ordinary case on a fresh database.
+        # Seeded in a known order after the two accounts, so it is one of the
+        # ids near admin's — probe rather than guess.
+        for candidate in range(admin_role_id + 1, admin_role_id + 4):
+            probe = client.post("/users", headers=auth, json={
+                "email": f"probe{candidate}@jewelryerp.com", "full_name": "probe",
+                "password": "probe12345", "role_id": candidate,
+            })
+            if probe.status_code == 201 and probe.json()["role"]["name"] == "staff":
+                staff_role_id = candidate
+                # Its own confirm header: `pwd_h` is not bound until later in
+                # the file, and a closure reading it here fails with a name
+                # error rather than a useful message.
+                client.delete(
+                    f"/users/{probe.json()['id']}",
+                    headers={**auth, "X-Confirm-Password": "admin123"},
+                )
+                break
+    check("the staff role can be found by name", staff_role_id is not None,
+          f"roles seen: {sorted(role_ids)}")
 
     # Re-create with correct id
     r = client.post(
@@ -4868,6 +4885,220 @@ def main() -> int:
 
     check("a timeline for a piece that does not exist → 404",
           client.get("/products/999999/timeline", headers=auth).status_code == 404)
+
+    # ----------------------------------------------------------------------
+    # Roles that mean something, and modules that can be switched off
+    #
+    # Two features answering the same question from opposite sides: what is
+    # this person allowed to reach. The assertions that matter are the ones
+    # about failing closed — a permission system that quietly grants nothing,
+    # or a module that is off in the sidebar and on at the endpoint, is worse
+    # than none, because both look like they are working.
+    # ----------------------------------------------------------------------
+    section("RBAC and modules")
+
+    check(
+        "an admin cannot reach the super admin panel",
+        client.get("/admin/modules", headers=auth).status_code == 403,
+        "an admin who can widen their own permissions is not limited by them",
+    )
+
+    sa_user = client.post("/users", headers=auth, json={
+        "email": "root_e2e@jewelryerp.com", "full_name": "Root",
+        "password": "root12345", "role_id": 1,
+    })
+    check("admin can still manage users", sa_user.status_code == 201,
+          f"got {sa_user.status_code}: {sa_user.text[:160]} — this broke once when the "
+          "wildcard permission stopped being a stored grant")
+    sr = client.post("/auth/login", json={"email": "root_e2e@jewelryerp.com",
+                                          "password": "root12345"}).json()
+    sa = {"Authorization": f"Bearer {sr['access_token']}"}
+    sa_pwd = {**sa, "X-Confirm-Password": "root12345"}
+
+    # --- the catalogue -------------------------------------------------
+    cat = client.get("/admin/permissions", headers=sa).json()
+    keys = {p["key"] for p in cat}
+    check("the catalogue lists every permission", len(cat) > 50, f"got {len(cat)}")
+    check(
+        "including ones no seeded role holds",
+        "master:delete" in keys and "ledger:delete" in keys,
+        "these are checked by real endpoints and belonged to no role — deriving the "
+        "catalogue from grants dropped them and quietly broke six delete buttons",
+    )
+
+    roles = {r["name"]: r for r in client.get("/admin/roles", headers=sa).json()}
+    check("admin holds the whole catalogue", len(roles["admin"]["permissions"]) == len(cat),
+          f"admin {len(roles['admin']['permissions'])} vs catalogue {len(cat)}")
+    check("staff holds fewer", len(roles["staff"]["permissions"]) < len(cat),
+          "a role that holds everything is not a role")
+    check(
+        "the super admin holds the whole catalogue too",
+        len(roles["superadmin"]["permissions"]) == len(cat),
+        f"holds {len(roles['superadmin']['permissions'])} of {len(cat)}",
+    )
+    # Two mechanisms, failing in opposite directions: the grants make the role
+    # honest — a panel showing an empty role that mysteriously works invites
+    # somebody to tidy it away — while the name check means that even with
+    # every grant gone, whoever holds it can still get in and restore them.
+    check(
+        "and is still recognised by name, so it cannot be stripped",
+        client.patch(f"/admin/roles/{roles['superadmin']['id']}", headers=sa_pwd,
+                     json={"permissions": []}).status_code == 409,
+        "stripping it would leave nobody able to grant anything, with no way back",
+    )
+    sa_login = client.post("/auth/login", json={
+        "email": "superadmin@jewelryerp.com", "password": "superadmin123"})
+    check("the seeded super admin account signs in", sa_login.status_code == 200,
+          f"got {sa_login.status_code} — the tier is useless if nobody holds it")
+    seeded = {"Authorization": f"Bearer {sa_login.json()['access_token']}"}
+    check(
+        "and it reaches both the panel and the ordinary screens",
+        client.get("/admin/modules", headers=seeded).status_code == 200
+        and client.get("/customers", headers=seeded).status_code == 200,
+        "a super admin who cannot open an invoice cannot check what they just changed",
+    )
+
+    # --- a role the shop creates itself --------------------------------
+    made = client.post("/admin/roles", headers=sa, json={
+        "name": "Viewer", "description": "Reads and nothing else",
+        "permissions": ["customer:read", "invoice:read"],
+    })
+    check("create a role → 201", made.status_code == 201, f"got {made.status_code}: {made.text[:180]}")
+    made = made.json()
+    check("it holds exactly what was asked for",
+          sorted(made["permissions"]) == ["customer:read", "invoice:read"], str(made["permissions"]))
+
+    # The trap this feature exists to remove: before permissions were rows, a
+    # role created this way silently held nothing.
+    client.post("/users", headers=auth, json={
+        "email": "viewer_e2e@jewelryerp.com", "full_name": "Viewer",
+        "password": "view12345", "role_id": made["id"],
+    })
+    vr = client.post("/auth/login", json={"email": "viewer_e2e@jewelryerp.com",
+                                          "password": "view12345"}).json()
+    vw = {"Authorization": f"Bearer {vr['access_token']}"}
+    check(
+        "a shop-created role actually works",
+        client.get("/customers", headers=vw).status_code == 200,
+        "before this, a custom role held nothing and no error said why",
+    )
+    check(
+        "and is limited to what it was granted",
+        client.get("/ledger/entries", headers=vw).status_code == 403,
+        "a role that was granted two permissions must not reach a third",
+    )
+
+    check(
+        "a permission nothing checks is refused",
+        client.patch(f"/admin/roles/{made['id']}", headers=sa_pwd,
+                     json={"permissions": ["invoice:read", "not:areal"]}).status_code == 422,
+        "granting it would confer nothing while looking like it did",
+    )
+    check(
+        "revoking works, not just granting",
+        sorted(client.patch(f"/admin/roles/{made['id']}", headers=sa_pwd,
+                            json={"permissions": ["invoice:read"]}).json()["permissions"])
+        == ["invoice:read"],
+        "a merge-only endpoint can add a permission and never take one away",
+    )
+    check(
+        "the super admin role cannot be edited",
+        client.patch(f"/admin/roles/{roles['superadmin']['id']}", headers=sa_pwd,
+                     json={"permissions": []}).status_code == 409,
+        "stripping it would leave nobody able to grant anything, with no way back",
+    )
+    check(
+        "a system role cannot be renamed",
+        client.patch(f"/admin/roles/{roles['staff']['id']}", headers=sa_pwd,
+                     json={"name": "peon"}).status_code == 409,
+        "the seed and the migrations look it up by name",
+    )
+    check(
+        "a role with users on it cannot be deleted",
+        client.delete(f"/admin/roles/{made['id']}", headers=sa_pwd).status_code == 409,
+        "it would leave their accounts pointing at nothing",
+    )
+
+    # --- the roles the specification asked for --------------------------
+    expected = {"manager", "inventory_manager", "sales_manager",
+                "salesman", "maker_manager", "viewer"}
+    check(
+        "the roles §11 asks for are seeded",
+        expected <= set(roles),
+        f"missing {sorted(expected - set(roles))}",
+    )
+    check(
+        "they are editable, not system roles",
+        all(not roles[n]["is_system"] for n in expected),
+        "the shop is meant to rename and re-scope these; marking them system "
+        "would stop it",
+    )
+    check(
+        "each holds something, and none holds everything",
+        all(0 < len(roles[n]["permissions"]) < len(cat) for n in expected),
+        str({n: len(roles[n]["permissions"]) for n in expected}),
+    )
+    # The safe direction for a guess is narrow. These are starting points the
+    # shop will adjust, and a default that quietly handed a salesman the ledger
+    # would be discovered long after it mattered.
+    for sensitive in ("ledger:read", "audit:read", "report:profit", "user:manage"):
+        check(
+            f"no seeded role reaches {sensitive} by default",
+            all(sensitive not in roles[n]["permissions"] for n in expected),
+            f"{[n for n in expected if sensitive in roles[n]['permissions']]} holds it — "
+            "the owner's information should be granted deliberately, not inherited",
+        )
+    check(
+        "the viewer can read and cannot write",
+        all(p.endswith(":read") for p in roles["viewer"]["permissions"]),
+        str([p for p in roles["viewer"]["permissions"] if not p.endswith(":read")]),
+    )
+
+    # --- modules -------------------------------------------------------
+    mods = {m["key"]: m for m in client.get("/admin/modules", headers=sa).json()}
+    check("every sidebar section has a switch", len(mods) >= 10, str(sorted(mods)))
+    check(
+        "dashboard and settings cannot be switched off",
+        not mods["settings"]["can_disable"] and not mods["dashboard"]["can_disable"],
+        "a shop that turned off Settings could never turn anything back on",
+    )
+    check(
+        "manufacturing is held open by live work",
+        mods["manufacturing"]["blockers"] and not mods["manufacturing"]["can_switch_off"],
+        f"blockers {mods['manufacturing']['blockers']} — metal is out with workers",
+    )
+    r = client.patch("/admin/modules/manufacturing", headers=sa_pwd, json={"enabled": False})
+    check("and switching it off is refused → 409", r.status_code == 409,
+          f"got {r.status_code}: {r.text[:180]}")
+    check(
+        "the refusal names what is holding it",
+        "out with workers" in r.text or "outside the building" in r.text,
+        r.text[:200],
+    )
+
+    # A module with nothing live in it switches off — and is off on the server,
+    # not merely hidden in the sidebar.
+    r = client.patch("/admin/modules/rates", headers=sa_pwd, json={"enabled": False})
+    check("a quiet module switches off → 200", r.status_code == 200, f"got {r.status_code}")
+    check(
+        "and its endpoints refuse, not just its links",
+        client.get("/gold-rates", headers=auth).status_code == 403,
+        "hiding a link changes nothing — the POST still arrives",
+    )
+    check(
+        "other modules are unaffected",
+        client.get("/customers", headers=auth).status_code == 200,
+        "one switch must not take the shop down",
+    )
+    client.patch("/admin/modules/rates", headers=sa_pwd, json={"enabled": True})
+    check("switching back on restores it",
+          client.get("/gold-rates", headers=auth).status_code == 200)
+    check(
+        "an admin cannot switch modules",
+        client.patch("/admin/modules/rates", headers=pwd_h, json={"enabled": False}).status_code
+        == 403,
+        "flags belong to somebody who is not also running the counter",
+    )
 
     # ----------------------------------------------------------------------
     # The business overview

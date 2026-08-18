@@ -61,7 +61,8 @@ from app.models.purchase import (
     SupplierPayment,
 )
 from app.models.product_stone import ProductStone
-from app.models.role import Role
+from app.models.module import Module
+from app.models.role import Role, RolePermission
 from app.models.stock_count import StockCount, StockCountLine, StockCountStatus
 from app.models.stock_movement import MovementType, StockMovement
 from app.models.cash import CashCategory, CashDirection, CashEntry, CashMethod
@@ -103,6 +104,8 @@ __all__ = [
     "StockCount",
     "StockCountLine",
     "StockCountStatus",
+    "Module",
+    "RolePermission",
     "Supplier",
     "SupplierPayment",
     "GoldKind",

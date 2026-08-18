@@ -100,6 +100,99 @@ and a CSV export to match every other report.
 
 ---
 
+## 5x · Module flags and real RBAC — **done** (0043)
+
+Two features answering the same question from opposite sides: *what is this
+person allowed to reach.*
+
+### RBAC
+
+**Roles were a table with no permissions in it.** `roles` held a name; the
+permissions lived in a Python dict keyed by that name. A shop could create a
+role called "Manager" through the API and it would silently hold **zero**
+permissions — the dict had no entry, every check returned False, and nothing
+said why. The guide asked for nine roles; three existed and none could change
+without a deploy.
+
+| | |
+|---|---|
+| Grants | rows in `role_permissions`, seeded from the same dict so nothing changed on the day |
+| Catalogue | built from what `require_perm` actually guards, so it cannot be incomplete |
+| Editing | `/admin/roles` — create, rename, replace grants, delete |
+| Guard rails | superadmin role uneditable; system roles unrenameable; a role with users undeletable; unknown permissions 422 |
+
+**Two bugs this surfaced.** `require_perm("*")` gated user management and the
+audit log — a wildcard that worked while permissions were a dict literal and
+meant nothing once they were rows. It failed *closed*: admin quietly lost both,
+and the only symptom was a 403 on screens that had always worked. They are real
+permissions now (`user:manage`, `audit:read`), which is also more honest.
+
+Then the catalogue itself was derived from what roles *held*, so `master:delete`
+and `ledger:delete` — checked by real endpoints, granted to nobody, reached by
+admin through `*` — vanished, breaking six delete buttons. It is now built by
+`require_perm` registering each permission as it guards it: a permission cannot
+be enforced and missing from the list, because enforcing it is what adds it.
+
+### Module flags
+
+One switch per sidebar section, managed by a super admin.
+
+- **Off means off on the server.** 21 routers carry the guard, applied at the
+  router so an endpoint added later is covered by default. Hiding a link changes
+  nothing — the POST still arrives.
+- **A module holding live work cannot be switched off**, and the refusal names
+  what: *"3 jobs still out with workers; 1,272.180 fine g outside"*. Hiding it
+  would strand real metal behind an unreachable screen.
+- **Dashboard and Settings can never be switched off.** A shop that turned off
+  Settings could never turn anything back on.
+
+### The nine roles §11 asked for
+
+Three existed. The other six are seeded and hold nobody until somebody is put
+on them:
+
+| Role | Holds | Reaches |
+|---|---|---|
+| `manager` | 33 | the floor: sells, orders stock, moves work through the workshop |
+| `sales_manager` | 23 | the counter and the people on it, including targets |
+| `inventory_manager` | 16 | the safe: what is in it, what came in, what moved |
+| `salesman` | 16 | writes a bill, takes a payment, sees stock to sell from |
+| `maker_manager` | 15 | issues metal, receives it, settles with karigars |
+| `viewer` | 16 | reads, and cannot write a single thing |
+
+**Starting points, not policy.** All six are editable — a salesman who also
+takes stock counts is perfectly ordinary and no default can know it. What they
+do guarantee is that **none reaches the ledger, the audit log, profit reports or
+user management** unless somebody grants it deliberately. That is the owner's
+information, and the safe direction for a guess is narrow. Asserted, so a later
+edit to the defaults cannot widen them by accident.
+
+### The super admin tier
+
+New, above admin, holding feature flags and role editing — an admin who can
+widen their own permissions is not really constrained by them.
+
+It holds **the whole catalogue *and* is recognised by name**, and the two
+mechanisms fail in opposite directions on purpose. The grants make the role
+honest: a panel showing an empty role that mysteriously works is one somebody
+eventually tidies away. The name check means that even with every grant gone,
+whoever holds it can still sign in and put them back — so the installation can
+never be locked out of its own permission system.
+
+Seeded as its own account:
+
+```
+SEED_SUPERADMIN_EMAIL=superadmin@jewelryerp.com
+SEED_SUPERADMIN_PASSWORD=superadmin123     ← change before deploying
+```
+
+Each seeded account is guarded independently rather than the seed returning
+early on the first one found — an existing installation already has an admin,
+and bailing there would mean the super admin never got created and the tier
+existed with nobody able to reach it.
+
+---
+
 ## 4l · The business overview — **done**
 
 The last open question in this document, and it needed the shop to answer it:
