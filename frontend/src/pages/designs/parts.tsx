@@ -53,6 +53,8 @@ export interface Leg {
   gold_issued_purity: number | null;
   gold_issued_tunch_pct: string | null;
   stones_issued_ct: string;
+  /** Metal and stones on one scale, as the shop states what it handed over. */
+  gold_issued_with_stones_g: string;
   received_at: string | null;
   // What the scale read, stones and all, and the metal left once the set
   // stones come back out. Equal on a leg carrying no stones.

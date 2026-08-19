@@ -381,6 +381,27 @@ class JobLeg(Base, TimestampMixin):
     )
 
 
+    @property
+    def gold_issued_with_stones_g(self) -> Decimal:
+        """
+        Everything handed over, on one scale, the way the shop says it aloud.
+
+        A setter is given metal and a parcel, and the shop reckons the job as
+        one number out against one number back: 100g and 30ct is "106 grams
+        given". The settlement below does the same arithmetic from the other
+        end — it takes the set stones back out of the returned gross instead of
+        adding the issued ones to what went out — and on a job where every
+        carat comes back inside the piece the two are the same figure.
+
+        They stop being the same the moment a carat does not come back, and
+        that is the point: this is a statement of what left the safe, not an
+        input to the metal reckoning. Nothing is settled off it.
+        """
+        stones_g = (Decimal(str(self.stones_issued_ct or 0)) / Decimal("5"))
+        return (Decimal(str(self.gold_issued_g or 0)) + stones_g).quantize(
+            Decimal("0.0001")
+        )
+
 class LegStone(Base, TimestampMixin):
     """
     An itemised stone line on a setting leg.
