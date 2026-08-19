@@ -503,6 +503,14 @@ Data safety:
 - [ ] The restore drill in §10 has been performed and the imbalance query returned zero rows.
 - [ ] The backups bucket has a lifecycle rule.
 
+Opening position (§13 — do this before anyone writes a bill):
+- [ ] Today's gold rate is set.
+- [ ] Every pot the shop keeps material in exists, at the purity it actually holds.
+- [ ] Each pot has been **weighed** and recorded as opening stock — not copied from the old system.
+- [ ] Opening balances typed on customers, workers and bank accounts, then posted once.
+- [ ] `python -m tools.check_stock_ledger` says the shelves and the books agree.
+- [ ] A labelled backup taken at this point, before the first bill.
+
 Business sanity, in production, before handing over:
 - [ ] Created a design, posted a leg, and confirmed the ledger entry balances.
 - [ ] Created and stocked a product with a photograph.
@@ -514,25 +522,23 @@ Business sanity, in production, before handing over:
 
 Listed honestly rather than buried.
 
-1. **`frontend/src/lib/url.ts` does not handle absolute image URLs.** `staticUrl()`
-   prepends the API root to whatever it is given. That is correct for the local
-   backend's `/static/foo.png`, and wrong for the S3 backend's
-   `https://images.example.com/products/foo.png`, which comes back as
-   `https://api.example.comhttps://images.example.com/…`. **Product photos will
-   not render on Railway until this one-line guard is added:**
+1. **No screen enters the shop's opening position.** Two endpoints do it and
+   neither has a button:
 
-   ```ts
-   export function staticUrl(path: string | null | undefined): string {
-     if (!path) return "";
-     if (/^https?:\/\//i.test(path)) return path;   // already absolute (S3/R2)
-     const base = import.meta.env.VITE_API_BASE_URL ?? "";
-     const root = base.replace(/\/api\/v1\/?$/, "");
-     return `${root}${path}`;
-   }
-   ```
+   - `POST /api/v1/inventory/{item_id}/opening` — what each pot held on day one.
+     The only way to put metal or stones into stock without a purchase behind
+     it, and it posts to the asset account against `3200 Opening Balance
+     Equity` like any other document.
+   - `POST /api/v1/ledger/opening-balances` — moves the `opening_balance`
+     figures already typed on customers, workers and bank accounts into the
+     ledger. Idempotent and serialised on an advisory lock, so a double click
+     cannot double anybody's balance. It refuses without a 24k PKR gold rate on
+     record, because worker metal has to be valued to balance the entry.
 
-   That file was outside the scope that produced this runbook, so the change is
-   not in the repo yet. It is the single highest-priority item here.
+   Customer opening balances **are** enterable on the customer form; it is the
+   posting step and the stock side that have no UI. Until one exists, a shop
+   goes live either with an empty safe or by calling these with a token. See
+   §13 for the order to do it in.
 
 2. **`docker-compose.prod.yml` needs two edits.** The frontend image is now
    standalone — it listens on `${PORT:-8080}` and no longer proxies `/api` to a
@@ -564,3 +570,34 @@ Listed honestly rather than buried.
 7. **No staging environment.** Railway environments make this cheap (duplicate
    the project, use a separate database and bucket). Worth doing before the first
    migration that touches posted entries.
+
+---
+
+## 13. Day one: putting the shop's real position in
+
+The checklist above proves the software runs. This is the part that decides
+whether its numbers mean anything, and it has to happen **before** anybody
+writes a bill.
+
+Order matters, because each step is the input to the next:
+
+1. **Set today's gold rate.** Nothing metal-valued can post without one, and
+   opening balances are refused outright until it exists.
+2. **Create the pots** — each tray, safe and parcel the shop actually keeps
+   material in, at the purity that pot holds. A pot's purity is not cosmetic:
+   metal returned into a pot is valued at that purity, and putting 18k into a
+   pot labelled 24k overstates fine grams by a third.
+3. **Weigh each pot and record it as opening stock.** One call per pot. Weigh
+   it — do not copy the last system's figure, which is exactly the number the
+   count is meant to test.
+4. **Type opening balances** on customers, workers and bank accounts: who owes
+   the shop, who the shop owes, what is in each account.
+5. **Post them** with `POST /ledger/opening-balances`, once.
+6. **Check the books against the safe.** Run `python -m tools.check_stock_ledger`
+   and confirm it says the shelves and the books agree. If it does not, stop —
+   every figure the system reports from here on is built on this.
+7. **Take a backup**, and label it. This is the only moment where the database
+   is a clean statement of the shop's position with nothing posted against it.
+
+If the shop is coming off an existing system, note that its stock figures are a
+claim, not a measurement. The count in step 3 is what makes them real.
