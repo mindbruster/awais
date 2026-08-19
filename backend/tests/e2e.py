@@ -2870,6 +2870,114 @@ def main() -> int:
     r = client.get("/ledger/trial-balance", headers=auth)
     check("books balance after a full setting settlement", r.json()["balanced"] is True)
 
+    # --- the owner's own worked example, nothing unaccounted for -------------
+    # The case above deliberately loses stones. This is the clean one the owner
+    # states, where every carat is set and the reckoning is metal only:
+    #
+    #   out   100.000 g of 24k + 30 ct (= 6.000 g)   = 106.000 g
+    #   back  gross 102.000 g, all 30 ct set         =   6.000 g
+    #   net   102.000 - 6.000                        =  96.000 g
+    #   short 100.000 - 96.000                       =   4.000 g
+    #   allow 0.400 / 100 x 350                      =   1.400 g
+    #   ------------------------------------------------------------
+    #   gold receivable                                  2.600 g
+    #
+    # He reaches 4.000 by putting the stones on the *issued* side; the system
+    # takes them off the *received* side. Identical while every carat comes
+    # back inside the piece — and the moment one does not, only the second way
+    # keeps a missing diamond from being settled as if it were gold.
+    clean_gold = open_pot(
+        {"type": "raw_gold", "label": "24k for setting", "purity": 24},
+        weight_g="200", rate_per_g="32000",
+    )
+    clean_stock = open_pot(
+        {"type": "raw_stone", "label": "12 PTR parcel, clean job"},
+        weight_ct="50", value="200000",
+    )
+    clean_design = client.post("/designs", headers=auth, json={"item_id": taka_id}).json()
+    r = client.post(
+        f"/designs/{clean_design['id']}/legs",
+        headers=auth,
+        json={
+            "department_id": setting_dept_id,
+            "worker_id": setter["id"],
+            "gold_issued_g": "100",
+            "gold_issued_purity": 24,
+            "gold_source_inventory_id": clean_gold["id"],
+            "stone_source_inventory_id": clean_stock["id"],
+            "stones": [{"stone_id": setting_stone_id, "quantity_issued": 350,
+                        "weight_issued_ct": "30"}],
+            "piece_count": 350,
+            "wastage_basis": "per_100_pieces",
+            "wastage_per_100_pcs_g": "0.400",
+            "labour_basis": "per_piece",
+            "labour_rate": "5",
+        },
+    )
+    check("issue 100g of 24k and 30ct for the clean job → 201",
+          r.status_code == 201, f"got {r.status_code}: {r.text[:250]}")
+    clean_leg = r.json()
+    check(
+        "the leg states 106g handed over, metal and stones on one scale",
+        Decimal(str(clean_leg["gold_issued_with_stones_g"])) == Decimal("106"),
+        f"got {clean_leg['gold_issued_with_stones_g']} — 100g of gold plus 30ct "
+        "is how the shop says what left the safe, and until the piece comes "
+        "back it is the only reckoning there is",
+    )
+    r = client.post(
+        f"/designs/legs/{clean_leg['id']}/receive",
+        headers=auth,
+        json={
+            "gold_received_g": "102",
+            "gold_received_purity": 24,
+            "piece_count": 350,
+            "stones": [{
+                "leg_stone_id": clean_leg["stones"][0]["id"],
+                "quantity_set": 350, "weight_set_ct": "30",
+                "quantity_returned": 0, "weight_returned_ct": "0",
+                "quantity_broken": 0, "weight_broken_ct": "0",
+            }],
+        },
+    )
+    check("receive it at a gross 102g → 200", r.status_code == 200,
+          f"got {r.status_code}: {r.text[:300]}")
+    clean = r.json()
+    check(
+        "all 30ct set is 6.000g, so the metal back is 96.000g",
+        Decimal(str(clean["gold_received_g"])) == Decimal("96"),
+        f"got {clean['gold_received_g']} — 102 would mean the stones were never "
+        "taken out of the gross",
+    )
+    check(
+        "the shortfall is 4.000g, as the owner reckons it",
+        Decimal(str(clean["wastage_actual_g"])) == Decimal("4"),
+        f"got {clean['wastage_actual_g']}",
+    )
+    check(
+        "the allowance is 0.400g per 100 over 350 stones = 1.400g",
+        Decimal(str(clean["wastage_allowed_g"])) == Decimal("1.4"),
+        f"got {clean['wastage_allowed_g']}",
+    )
+    check(
+        "2.600g is receivable from the stone fixer",
+        Decimal(str(clean["wastage_excess_g"])) == Decimal("2.6"),
+        f"got {clean['wastage_excess_g']}, expected 2.6000",
+    )
+    check(
+        "at 24k the receivable is 2.600g fine as well, not converted twice",
+        Decimal(str(clean["wastage_excess_fine_g"])) == Decimal("2.6"),
+        f"got {clean['wastage_excess_fine_g']}",
+    )
+    check(
+        "nothing is left owed in stones",
+        Decimal(str(clean["stones_owed_ct"])) == Decimal("0")
+        and Decimal(str(clean["stones_broken_ct"])) == Decimal("0"),
+        f"owed {clean['stones_owed_ct']}, broken {clean['stones_broken_ct']}",
+    )
+    r = client.get("/ledger/trial-balance", headers=auth)
+    check("books still balance after the clean setting job",
+          r.json()["balanced"] is True)
+
     # Broken stones are stock, not a loss: they land in their own category
     # rather than back among the whole stones they can no longer serve.
     inv = client.get("/inventory", headers=auth, params={"type": "broken_stone"})

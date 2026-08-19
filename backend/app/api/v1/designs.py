@@ -120,6 +120,7 @@ def _leg_read(leg: JobLeg) -> JobLegRead:
             d(leg.gold_issued_tunch_pct) if leg.gold_issued_tunch_pct is not None else None
         ),
         stones_issued_ct=d(leg.stones_issued_ct),
+        gold_issued_with_stones_g=leg.gold_issued_with_stones_g,
         gold_source_inventory_id=leg.gold_source_inventory_id,
         stone_source_inventory_id=leg.stone_source_inventory_id,
         received_at=leg.received_at,

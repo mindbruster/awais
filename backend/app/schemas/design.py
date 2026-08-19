@@ -299,6 +299,9 @@ class JobLegRead(TimestampedRead):
     gold_issued_purity: int | None = None
     gold_issued_tunch_pct: Decimal | None = None
     stones_issued_ct: Decimal
+    # Metal and stones on one scale — what the shop says it handed over. A
+    # statement, not an input: the settlement never reads it.
+    gold_issued_with_stones_g: Decimal
     gold_source_inventory_id: int | None = None
     stone_source_inventory_id: int | None = None
     received_at: datetime | None = None

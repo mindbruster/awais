@@ -568,8 +568,20 @@ function LegCard({
             <Figure
               label={leg.metal === "silver" ? "Silver issued" : "Gold issued"}
               value={wt(leg.gold_issued_g)}
+              // On a leg carrying stones the shop states what it handed over
+              // as one figure — 100 g of gold and 30 ct is "106 g given" —
+              // and until the piece comes back that is the only reckoning
+              // there is. Issued carats, not set ones: nothing has been set
+              // yet. The settlement below re-states it against what actually
+              // returned, which is why the two can differ on a job where a
+              // stone goes missing.
               sub={
-                leg.gold_issued_tunch_pct
+                Number(leg.stones_issued_ct) > 0
+                  ? `${wt(leg.gold_issued_with_stones_g)} with ${wt(
+                      leg.stones_issued_ct,
+                      "ct",
+                    )} of stones`
+                  : leg.gold_issued_tunch_pct
                   ? `${Number(leg.gold_issued_tunch_pct)}% fine`
                   : leg.gold_issued_purity
                   ? `${leg.gold_issued_purity}k`
