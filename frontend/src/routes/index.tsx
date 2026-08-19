@@ -55,6 +55,7 @@ import { BillsPage } from "@/pages/purchasing/BillsPage";
 import { ReconciliationPage } from "@/pages/reconciliation/ReconciliationPage";
 import { OverviewPage } from "@/pages/reports/OverviewPage";
 import { ModulesPage } from "@/pages/settings/ModulesPage";
+import { OpeningPage } from "@/pages/settings/OpeningPage";
 
 function ProtectedRoute() {
   const token = useAuthStore((s) => s.token);
@@ -123,6 +124,7 @@ export const router = createBrowserRouter([
           { path: "/reconciliation", element: <ReconciliationPage /> },
           { path: "/overview", element: <OverviewPage /> },
           { path: "/settings/modules", element: <ModulesPage /> },
+          { path: "/settings/opening", element: <OpeningPage /> },
           { path: "/purchasing/old-gold", element: <OldGoldPage /> },
           { path: "/purchasing/stones", element: <StonePurchasePage /> },
           { path: "/purchasing/stone-stock", element: <StoneStockPage /> },

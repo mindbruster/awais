@@ -87,6 +87,42 @@ class InventoryItemRead(TimestampedRead, InventoryItemBase):
     branch_id: int | None = None
 
 
+class OpeningPotStatus(BaseModel):
+    """
+    One pot, and whether its go-live balance has been recorded.
+
+    A shop opening its books works down a list of physical containers, and the
+    only question that matters per container is "have we done this one". The
+    inventory list cannot answer it — an opening balance is a stock movement,
+    not a column — and asking per row would be one query per pot on a screen
+    that exists precisely to show them all at once.
+    """
+
+    id: int
+    label: str
+    type: InventoryType
+    location: str | None = None
+    purity: int | None = None
+    tunch_pct: Decimal | None = None
+    # Metal is declared in grams and valued per fine gram; stones and finished
+    # pieces are declared in carats or pieces and valued as a lump. The client
+    # renders a different form for each, so it is told which rather than
+    # inferring it from the type and drifting when a type is added.
+    weighs_metal: bool
+    has_opening: bool
+
+
+class OpeningStatusRead(BaseModel):
+    """Everything the go-live screen needs to show progress in one request."""
+
+    pots: list[OpeningPotStatus]
+    done: int
+    pending: int
+    # Opening balances cannot post without a rate, so the screen says so before
+    # somebody fills in a form that is going to be refused.
+    gold_rate_set: bool
+
+
 class OpeningStockCreate(BaseModel):
     """
     Stock the shop already had when it started using this system.

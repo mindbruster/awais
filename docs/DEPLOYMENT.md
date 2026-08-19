@@ -522,23 +522,12 @@ Business sanity, in production, before handing over:
 
 Listed honestly rather than buried.
 
-1. **No screen enters the shop's opening position.** Two endpoints do it and
-   neither has a button:
-
-   - `POST /api/v1/inventory/{item_id}/opening` — what each pot held on day one.
-     The only way to put metal or stones into stock without a purchase behind
-     it, and it posts to the asset account against `3200 Opening Balance
-     Equity` like any other document.
-   - `POST /api/v1/ledger/opening-balances` — moves the `opening_balance`
-     figures already typed on customers, workers and bank accounts into the
-     ledger. Idempotent and serialised on an advisory lock, so a double click
-     cannot double anybody's balance. It refuses without a 24k PKR gold rate on
-     record, because worker metal has to be valued to balance the entry.
-
-   Customer opening balances **are** enterable on the customer form; it is the
-   posting step and the stock side that have no UI. Until one exists, a shop
-   goes live either with an empty safe or by calling these with a token. See
-   §13 for the order to do it in.
+1. **Nothing checks the opening position for you.** *Settings → Opening
+   position* now records it — a checklist over the pots, and a button that
+   posts the balances typed on customers, workers and bank accounts. What it
+   does not do is tell you whether the figures are *right*. The count in §13
+   step 3 is still a person with a scale, and `check_stock_ledger` is still a
+   command someone has to run.
 
 2. **`docker-compose.prod.yml` needs two edits.** The frontend image is now
    standalone — it listens on `${PORT:-8080}` and no longer proxies `/api` to a
@@ -592,7 +581,7 @@ Order matters, because each step is the input to the next:
    count is meant to test.
 4. **Type opening balances** on customers, workers and bank accounts: who owes
    the shop, who the shop owes, what is in each account.
-5. **Post them** with `POST /ledger/opening-balances`, once.
+5. **Post them** — the button at the foot of the same screen — once.
 6. **Check the books against the safe.** Run `python -m tools.check_stock_ledger`
    and confirm it says the shelves and the books agree. If it does not, stop —
    every figure the system reports from here on is built on this.

@@ -8,9 +8,13 @@ from app.schemas.inventory import (
     InventoryItemCreate,
     InventoryItemRead,
     InventoryItemUpdate,
+    OpeningPotStatus,
+    OpeningStatusRead,
     OpeningStockCreate,
 )
+from app.models.currency import Currency
 from app.services import opening_stock
+from app.services.gold_rate import rate_in_force
 from app.services.audit import changes, log_action, snapshot
 
 router = APIRouter()
@@ -62,6 +66,55 @@ async def create_item(
     await db.commit()
     await db.refresh(item)
     return item
+
+
+@router.get("/opening-status", response_model=OpeningStatusRead, dependencies=[read])
+async def opening_status(db: DbSession) -> OpeningStatusRead:
+    """
+    Which pots still need their go-live balance, and which are done.
+
+    Declared **above** `/{item_id}` on purpose: FastAPI matches in declaration
+    order, so a dynamic segment registered first would swallow this path and
+    answer it with "Inventory item not found" for an id of "opening-status".
+
+    Two queries regardless of how many pots there are — the pots, and the set of
+    ids that already have an opening movement — rather than asking per row. A
+    shop with sixty trays would otherwise pay sixty round trips to draw a
+    checklist.
+    """
+    pots = list(
+        (
+            await db.execute(
+                select(InventoryItem)
+                .where(InventoryItem.type.in_(opening_stock.OPENABLE_TYPES))
+                .order_by(InventoryItem.type, InventoryItem.label)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    opened = await opening_stock.opened_item_ids(db, [p.id for p in pots])
+    rate = await rate_in_force(db, currency=Currency.PKR, purity=24)
+
+    rows = [
+        OpeningPotStatus(
+            id=p.id,
+            label=p.label,
+            type=p.type,
+            location=p.location,
+            purity=p.purity,
+            tunch_pct=p.tunch_pct,
+            weighs_metal=p.type in opening_stock.METAL_TYPES,
+            has_opening=p.id in opened,
+        )
+        for p in pots
+    ]
+    return OpeningStatusRead(
+        pots=rows,
+        done=sum(1 for r in rows if r.has_opening),
+        pending=sum(1 for r in rows if not r.has_opening),
+        gold_rate_set=rate is not None,
+    )
 
 
 @router.get("/{item_id}", response_model=InventoryItemRead, dependencies=[read])
