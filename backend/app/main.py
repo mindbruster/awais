@@ -24,15 +24,44 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("startup", extra={"env": settings.environment, "app": settings.app_name})
+    # CORS is the one production setting that is wrong *silently*. A deployment
+    # left on the shipped default boots, passes its healthcheck and serves the
+    # API perfectly — and every browser request from the real domain is refused
+    # by the browser, so the only evidence is in a console nobody on the shop
+    # floor opens. Not fatal, because a same-origin deploy needs no origins at
+    # all; loud, because the alternative is an afternoon of "the site is blank".
+    if settings.environment.lower() not in ("development", "test", "ci"):
+        local = [o for o in settings.cors_origins
+                 if "localhost" in o or "127.0.0.1" in o]
+        if local:
+            log.warning(
+                "CORS_ORIGINS still contains local addresses in a non-development "
+                "environment — browser requests from the real domain will be "
+                "refused unless the frontend is served from this same origin",
+                extra={"cors_origins": settings.cors_origins},
+            )
     yield
     log.info("shutdown")
 
+
+# The interactive docs are a development tool. In production they publish the
+# whole endpoint map — every path, every field name, every enum value — to
+# anyone who asks, without a login. That is a map of the shop's operations
+# handed to whoever finds the host, and nobody on the counter has ever needed
+# it. Off outside development, and still one env var away for a deployment that
+# genuinely wants them.
+_docs_on = settings.environment.lower() in ("development", "test", "ci") or (
+    os.getenv("EXPOSE_API_DOCS", "").strip().lower() in ("1", "true", "yes")
+)
 
 app = FastAPI(
     title=settings.app_name,
     version="0.5.0",
     debug=settings.debug,
     lifespan=lifespan,
+    docs_url="/docs" if _docs_on else None,
+    redoc_url="/redoc" if _docs_on else None,
+    openapi_url="/openapi.json" if _docs_on else None,
 )
 
 # Rate limiting (slowapi)
