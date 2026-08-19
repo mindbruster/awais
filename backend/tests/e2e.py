@@ -174,6 +174,105 @@ def main() -> int:
     r = client.get("/users", headers=staff_auth)
     check("staff cannot list users → 403", r.status_code == 403)
 
+    # --- an admin must not be able to become the super admin ---------------
+    # Verified against a running server before the guard existed: PATCH the
+    # super admin's password as an admin returned 200, and logging in as the
+    # super admin with the password the admin had just chosen returned 200 too.
+    # The tier only means something if this is refused.
+    su_id = next(
+        (u["id"] for u in client.get("/users", headers=auth).json()
+         if u["role"]["name"] == "superadmin"),
+        None,
+    )
+    check("the super admin account exists to be protected", su_id is not None)
+    r = client.patch(
+        f"/users/{su_id}",
+        headers={**auth, "X-Confirm-Password": "admin123"},
+        json={"password": "takeover123"},
+    )
+    check(
+        "an admin cannot reset the super admin's password → 403",
+        r.status_code == 403,
+        f"got {r.status_code} — an admin who can do this holds every power the "
+        "tier above was created to withhold",
+    )
+    r = client.post(
+        "/auth/login",
+        json={"email": "superadmin@jewelryerp.com", "password": "takeover123"},
+    )
+    check(
+        "and the password it tried to set does not work",
+        r.status_code == 401,
+        f"got {r.status_code}",
+    )
+    r = client.patch(
+        f"/users/{su_id}", headers=auth, json={"full_name": "Renamed by admin"}
+    )
+    check(
+        "nor rename the super admin",
+        r.status_code == 403,
+        "the whole account is out of reach, not just its password",
+    )
+
+    # --- and must not be able to lock the shop out of its own user list ----
+    admin_id = client.get("/auth/me", headers=auth).json()["id"]
+    r = client.patch(f"/users/{admin_id}", headers=auth, json={"is_active": False})
+    check(
+        "nobody can deactivate their own account → 400",
+        r.status_code == 400,
+        f"got {r.status_code}",
+    )
+    r = client.patch(f"/users/{admin_id}", headers=auth, json={"role_id": staff_role_id})
+    check(
+        "nor move themselves off the role that let them do it → 400",
+        r.status_code == 400,
+        f"got {r.status_code} — the request that removes user:manage is the last "
+        "one that could have put it back",
+    )
+
+    # --- setting somebody else's password is a confirmed act ---------------
+    r = client.patch(f"/users/{staff_id}", headers=auth, json={"password": "resetbyadmin"})
+    check(
+        "setting another user's password without confirming your own → 401",
+        r.status_code == 401,
+        f"got {r.status_code}",
+    )
+    r = client.patch(
+        f"/users/{staff_id}",
+        headers={**auth, "X-Confirm-Password": "admin123"},
+        json={"password": "resetbyadmin"},
+    )
+    check("with the confirmation it goes through → 200", r.status_code == 200,
+          f"got {r.status_code}: {r.text[:150]}")
+
+    # --- everybody can change their own password ---------------------------
+    # The reason this endpoint exists: `user:manage` is what gated passwords,
+    # and a salesman will never hold it. It also unfreezes the seeded accounts,
+    # whose passwords the seeder will not touch once the row exists.
+    r = client.post(
+        "/auth/change-password",
+        headers=staff_auth,
+        json={"current_password": "resetbyadmin", "new_password": "chosen-by-staff"},
+    )
+    check("staff changes their own password → 204", r.status_code == 204,
+          f"got {r.status_code}: {r.text[:150]}")
+    r = client.post(
+        "/auth/login",
+        json={"email": "staff_e2e@jewelryerp.com", "password": "chosen-by-staff"},
+    )
+    check("and the new one signs them in", r.status_code == 200, f"got {r.status_code}")
+    staff_auth = {"Authorization": f"Bearer {r.json()['access_token']}"}
+    r = client.post(
+        "/auth/change-password",
+        headers=staff_auth,
+        json={"current_password": "not-it", "new_password": "another-one"},
+    )
+    check(
+        "a wrong current password is refused → 401",
+        r.status_code == 401,
+        "otherwise a session left open on the counter is a permanent takeover",
+    )
+
     # ----- CUSTOMERS -----
     section("Customers")
     r = client.post(
@@ -4964,17 +5063,34 @@ def main() -> int:
         "an admin who can widen their own permissions is not limited by them",
     )
 
-    sa_user = client.post("/users", headers=auth, json={
+    # An admin still manages users — this broke once when the wildcard
+    # permission stopped being a stored grant, and failed closed.
+    ordinary = client.post("/users", headers=auth, json={
+        "email": "hand_e2e@jewelryerp.com", "full_name": "Shop Hand",
+        "password": "hand12345", "role_id": staff_role_id,
+    })
+    check("admin can still manage users", ordinary.status_code == 201,
+          f"got {ordinary.status_code}: {ordinary.text[:160]}")
+    # But it cannot mint the tier above itself. This test used to do exactly
+    # that to get a super admin token, which is the clearest possible statement
+    # that the tier was not a boundary: whoever it excluded could create a
+    # member of it. The token now comes from signing in as the seeded account,
+    # which is the only way a real installation has.
+    minted = client.post("/users", headers=auth, json={
         "email": "root_e2e@jewelryerp.com", "full_name": "Root",
         "password": "root12345", "role_id": 1,
     })
-    check("admin can still manage users", sa_user.status_code == 201,
-          f"got {sa_user.status_code}: {sa_user.text[:160]} — this broke once when the "
-          "wildcard permission stopped being a stored grant")
-    sr = client.post("/auth/login", json={"email": "root_e2e@jewelryerp.com",
-                                          "password": "root12345"}).json()
+    check(
+        "an admin cannot create a super admin → 403",
+        minted.status_code == 403,
+        f"got {minted.status_code}: {minted.text[:160]} — a tier you can grant "
+        "yourself is not a tier",
+    )
+    sr = client.post("/auth/login", json={"email": "superadmin@jewelryerp.com",
+                                          "password": "superadmin123"}).json()
+    check("the seeded super admin signs in", "access_token" in sr, str(sr)[:160])
     sa = {"Authorization": f"Bearer {sr['access_token']}"}
-    sa_pwd = {**sa, "X-Confirm-Password": "root12345"}
+    sa_pwd = {**sa, "X-Confirm-Password": "superadmin123"}
 
     # --- the catalogue -------------------------------------------------
     cat = client.get("/admin/permissions", headers=sa).json()

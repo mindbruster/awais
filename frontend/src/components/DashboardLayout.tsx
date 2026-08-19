@@ -22,6 +22,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { api } from "@/api/client";
 import { useAuthStore } from "@/store/auth";
+import { ChangePassword } from "@/components/ChangePassword";
 import { CommandPalette } from "@/components/CommandPalette";
 import { NavSection, sectionForPath, visibleSections } from "@/components/nav";
 
@@ -154,6 +155,7 @@ function SectionIcon({ name, className = "" }: { name: string; className?: strin
 export function DashboardLayout() {
   const user = useAuthStore((s) => s.user);
   const logout = useAuthStore((s) => s.logout);
+  const [changingPassword, setChangingPassword] = useState(false);
   const navigate = useNavigate();
   const location = useLocation();
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -275,7 +277,12 @@ export function DashboardLayout() {
       <div className="border-t border-slate-200 px-4 py-3">
         <div className="text-sm font-medium text-slate-800">{user?.full_name}</div>
         <div className="text-xs capitalize text-slate-500">{role}</div>
-        <button onClick={handleLogout} className="btn-ghost mt-2 w-full">
+        {/* Here rather than under Settings: every role needs it, and most roles
+            cannot open Settings at all. */}
+        <button onClick={() => setChangingPassword(true)} className="btn-ghost mt-2 w-full">
+          Change password
+        </button>
+        <button onClick={handleLogout} className="btn-ghost mt-1 w-full">
           Sign out
         </button>
       </div>
@@ -336,6 +343,11 @@ export function DashboardLayout() {
           <Outlet />
         </div>
       </main>
+
+      <ChangePassword
+        open={changingPassword}
+        onClose={() => setChangingPassword(false)}
+      />
     </div>
   );
 }

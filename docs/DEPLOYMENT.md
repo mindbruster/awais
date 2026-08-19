@@ -481,7 +481,9 @@ Infrastructure:
 
 Secrets:
 - [ ] `JWT_SECRET` is ≥32 random chars and not from any example file.
-- [ ] `SEED_ADMIN_PASSWORD` is not `admin123`, and you have changed it in-app after first login.
+- [ ] `SEED_ADMIN_PASSWORD` is not `admin123`, and you have changed it in-app after first login (**Change password**, under your name in the sidebar).
+- [ ] `SEED_SUPERADMIN_PASSWORD` is not `superadmin123`, and changed in-app too.
+- [ ] Everybody who needs a login has one, under *Settings → People*, on a role narrow enough that nobody reaches the ledger or the profit reports by accident.
 - [ ] `ENVIRONMENT=production`, `DEBUG=false`.
 - [ ] No secret is committed to git. (`.env.prod` is gitignored; `.env.prod.example` has placeholders only.)
 

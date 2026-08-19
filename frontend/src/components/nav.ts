@@ -466,6 +466,18 @@ export const SECTIONS: NavSection[] = [
         ],
       },
       {
+        to: "/settings/users",
+        label: "People",
+        hint: "Who can sign in, and what they may reach",
+        // Admin, not accountant: this decides who has permissions at all, which
+        // is a different question from the books.
+        roles: ["admin"],
+        keywords: [
+          "user", "users", "people", "staff", "employee", "login", "account",
+          "password", "role", "permission", "access", "add someone", "team",
+        ],
+      },
+      {
         to: "/settings/modules",
         label: "Modules & roles",
         hint: "What this shop uses, and what each role may do",
