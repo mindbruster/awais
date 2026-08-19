@@ -53,6 +53,35 @@ _ACCOUNTS: dict[InventoryType, tuple[SystemAccount, Commodity]] = {
 }
 
 
+# The pot types a shop can declare an opening balance for, and which of those
+# are weighed as metal. Derived from the account map rather than re-listed, so
+# adding a type in one place cannot leave the go-live screen showing a pot the
+# endpoint will refuse — or hiding one it would accept.
+OPENABLE_TYPES: tuple[InventoryType, ...] = tuple(_ACCOUNTS)
+METAL_TYPES: frozenset[InventoryType] = frozenset(
+    t for t, (_acct, commodity) in _ACCOUNTS.items()
+    if commodity in (Commodity.GOLD, Commodity.SILVER)
+)
+
+
+async def opened_item_ids(db: AsyncSession, item_ids: list[int]) -> set[int]:
+    """
+    Which of these pots already carry an opening balance.
+
+    The set form of `already_opened`, for the screen that draws the whole
+    checklist: one query for any number of pots instead of one each.
+    """
+    if not item_ids:
+        return set()
+    rows = await db.execute(
+        select(StockMovement.inventory_item_id).where(
+            StockMovement.inventory_item_id.in_(item_ids),
+            StockMovement.reference_type == OPENING_STOCK_SOURCE,
+        )
+    )
+    return set(rows.scalars().all())
+
+
 async def already_opened(db: AsyncSession, item_id: int) -> bool:
     """Has this pot had its opening balance recorded already?"""
     return bool(

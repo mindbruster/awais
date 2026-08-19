@@ -452,6 +452,20 @@ export const SECTIONS: NavSection[] = [
         keywords: ["country", "city", "location", "address"],
       },
       {
+        to: "/settings/opening",
+        label: "Opening position",
+        hint: "What the shop had on day one",
+        // Left in the sidebar rather than hidden once it is done. It is the
+        // record of what the books were opened at, and a shop that adds a new
+        // safe in year two needs the same screen — the pots it lists are
+        // whatever exists now, not a snapshot of go-live day.
+        roles: ["admin", "accountant"],
+        keywords: [
+          "opening", "open", "start", "day one", "go live", "golive",
+          "initial", "existing stock", "carry forward", "balance", "capital",
+        ],
+      },
+      {
         to: "/settings/modules",
         label: "Modules & roles",
         hint: "What this shop uses, and what each role may do",

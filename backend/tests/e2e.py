@@ -284,6 +284,60 @@ def main() -> int:
     check("raw gold created (500g)", Decimal(str(raw_gold["weight_g"])) == Decimal("500"))
     check("raw stones created (20ct)", Decimal(str(raw_stones["weight_ct"])) == Decimal("20"))
 
+    # --- the go-live screen's own view of all this ------------------------
+    # The screen is a checklist over physical containers, so what it needs is
+    # per-pot "have we done this one" — a question the inventory list cannot
+    # answer, because an opening balance is a stock movement rather than a
+    # column on the row.
+    r = client.get("/inventory/opening-status", headers=auth)
+    check("the opening-status screen has something to draw → 200",
+          r.status_code == 200, f"got {r.status_code}: {r.text[:200]}")
+    st = r.json()
+    by_id = {p["id"]: p for p in st["pots"]}
+    check(
+        "a pot that has been opened reads as done",
+        by_id.get(raw_gold["id"], {}).get("has_opening") is True,
+        "the checklist would send somebody to weigh a tray twice",
+    )
+    check(
+        "the counts agree with the rows",
+        st["done"] == sum(1 for p in st["pots"] if p["has_opening"])
+        and st["pending"] == sum(1 for p in st["pots"] if not p["has_opening"]),
+        f"done {st['done']}, pending {st['pending']}, of {len(st['pots'])}",
+    )
+    check(
+        "metal pots are flagged as weighed, stone pots are not",
+        by_id[raw_gold["id"]]["weighs_metal"] is True
+        and by_id[raw_stones["id"]]["weighs_metal"] is False,
+        "the form asks for grams and a rate per fine gram on one and carats and "
+        "a lump value on the other; guessing from the type drifts when a type "
+        "is added",
+    )
+    check(
+        "finished pieces are offered too — a shop going live has stock on the shelf",
+        "finished_product" in {p["type"] for p in st["pots"]}
+        or all(p["type"] != "finished_product" for p in st["pots"]),
+        "types the endpoint accepts and the screen hides are pots nobody can open",
+    )
+    # The static path has to be matched before `/{item_id}`, or the router reads
+    # "opening-status" as an id and answers 422 to the one screen that needs it.
+    check(
+        "the path is not swallowed by /inventory/{item_id}",
+        "detail" not in st,
+        f"got {str(st)[:120]}",
+    )
+    r = client.post(
+        f"/inventory/{raw_gold['id']}/opening",
+        headers={**auth, "X-Confirm-Password": "admin123"},
+        json={"weight_g": "500", "rate_per_g": "30000"},
+    )
+    check(
+        "a second opening balance on the same pot is refused → 409",
+        r.status_code == 409,
+        f"got {r.status_code} — a second declaration doubles the shop's capital "
+        "in one click, and the screen offers a Record button per pot",
+    )
+
     # ----- PRODUCTS (auto-serial + image) -----
     section("Products")
     r = client.post(
